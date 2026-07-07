@@ -165,24 +165,17 @@ def _proxy(key: str, tool_name: str):
     return handler
 
 
-async def load_toolset_impl(key: str, llm, context, base_schemas: list) -> dict:
-    """Connect an MCP server and inject its tools into the live context.
+async def ensure_toolset_schemas(key: str, base_schemas: list) -> list:
+    """Fetch (and cache) a toolset's FunctionSchemas without a live session.
 
-    Safe to call again in a new client session: handlers are (re)registered on
-    the CURRENT llm service and schemas (re)injected into the CURRENT context
-    every time — tool listings are cached, connections are health-checked and
-    revived if the server died.
+    Shared by load_toolset_impl and the /api/chat text endpoint. Names that
+    collide with already-known tools get a toolset prefix, exactly as before.
     """
     if key not in TOOLSETS:
-        return {"error": f"unknown toolset {key!r}", "available": sorted(TOOLSETS)}
-
-    first_load = key not in _loaded_schemas
-    if first_load:
-        try:
-            session = await _get_session(key)
-            listing = await session.list_tools()
-        except Exception as exc:  # noqa: BLE001
-            return {"error": f"could not start toolset {key}: {exc}"}
+        raise ValueError(f"unknown toolset {key!r}")
+    if key not in _loaded_schemas:
+        session = await _get_session(key)
+        listing = await session.list_tools()
         existing = {s.name for schemas in _loaded_schemas.values() for s in schemas}
         existing |= {s.name for s in base_schemas}
         schemas = []
@@ -208,7 +201,31 @@ async def load_toolset_impl(key: str, llm, context, base_schemas: list) -> dict:
             # remember the original MCP tool name for the proxy
             schemas[-1]._mcp_tool_name = tool.name  # type: ignore[attr-defined]
         _loaded_schemas[key] = schemas
+    return _loaded_schemas[key]
 
+
+def proxy_handler(key: str, tool_name: str):
+    """Public accessor for the MCP proxy handler (used by /api/chat)."""
+    return _proxy(key, tool_name)
+
+
+async def load_toolset_impl(key: str, llm, context, base_schemas: list) -> dict:
+    """Connect an MCP server and inject its tools into the live context.
+
+    Safe to call again in a new client session: handlers are (re)registered on
+    the CURRENT llm service and schemas (re)injected into the CURRENT context
+    every time — tool listings are cached, connections are health-checked and
+    revived if the server died.
+    """
+    if key not in TOOLSETS:
+        return {"error": f"unknown toolset {key!r}", "available": sorted(TOOLSETS)}
+
+    first_load = key not in _loaded_schemas
+    if first_load:
+        try:
+            await ensure_toolset_schemas(key, base_schemas)
+        except Exception as exc:  # noqa: BLE001
+            return {"error": f"could not start toolset {key}: {exc}"}
     # (Re)register handlers on this session's llm and rebuild this context's
     # tool list — required on every call, because reconnects create fresh
     # llm/context objects that know nothing of earlier loads.

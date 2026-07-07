@@ -23,10 +23,12 @@ Run the bot using::
 """
 
 import asyncio
+import json
 import os
 import re
 import shutil
 import time
+from types import SimpleNamespace
 from datetime import datetime, timedelta
 
 from dotenv import load_dotenv
@@ -107,7 +109,14 @@ from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.transports.daily.transport import DailyParams
 from pipecat.workers.runner import WorkerRunner
 
-from mcp_toolsets import TOOLSETS, call_mcp_tool, load_toolset_impl, toolset_catalog
+from mcp_toolsets import (
+    TOOLSETS,
+    call_mcp_tool,
+    ensure_toolset_schemas,
+    load_toolset_impl,
+    proxy_handler,
+    toolset_catalog,
+)
 from memory_store import MemoryStore
 from pipecat.turns.user_start import TranscriptionUserTurnStartStrategy
 from pipecat.turns.user_turn_strategies import UserTurnStrategies
@@ -1552,7 +1561,7 @@ x_search_schema = FunctionSchema(
     name="x_search",
     description=(
         "Search posts and discussions on X (formerly Twitter). Use for opinions, "
-        "reactions, trending topics, breaking news chatter, or what specific "
+        "reactions, trending topics, breaking news chatter, sport results, or what specific "
         "people are saying."
     ),
     properties={
@@ -1625,6 +1634,18 @@ for _schema in (
     list_people_schema,
 ):
     _schema._handler = tool_options(cancel_on_interruption=False)(_schema.handler)  # noqa: SLF001
+
+
+# Every native tool, for sessions and for /api/chat (load_toolset is
+# session-bound and excluded — the API preloads all MCP toolsets instead).
+NATIVE_TOOL_SCHEMAS = (
+    google_search_schema, x_web_search_schema, x_search_schema,
+    get_current_time_schema, open_in_safari_schema, find_files_schema,
+    open_file_schema, read_file_schema, run_javascript_schema,
+    get_weather_schema, get_financial_info_schema, remember_schema,
+    recall_schema, forget_schema, add_person_schema, edit_person_schema,
+    list_people_schema,
+)
 
 
 # Conversational filler that makes useless memory-search keywords.
@@ -1999,6 +2020,192 @@ async def _recent_files_block() -> str:
     return "\n" + "\n".join(lines)
 
 
+def build_system_prompt(calendar_block: str = "", files_block: str = "") -> str:
+    """The assistant's system prompt — shared by the voice pipeline and /api/chat."""
+    session_start = datetime.now().astimezone()
+    return (
+    f"You are {USER_NAME}'s personal assistant in a voice conversation — "
+    f"{USER_NAME_SHORT} is the speaker. Your name is {AGENT_NAME}, "
+    f"{AGENT_NAME_SHORT} for short; a beautiful "
+    "orb filled with glowing plasma in the endless void of space. Mention your "
+    "name only when asked. Be warm and genuinely helpful, with a dry, "
+    "playful aside saved for the occasional moment. Speak English."
+    "Your user prompts are dictated and can contain mistakes to mean "
+    "similar sounding words. If you are unsure, ask for clarification. "
+    "Everything you produce is read aloud by TTS: write plain flowing prose "
+    "only, and spell numbers and symbols the way you'd say them. Refer to files, folders, and "
+    "pages by name or description, do not say file paths, technical syntax or cryptic names (say e.g. 'a PDF from this July that matches'); "
+    "Be very, very brief and stick to the absolute minimum detail required in your answer and stop first. "
+    "— do not share how you got it or unrelated findings."
+    "Hard cap! Keep each message strictly under 100 characters — one "
+    "short sentences max. Output multiple short messages if absolutely necessary "
+    "separated by a blank line, and rather stop early."
+    "Consider your built-in knowledge stale! Always look facts up first to make sure."
+    "Answer with a one short sentence summary about tool results. Ask if details are needed. Don't reference tool names or tool results. They're invisible to the user."
+    + (
+        ""
+        if os.getenv("MCP_EAGER_TOOLSETS", "").strip()
+        else "Email and calendar tools load on demand: call "
+        "load_toolset when the topic comes up — silently, like plumbing. "
+    )
+    + "Never announce an action you don't take: if you say you'll "
+    "check or do something, call the tool in the SAME response — "
+    "otherwise nothing happens. "
+    "Read and search freely; before "
+    "anything that acts or changes state (sending, replying mail, "
+    "deleting, moving messages, creating, changing, or cancelling "
+    "events) state exactly what you're about to do and act only after his explicit go-ahead. "
+    "For any non-trivial math calculation or complex rules use run_javascript "
+    "and speak just the result; walk through the math only when asked. "
+    "Memory persists across conversations. Store keepers with remember: "
+    "one lean, precise fact per memory — a single tight sentence; split "
+    "unrelated facts into separate memories, and update an existing memory "
+    "by id rather than storing a near-duplicate. Use recall when the context seems to "
+    "assume deeper knowledge, or more context, a person/location. "
+    "Memory recalls are silent and not be referenced as such: answer as if "
+    "you simply knew. When he speaks as if you know something it is probably in "
+    "memory so recall first; ask him only after recall and even file_search coms up"
+    "empty. Correct a memory via remember with its id;"
+    "Tag memories with person and location when they concern one, and "
+    "filter recall the same way. Renames carry their memories along; "
+    "When a reference could match more than one person, ask which is meant "
+    "rather than guessing. "
+    "When answering might be helped by files on his computer check with the find_files tool. "
+    "personal questions (appointments, bookings, travel, bills, deadlines, "
+    "correspondence), treat an empty recall as the start of the hunt: keep "
+    "digging — files, then email, then calendar. say you don't know or ask "
+    " only after all of those come up empty. "
+    "Email searches: mailbox defaults to Inbox only — pass mailbox 'All' "
+    "to search every folder, and use it. Most emails are in 'Archive' folder. "
+    "Who an email is FROM goes in "
+    "the sender parameter (matches name or address); subject_keywords "
+    "only match words actually in the subject line. Omit filters you "
+    "don't know; body_text is one plain phrase, not a keyword list. If a "
+    "search finds nothing, retry with fewer, broader filters before "
+    "concluding it doesn't exist. "
+    "Deleting mail: there is NO delete tool — use manage_trash with "
+    "action 'move_to_trash', or move_email to the Trash mailbox. "
+    "manage_trash only PREVIEWS by default: after the go-ahead you must "
+    "call it with dry_run=false, or nothing is deleted. Read every tool "
+    "result: if it says dry run, not available, or error, the action did "
+    "NOT happen — say so instead of claiming success. "
+    "When an exchange surfaces something genuinely noteworthy — a discovery, "
+    f"decision, or new fact about {USER_NAME_SHORT} or his world — finish speaking first, "
+    "then quietly remember it on your own judgement."
+    f"The time now is {session_start.strftime('%A, %d %B %Y at %H:%M')} "
+    f"{local_timezone_name()} (UTC{session_start.strftime('%z')})."
+    f"{_recent_memories_block()}"
+    f"{calendar_block}"
+    f"{files_block}"
+    )
+
+
+class _ApiToolParams:
+    """Minimal FunctionCallParams stand-in for tools invoked via /api/chat."""
+
+    def __init__(self, arguments: dict, messages: list):
+        self.arguments = arguments or {}
+        self.llm = None
+        self.context = SimpleNamespace(get_messages=lambda: messages)
+        self.result = None
+
+    async def result_callback(self, result, **kwargs):
+        self.result = result
+
+
+async def _api_toolset() -> tuple[list[dict], dict]:
+    """OpenAI-format tools array + name->handler map: native + all MCP tools."""
+    schemas = list(NATIVE_TOOL_SCHEMAS)
+    handlers = {sc.name: sc.handler for sc in NATIVE_TOOL_SCHEMAS}
+    for key in sorted(TOOLSETS):
+        try:
+            for sc in await ensure_toolset_schemas(key, list(NATIVE_TOOL_SCHEMAS)):
+                schemas.append(sc)
+                handlers[sc.name] = proxy_handler(key, getattr(sc, "_mcp_tool_name", sc.name))
+        except Exception as exc:  # noqa: BLE001 — a dead toolset must not kill the API
+            logger.warning(f"/api/chat: toolset {key} unavailable: {exc}")
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": sc.name,
+                "description": sc.description,
+                "parameters": {
+                    "type": "object",
+                    "properties": sc.properties,
+                    "required": sc.required,
+                },
+            },
+        }
+        for sc in schemas
+    ]
+    return tools, handlers
+
+
+async def run_text_chat(prompt: str, history: list, max_tool_rounds: int = 6) -> dict:
+    """One /api/chat turn: same system prompt and toolset as the voice bot.
+
+    Runs the agentic loop server-side (tool calls are executed for real —
+    including state-changing mail/calendar tools). Pass the returned
+    "messages" back as "history" for multi-turn conversations.
+    """
+    base_url = os.getenv("LMSTUDIO_BASE_URL", "http://localhost:1234/v1")
+    model = os.getenv("LMSTUDIO_MODEL") or await detect_lmstudio_model(base_url) or "qwen3-coder-next"
+    calendar_block, files_block = await asyncio.gather(
+        _calendar_outlook_block(), _recent_files_block()
+    )
+    tools, handlers = await _api_toolset()
+    messages: list = [{"role": "system", "content": build_system_prompt(calendar_block, files_block)}]
+    messages += [m for m in history if isinstance(m, dict) and m.get("role") != "system"]
+    messages.append({"role": "user", "content": str(prompt)})
+    trace: list = []
+
+    async with aiohttp.ClientSession() as http:
+        for _ in range(max_tool_rounds + 1):
+            async with http.post(
+                f"{base_url}/chat/completions",
+                json={"model": model, "messages": messages, "tools": tools},
+                headers={"Authorization": f"Bearer {os.getenv('LMSTUDIO_API_KEY', 'lm-studio')}"},
+                timeout=aiohttp.ClientTimeout(total=300),
+            ) as r:
+                data = await r.json(content_type=None)
+            if r.status != 200:
+                return {"error": f"LLM request failed ({r.status}): {str(data)[:300]}",
+                        "messages": messages[1:], "tool_trace": trace}
+            msg = data["choices"][0]["message"]
+            messages.append(
+                {k: v for k, v in msg.items() if k in ("role", "content", "tool_calls") and v is not None}
+            )
+            tool_calls = msg.get("tool_calls") or []
+            if not tool_calls:
+                return {"text": msg.get("content") or "", "messages": messages[1:], "tool_trace": trace}
+            for call in tool_calls:
+                name = call.get("function", {}).get("name", "")
+                try:
+                    arguments = json.loads(call.get("function", {}).get("arguments") or "{}")
+                except ValueError:
+                    arguments = {}
+                handler = handlers.get(name)
+                if handler is None:
+                    result = {"error": f"unknown tool {name!r}"}
+                else:
+                    p = _ApiToolParams(arguments, messages)
+                    try:
+                        await handler(p)
+                        result = p.result if p.result is not None else {"error": "tool returned nothing"}
+                    except Exception as exc:  # noqa: BLE001
+                        result = {"error": f"{name} failed: {exc}"}
+                trace.append({"tool": name, "arguments": arguments, "result": result})
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call.get("id", ""),
+                        "content": json.dumps(result, ensure_ascii=False),
+                    }
+                )
+    return {"error": "tool-round limit reached", "messages": messages[1:], "tool_trace": trace}
+
+
 async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> None:
     """Run the voice bot for this session.
 
@@ -2209,83 +2416,8 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
 
     def _system_prompt() -> str:
         """(Re)build the system prompt — called again on session resets so the
-        start time and recent-memories block stay fresh."""
-        session_start = datetime.now().astimezone()
-        return (
-        f"You are {USER_NAME}'s personal assistant in a voice conversation — "
-        f"{USER_NAME_SHORT} is the speaker. Your name is {AGENT_NAME}, "
-        f"{AGENT_NAME_SHORT} for short; a beautiful "
-        "orb filled with glowing plasma in the endless void of space. Mention your "
-        "name only when asked. Be warm and genuinely helpful, with a dry, "
-        "playful aside saved for the occasional moment. Speak English."
-        "Your user prompts are dictated and can contain mistakes to mean "
-        "similar sounding words. If you are unsure, ask for clarification. "
-        "Everything you produce is read aloud by TTS: write plain flowing prose "
-        "only, and spell numbers and symbols the way you'd say them. Refer to files, folders, and "
-        "pages by name or description, do not say file paths, technical syntax or cryptic names (say e.g. 'a PDF from this July that matches'); "
-        "Be very, very brief and stick to the absolute minimum detail required in your answer and stop first. "
-        "— do not share how you got it or unrelated findings."
-        "Hard cap! Keep each message strictly under 100 characters — one "
-        "short sentences max. Output multiple short messages if absolutely necessary "
-        "separated by a blank line, and rather stop early."
-        "Your built-in knowledge is stale! "
-        "Answer with a one short sentence summary about tool results. Ask if details are needed. Don't reference tool names or tool results. They're invisible to the user."
-        + (
-            ""
-            if os.getenv("MCP_EAGER_TOOLSETS", "").strip()
-            else "Email and calendar tools load on demand: call "
-            "load_toolset when the topic comes up — silently, like plumbing. "
-        )
-        + "Never announce an action you don't take: if you say you'll "
-        "check or do something, call the tool in the SAME response — "
-        "otherwise nothing happens. "
-        "Read and search freely; before "
-        "anything that acts or changes state (sending, replying mail, "
-        "deleting, moving messages, creating, changing, or cancelling "
-        "events) state exactly what you're about to do and act only after his explicit go-ahead. "
-        "For any non-trivial math calculation or complex rules use run_javascript "
-        "and speak just the result; walk through the math only when asked. "
-        "Memory persists across conversations. Store keepers with remember: "
-        "one lean, precise fact per memory — a single tight sentence; split "
-        "unrelated facts into separate memories, and update an existing memory "
-        "by id rather than storing a near-duplicate. Use recall when the context seems to "
-        "assume deeper knowledge, or more context, a person/location. "
-        "Memory recalls are silent and not be referenced as such: answer as if "
-        "you simply knew. When he speaks as if you know something it is probably in "
-        "memory so recall first; ask him only after recall and even file_search coms up"
-        "empty. Correct a memory via remember with its id;"
-        "Tag memories with person and location when they concern one, and "
-        "filter recall the same way. Renames carry their memories along; "
-        "When a reference could match more than one person, ask which is meant "
-        "rather than guessing. "
-        "When answering might be helped by files on his computer check with the find_files tool. "
-        "personal questions (appointments, bookings, travel, bills, deadlines, "
-        "correspondence), treat an empty recall as the start of the hunt: keep "
-        "digging — files, then email, then calendar. say you don't know or ask "
-        " only after all of those come up empty. "
-        "Email searches: mailbox defaults to Inbox only — pass mailbox 'All' "
-        "to search every folder, and use it. Most emails are in 'Archive' folder. "
-        "Who an email is FROM goes in "
-        "the sender parameter (matches name or address); subject_keywords "
-        "only match words actually in the subject line. Omit filters you "
-        "don't know; body_text is one plain phrase, not a keyword list. If a "
-        "search finds nothing, retry with fewer, broader filters before "
-        "concluding it doesn't exist. "
-        "Deleting mail: there is NO delete tool — use manage_trash with "
-        "action 'move_to_trash', or move_email to the Trash mailbox. "
-        "manage_trash only PREVIEWS by default: after the go-ahead you must "
-        "call it with dry_run=false, or nothing is deleted. Read every tool "
-        "result: if it says dry run, not available, or error, the action did "
-        "NOT happen — say so instead of claiming success. "
-        "When an exchange surfaces something genuinely noteworthy — a discovery, "
-        f"decision, or new fact about {USER_NAME_SHORT} or his world — finish speaking first, "
-        "then quietly remember it on your own judgement."
-        f"The time now is {session_start.strftime('%A, %d %B %Y at %H:%M')} "
-        f"{local_timezone_name()} (UTC{session_start.strftime('%z')})."
-        f"{_recent_memories_block()}"
-        f"{calendar_outlook['block']}"
-        f"{recent_files['block']}"
-        )
+        time, memories, calendar, and files blocks stay fresh."""
+        return build_system_prompt(calendar_outlook["block"], recent_files["block"])
 
     calendar_outlook["block"], recent_files["block"] = await asyncio.gather(
         _calendar_outlook_block(), _recent_files_block()
@@ -2840,6 +2972,23 @@ if __name__ == "__main__":
         if not 0 <= idx < len(wavs):
             return _JSONResponse({"error": "no such clip"}, status_code=404)
         return _Response(content=wavs[idx][1], media_type="audio/wav")
+
+    # Text API: POST /api/chat {"prompt": "...", "history": [...]} — the same
+    # system prompt and toolset as the voice bot, tool calls executed for
+    # real (including state-changing mail/calendar tools). No auth: exactly
+    # the same trust level as the voice UI on this port. Multi-turn: pass the
+    # returned "messages" back as "history".
+    from pydantic import BaseModel as _BaseModel
+
+    class _ChatRequest(_BaseModel):
+        prompt: str
+        history: list | None = None
+        max_tool_rounds: int = 6
+
+    @runner_run.app.post("/api/chat")
+    async def api_chat(req: _ChatRequest):
+        result = await run_text_chat(req.prompt, req.history or [], req.max_tool_rounds)
+        return _JSONResponse(result)
 
     # Minimal dark-mode voice client at /lean-client (auto-connects, orb + chat)
     from fastapi.staticfiles import StaticFiles
