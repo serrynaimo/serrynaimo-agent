@@ -79,8 +79,10 @@
   #chat { opacity: 0; transition: opacity 1.4s ease; }
   body.chatReady #chat { opacity: 1; }
   /* When the wake gate is closed (10s since the bot last spoke, wake word
-     required), all text dims to half until the conversation resumes. */
-  body.gated #chat, body.gated #status { opacity: 0.3; }
+     required), text dims until the conversation resumes. The chat rule ALSO
+     requires .chatReady so the cold-start gate can't reveal text early. */
+  body.gated #status { opacity: 0.3; }
+  body.gated.chatReady #chat { opacity: 0.3; }
 
   .msg {
     max-width: 78%;
@@ -488,7 +490,7 @@ let chatRevealTimer = null;
 function revealChatAfterAperture() {
   // Text fades in 2s after the aperture opens — never before the bloom.
   clearTimeout(chatRevealTimer);
-  chatRevealTimer = setTimeout(() => document.body.classList.add("chatReady"), 2000);
+  chatRevealTimer = setTimeout(() => document.body.classList.add("chatReady"), 3500);
 }
 
 async function playAperture() {
