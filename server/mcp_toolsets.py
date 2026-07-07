@@ -159,7 +159,7 @@ def _proxy(key: str, tool_name: str):
         # Fresh time on every result, like the native tools: calendar and
         # mail answers are exactly where "how long until X" math happens,
         # and the system prompt only has the session-start time.
-        result["current_time"] = datetime.now().astimezone().strftime("%H:%M")
+        result["current_time"] = datetime.now().astimezone().strftime("%-I:%M %p")
         await params.result_callback(result)
 
     return handler

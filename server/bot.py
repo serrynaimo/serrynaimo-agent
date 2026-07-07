@@ -135,6 +135,28 @@ load_dotenv(override=True)
 
 memory = MemoryStore(os.getenv("MEMORY_DB_PATH", os.path.join(os.path.dirname(__file__), "memories.db")))
 
+# Default action memories (kind='action'): procedures and tool quirks that
+# used to live in the system prompt. Seeded once; edits by voice stick —
+# "Serry, when deleting emails, also ..." updates the note, not this file.
+SEED_ACTION_MEMORIES = [
+    "Searching or finding emails, mail, messages: mailbox defaults to Inbox "
+    "only — pass mailbox 'All' to search every folder; most mail sits in "
+    "'Archive'. Who an email is FROM goes in the sender parameter (matches "
+    "name or address); subject_keywords only match words actually in the "
+    "subject line. Omit filters you don't know; body_text is one plain "
+    "phrase, not a keyword list. On zero hits retry with fewer, broader "
+    "filters before concluding it doesn't exist.",
+    "Deleting, trashing, or cleaning up emails: there is no delete tool — "
+    "use manage_trash with action 'move_to_trash', or move_email to the "
+    "Trash mailbox. manage_trash only PREVIEWS by default: after the "
+    "go-ahead call it again with dry_run=false, or nothing is deleted.",
+]
+try:
+    if _n := memory.seed_actions(SEED_ACTION_MEMORIES):
+        logger.info(f"Seeded {_n} default action memories")
+except Exception as _exc:  # noqa: BLE001
+    logger.warning(f"Could not seed action memories: {_exc}")
+
 
 def _net_error(action: str, exc: Exception) -> dict:
     """Uniform error result for internet tools.
@@ -326,7 +348,7 @@ async def get_current_time(params: FunctionCallParams):
     now = datetime.now().astimezone()
     await params.result_callback(
         {
-            "datetime": now.strftime("%A, %d %B %Y, %H:%M:%S"),
+            "datetime": now.strftime("%A, %d %B %Y, %-I:%M:%S %p"),
             "timezone": f"{local_timezone_name()} (UTC{now.strftime('%z')})",
             "iso": now.isoformat(),
         }
@@ -395,8 +417,9 @@ async def remember(params: FunctionCallParams):
     snapshot = _recent_conversation(params.context)
     location = str(params.arguments.get("location") or "").strip() or None
     person = str(params.arguments.get("person") or "").strip() or None
+    kind = str(params.arguments.get("kind") or "").strip().lower() or None
     result = await asyncio.to_thread(
-        memory.remember, content, snapshot, memory_id, location, person
+        memory.remember, content, snapshot, memory_id, location, person, kind
     )
     if "error" in result:
         await params.result_callback(result)
@@ -431,7 +454,7 @@ def _injected_memory_text() -> str:
         str(m.get("content", ""))
         for m in ctx.get_messages()
         if isinstance(m, dict)
-        and str(m.get("content", "")).startswith("Auto-recalled memories")
+        and str(m.get("content", "")).startswith(("Auto-recalled memories", "Action notes"))
     )
 
 
@@ -442,8 +465,9 @@ async def recall(params: FunctionCallParams):
         keywords = keywords.split()
     person = str(params.arguments.get("person") or "").strip() or None
     location = str(params.arguments.get("location") or "").strip() or None
+    kind = str(params.arguments.get("kind") or "").strip().lower() or None
     result = await asyncio.to_thread(
-        memory.recall, list(keywords), person, location, 5
+        memory.recall, list(keywords), person, location, 5, kind
     )
     logger.info(f"recall: {keywords} person={person} location={location} -> {result.get('error') or len(result['memories'])}")
     if result.get("error"):
@@ -456,6 +480,7 @@ async def recall(params: FunctionCallParams):
             "person": m.get("person"),
             "location": m.get("location"),
             "date": m["created_at"][:10],
+            "kind": m.get("kind", "fact"),
         }
         for m in result["memories"]
     ]
@@ -482,7 +507,8 @@ async def recall(params: FunctionCallParams):
             shown.append(str(m["id"]))
             continue
         tags = ", ".join(t for t in (m["person"], m["location"]) if t)
-        head = f"[{m['id']}, {m['date']}" + (f", {tags}" if tags else "") + "]"
+        marker = ", action" if m.get("kind") == "action" else ""
+        head = f"[{m['id']}{marker}, {m['date']}" + (f", {tags}" if tags else "") + "]"
         lines.append(f"- {head} {m['content']}")
     if shown:
         lines.append(f"(ids {', '.join(shown)} already shown in context above)")
@@ -552,6 +578,16 @@ remember_schema = FunctionSchema(
             "type": "integer",
             "description": "Optional: id of an existing memory to overwrite with the new content",
         },
+        "kind": {
+            "type": "string",
+            "enum": ["fact", "action"],
+            "description": (
+                "fact (default) = something that is true. action = HOW to do "
+                "a task for Thomas: procedure, tool quirks, his preferences. "
+                "Store an action memory whenever doing a task surfaced "
+                "corrections or specifics worth reusing."
+            ),
+        },
         "person": {
             "type": "string",
             "description": (
@@ -596,6 +632,11 @@ recall_schema = FunctionSchema(
             "type": "array",
             "items": {"type": "string"},
             "description": "Keywords to search for (any match counts)",
+        },
+        "kind": {
+            "type": "string",
+            "enum": ["fact", "action"],
+            "description": "Optional: 'action' = how-to notes for tasks; 'fact' = knowledge",
         },
         "person": {
             "type": "string",
@@ -1601,7 +1642,7 @@ def _with_current_time(handler):
                 # Just HH:MM — date and timezone are in the system prompt.
                 result = {
                     **result,
-                    "current_time": datetime.now().astimezone().strftime("%H:%M"),
+                    "current_time": datetime.now().astimezone().strftime("%-I:%M %p"),
                 }
             await original(result, **kwargs)
 
@@ -1742,6 +1783,7 @@ class MemoryInjector(FrameProcessor):
     """
 
     MARK = "Auto-recalled memories"
+    ACTION_MARK = "Action notes"
 
     def __init__(self, context=None, **kwargs):
         super().__init__(**kwargs)
@@ -1767,7 +1809,14 @@ class MemoryInjector(FrameProcessor):
         ][:10]
         if len(words) < 2:
             return  # trivial utterance ("thanks", "okay") — nothing to look up
-        result = await asyncio.to_thread(memory.recall, words, None, None, 4)
+        await self._inject_kind(words, text, "fact", self.MARK, "use if relevant", 4)
+        await self._inject_kind(
+            words, text, "action", self.ACTION_MARK,
+            "how Thomas wants this done — follow these", 2,
+        )
+
+    async def _inject_kind(self, words, text, kind, mark, hint, limit):
+        result = await asyncio.to_thread(memory.recall, words, None, None, limit, kind)
         memories = result.get("memories")
         if not isinstance(memories, list) or not memories:
             return
@@ -1775,28 +1824,36 @@ class MemoryInjector(FrameProcessor):
         # OR-matching alone drags in barely-related entries.
         stems = {w[:4] for w in words}
         def relevant(m):
-            hay = f"{m['content']} {m.get('person') or ''} {m.get('location') or ''}".lower()
+            if kind == "action":
+                # Actions match on their TRIGGER phrase only (the part before
+                # the first colon) — matching the procedure body causes false
+                # hits like "passed" (time) ~ "pass mailbox 'All'".
+                hay = m["content"].split(":", 1)[0].lower()
+            else:
+                hay = f"{m['content']} {m.get('person') or ''} {m.get('location') or ''}".lower()
             return any(w[:4] in stems for w in re.findall(r"[\w']+", hay) if len(w) > 3)
         memories = [m for m in memories if relevant(m)][:4]
-        if self._append_only and self._context is not None:
-            # Skip memories already sitting in an earlier injection block —
-            # checked against the live context so a session reset re-allows them.
+        if self._context is not None:
+            # Skip memories already in context: earlier injection blocks AND
+            # the system prompt (recent/top-recalled sections) — the model
+            # doesn't need the same memory twice in one request.
             existing = "\n".join(
                 str(m.get("content", ""))
                 for m in self._context.get_messages()
                 if isinstance(m, dict)
-                and str(m.get("content", "")).startswith(self.MARK)
+                and (m.get("role") == "system"
+                     or str(m.get("content", "")).startswith(mark))
             )
             memories = [m for m in memories if m["content"][:100] not in existing]
         if not memories:
             return
         lines = "\n".join(
-            f"- [{m['created_at'][:10]}]"
+            f"- [{m['id']}, {m['created_at'][:10]}]"
             f"{' (' + m['person'] + ')' if m.get('person') else ''} "
             f"{m['content'][:220] + '…' if len(m['content']) > 220 else m['content']}"
             for m in memories
         )
-        logger.info(f"Memory injection: {len(memories)} memories for [{text[:60]}]")
+        logger.info(f"Memory injection ({kind}): {len(memories)} for [{text[:60]}]")
         # Purely visual: let the client flash a spark orb for the lookup.
         await self.push_frame(
             RTVIServerMessageFrame(data={"event": "memory-lookup", "count": len(memories)})
@@ -1808,7 +1865,7 @@ class MemoryInjector(FrameProcessor):
             kept = [
                 m for m in msgs
                 if not (isinstance(m, dict)
-                        and str(m.get("content", "")).startswith(self.MARK))
+                        and str(m.get("content", "")).startswith(mark))
             ]
             if len(kept) != len(msgs):
                 self._context.set_messages(kept)
@@ -1821,7 +1878,7 @@ class MemoryInjector(FrameProcessor):
             LLMMessagesAppendFrame(
                 messages=[{
                     "role": "user",
-                    "content": f"{self.MARK} (use if relevant):\n{lines}",
+                    "content": f"{mark} ({hint}):\n{lines}",
                 }],
                 run_llm=False,
             )
@@ -1832,21 +1889,34 @@ def _recent_memories_block() -> str:
     """The five newest memories for the system prompt, so the model has
     recency awareness without a recall call."""
     try:
-        recent = memory.recent(5)
+        recent = memory.recent(5, kind="fact")
     except Exception as exc:  # noqa: BLE001
         logger.warning(f"Could not load recent memories: {exc}")
         return ""
     if not recent:
         return ""
-    lines = []
-    for m in recent:
+
+    def _line(m):
         tags = ", ".join(t for t in (m["person"], m["location"]) if t)
         date = m["created_at"][:10]
-        lines.append(f"- [{date}{', ' + tags if tags else ''}] {m['content']}")
-    return (
+        marker = ", action" if m.get("kind") == "action" else ""
+        return f"- [{m['id']}{marker}, {date}{', ' + tags if tags else ''}] {m['content']}"
+
+    out = (
         "\nYour five most recent memories, newest first (recall has the rest):\n"
-        + "\n".join(lines)
+        + "\n".join(_line(m) for m in recent)
     )
+    try:
+        top = memory.top_recalled(5, exclude_ids={m["id"] for m in recent})
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"Could not load top-recalled memories: {exc}")
+        top = []
+    if top:
+        out += (
+            "\nYour most frequently recalled memories:\n"
+            + "\n".join(_line(m) for m in top)
+        )
+    return out
 
 
 async def _calendar_outlook_block() -> str:
@@ -1913,23 +1983,21 @@ async def _calendar_outlook_block() -> str:
 
     # "Last": anything that already started (over or still running) counts.
     past = [(d, e) for d, e in parsed if d <= local_now][-2:]
-    upcoming = [e for d, e in parsed if d > local_now][:6]
+    upcoming = [(d, e) for d, e in parsed if d > local_now][:6]
     if not past and not upcoming:
         return ""
 
-    def _fmt(e: dict, ongoing: bool = False) -> str:
-        when = e.get("start", "?")
-        when = f"{when[:10]} all-day" if e.get("all_day") else when[:16].replace("T", " ")
+    def _fmt(d: datetime, e: dict, status: str = "") -> str:
+        when = f"{d:%Y-%m-%d} all-day" if e.get("all_day") else f"{d:%Y-%m-%d %-I:%M %p}"
         loc = f" @ {e['location']}" if e.get("location") else ""
-        return f"- {when}: {e['title']}{loc}{' (ongoing)' if ongoing else ''}"
+        return f"- {when}: {e['title']}{loc}{f' ({status})' if status else ''}"
 
-    lines = []
-    if past:
-        lines.append("\nLast calendar events (already started or over):")
-        lines.extend(_fmt(e, ongoing=_still_running(e, d)) for d, e in past)
-    if upcoming:
-        lines.append("Upcoming calendar events (get_events has the details):")
-        lines.extend(_fmt(e) for e in upcoming)
+    lines = ["\nCalendar events around now (get_events has the details):"]
+    lines.extend(
+        _fmt(d, e, "ongoing" if _still_running(e, d) else "already passed")
+        for d, e in past
+    )
+    lines.extend(_fmt(d, e) for d, e in upcoming)
     return "\n" + "\n".join(lines)
 
 
@@ -2015,7 +2083,7 @@ async def _recent_files_block() -> str:
     lines = ["\nRecently modified files (read_file/open_file accept these paths):"]
     for mtime, p in picked:
         display = _home_display(p)
-        when = datetime.fromtimestamp(mtime).astimezone().strftime("%Y-%m-%d %H:%M")
+        when = datetime.fromtimestamp(mtime).astimezone().strftime("%Y-%m-%d %-I:%M %p")
         lines.append(f"- {display} ({when})")
     return "\n" + "\n".join(lines)
 
@@ -2060,7 +2128,7 @@ def build_system_prompt(calendar_block: str = "", files_block: str = "") -> str:
     "Memory persists across conversations. Store keepers with remember: "
     "one lean, precise fact per memory — a single tight sentence; split "
     "unrelated facts into separate memories, and update an existing memory "
-    "by id rather than storing a near-duplicate. Use recall when the context seems to "
+    "by id rather than storing a near-duplicate. Every memory shown to you starts with its id in brackets. Use recall when the context seems to "
     "assume deeper knowledge, or more context, a person/location. "
     "Memory recalls are silent and not be referenced as such: answer as if "
     "you simply knew. When he speaks as if you know something it is probably in "
@@ -2075,24 +2143,18 @@ def build_system_prompt(calendar_block: str = "", files_block: str = "") -> str:
     "correspondence), treat an empty recall as the start of the hunt: keep "
     "digging — files, then email, then calendar. say you don't know or ask "
     " only after all of those come up empty. "
-    "Email searches: mailbox defaults to Inbox only — pass mailbox 'All' "
-    "to search every folder, and use it. Most emails are in 'Archive' folder. "
-    "Who an email is FROM goes in "
-    "the sender parameter (matches name or address); subject_keywords "
-    "only match words actually in the subject line. Omit filters you "
-    "don't know; body_text is one plain phrase, not a keyword list. If a "
-    "search finds nothing, retry with fewer, broader filters before "
-    "concluding it doesn't exist. "
-    "Deleting mail: there is NO delete tool — use manage_trash with "
-    "action 'move_to_trash', or move_email to the Trash mailbox. "
-    "manage_trash only PREVIEWS by default: after the go-ahead you must "
-    "call it with dry_run=false, or nothing is deleted. Read every tool "
+    "Action memories hold HOW Thomas wants tasks done and tool quirks. "
+    "Before any tool-driven task: follow the attached Action notes; if none "
+    "are attached, recall kind 'action' with the task words FIRST. When "
+    "doing a task surfaces corrections, quirks, or preferences, remember "
+    "them with kind 'action' — update the existing note by id rather than "
+    "adding a near-duplicate. Read every tool "
     "result: if it says dry run, not available, or error, the action did "
     "NOT happen — say so instead of claiming success. "
     "When an exchange surfaces something genuinely noteworthy — a discovery, "
     f"decision, or new fact about {USER_NAME_SHORT} or his world — finish speaking first, "
     "then quietly remember it on your own judgement."
-    f"The time now is {session_start.strftime('%A, %d %B %Y at %H:%M')} "
+    f"The time now is {session_start.strftime('%A, %d %B %Y at %-I:%M %p')} "
     f"{local_timezone_name()} (UTC{session_start.strftime('%z')})."
     f"{_recent_memories_block()}"
     f"{calendar_block}"
