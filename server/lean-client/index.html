@@ -73,9 +73,13 @@
   #chat::-webkit-scrollbar { display: none; }
   #chat .spacer { margin-top: auto; }
 
+  /* Chat text holds back until 2s AFTER the aperture opens (JS adds
+     .chatReady), so bot messages fade in with the bloom, never before it. */
+  #status { transition: opacity 0.8s ease; }
+  #chat { opacity: 0; transition: opacity 1.4s ease; }
+  body.chatReady #chat { opacity: 1; }
   /* When the wake gate is closed (10s since the bot last spoke, wake word
      required), all text dims to half until the conversation resumes. */
-  #chat, #status { transition: opacity 0.8s ease; }
   body.gated #chat, body.gated #status { opacity: 0.5; }
 
   .msg {
@@ -475,6 +479,25 @@ async function loadFillerClips() {
   }
 }
 loadFillerClips();
+
+/* ---- aperture chime: the cosmic bloom for the "opening aperture" moment ---- */
+let apertureData = null;
+let apertureBuf = null;
+fetch("aperture.wav").then((r) => r.arrayBuffer()).then((b) => (apertureData = b)).catch(() => {});
+async function playAperture() {
+  const ctx = wsOutCtx || audioCtx;
+  if (!ctx || !apertureData) return;
+  try {
+    if (!apertureBuf) apertureBuf = await ctx.decodeAudioData(apertureData.slice(0));
+  } catch (e) { return; }
+  const g = ctx.createGain();
+  g.gain.value = 0.6;
+  g.connect(ctx.destination);
+  const src = ctx.createBufferSource();
+  src.buffer = apertureBuf;
+  src.connect(g);
+  src.start();
+}
 
 /* ---- submit sound: the macOS "Pop" plays on every submitted message ---- */
 let plopData = null;
@@ -963,6 +986,7 @@ function handleRtvi(msg) {
         document.body.classList.add("ready");
         bgCanvas.style.opacity = "1";
         setStatus("opening aperture");
+        playAperture();
       } else if (data && data.event === "session-reset") {
         // Fresh conversation (button or idle timeout): clear the page.
         finishBotFlow();
@@ -989,6 +1013,7 @@ function handleRtvi(msg) {
         document.body.classList.add("ready");
         bgCanvas.style.opacity = "1";
         setStatus("opening aperture");
+        playAperture();
       }
       break;
   }
@@ -1340,6 +1365,11 @@ void main() {
   // Glass sphere: near-constant radius, breathing faintly, nudged by audio.
   float R = 0.56 + 0.02 * sin(u_time * 1.6) + 0.04 * u_level;
 
+  // Before the aperture opens (u_ready low) the orb is dormant: dimmer and
+  // its plasma thinned to sparse wisps. It blooms to full as u_ready eases in.
+  float preDim  = mix(0.34, 1.0, u_ready);   // overall brightness
+  float preThin = mix(5.2, 3.0, u_ready);    // higher power = sparser filaments
+
   /* ---- haze: slow nebula wrapped around (and faintly behind) the glass */
   float hz1 = fbm(uv * 1.9 + vec2(t * 0.55, -t * 0.4));
   float hz2 = fbm(uv * 3.1 - vec2(t * 0.35, t * 0.5) + hz1 * 1.7);
@@ -1363,8 +1393,8 @@ void main() {
 
   float n1 = fbm(puv * 2.2 + vec2(t * 0.9, -t * 0.7));
   float n2 = fbm(puv * 4.2 - vec2(t * 0.6, t * 0.85) + n1 * 1.3);
-  float core = exp(-dot(puv, puv) * (6.0 - 2.5 * u_level)) * (0.5 + 1.3 * u_level + 0.3 * u_act);
-  float fil  = pow(n2, 3.0) * (1.1 + 1.9 * u_level) * (1.0 + 0.5 * u_act);
+  float core = exp(-dot(puv, puv) * (6.0 - 2.5 * u_level)) * (0.5 + 1.3 * u_level + 0.3 * u_act) * preDim;
+  float fil  = pow(n2, preThin) * (1.1 + 1.9 * u_level) * (1.0 + 0.5 * u_act) * preDim;
   // Hue varies with noise, radius and a slow angular swirl, and the
   // filaments blend toward a second hue a third of the palette away.
   float ang = atan(puv.y, puv.x);
@@ -1374,7 +1404,8 @@ void main() {
 
   /* ---- glass shell: fresnel rim, bright ring, specular highlight */
   float fres = pow(1.0 - nz, 3.0);
-  vec3 glass = palette(hueBase + 0.18) * fres * 0.9 + vec3(0.5) * fres * 0.25;
+  vec3 glass = (palette(hueBase + 0.18) * fres * 0.9 + vec3(0.5) * fres * 0.25)
+             * mix(0.5, 1.0, u_ready);
   // Rim shimmer: faint travelling glints while the bot is busy.
   float shimmer = noise(vec2(ang * 4.0 + u_spin * 2.0, u_time * 5.0));
   float ring = exp(-(r - R) * (r - R) * 6000.0)
@@ -1388,12 +1419,14 @@ void main() {
              * (0.025 + 0.38 * u_level);
   vec3 glowCol = palette(hueBase + 0.08) * glow;
   vec2 hl = uv - vec2(-0.32, 0.38) * R;
-  float highlight = exp(-dot(hl, hl) * 60.0) * 0.5 + exp(-dot(hl, hl) * 9.0) * 0.12;
+  float highlight = (exp(-dot(hl, hl) * 60.0) * 0.5 + exp(-dot(hl, hl) * 9.0) * 0.12)
+                  * mix(0.55, 1.0, u_ready);
 
   float glassBody = 0.10 + fres * 0.55;           // translucency of the empty glass
   vec3 insideCol = plasma + glass + vec3(1.0) * highlight;
 
-  vec3 c = hazeCol + insideCol * inside + ringCol + glowCol;
+  vec3 c = hazeCol + insideCol * inside
+         + (ringCol + glowCol) * mix(0.4, 1.0, u_ready);
 
   /* ---- tiny spark orbs around the sphere while tool calls run */
   float sparkAlpha = 0.0;
