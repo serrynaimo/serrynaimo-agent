@@ -484,6 +484,13 @@ loadFillerClips();
 let apertureData = null;
 let apertureBuf = null;
 fetch("aperture.wav").then((r) => r.arrayBuffer()).then((b) => (apertureData = b)).catch(() => {});
+let chatRevealTimer = null;
+function revealChatAfterAperture() {
+  // Text fades in 2s after the aperture opens — never before the bloom.
+  clearTimeout(chatRevealTimer);
+  chatRevealTimer = setTimeout(() => document.body.classList.add("chatReady"), 2000);
+}
+
 async function playAperture() {
   const ctx = wsOutCtx || audioCtx;
   if (!ctx || !apertureData) return;
@@ -987,6 +994,7 @@ function handleRtvi(msg) {
         bgCanvas.style.opacity = "1";
         setStatus("opening aperture");
         playAperture();
+        revealChatAfterAperture();
       } else if (data && data.event === "session-reset") {
         // Fresh conversation (button or idle timeout): clear the page.
         finishBotFlow();
@@ -1004,7 +1012,8 @@ function handleRtvi(msg) {
         // system prompt — back to the boot look until session-ready:
         // buttons, stars, and haze all fade out with the ready state.
         assistantReady = false;
-        document.body.classList.remove("ready");
+        document.body.classList.remove("ready", "chatReady");
+        clearTimeout(chatRevealTimer);
         bgCanvas.style.opacity = "0";
         setStatus("charging up", true);
       } else if (data && data.event === "session-ready") {
@@ -1014,6 +1023,7 @@ function handleRtvi(msg) {
         bgCanvas.style.opacity = "1";
         setStatus("opening aperture");
         playAperture();
+        revealChatAfterAperture();
       }
       break;
   }
