@@ -1,0 +1,29 @@
+[project]
+name = "pipecat-quickstart"
+version = "0.1.0"
+description = "Voice AI bot built with Pipecat"
+requires-python = ">=3.11"
+dependencies = [
+    # Local, on-device speech models (Apple Silicon / MLX): Qwen3-ASR + Qwen3-TTS
+    "mlx-audio>=0.4.4",
+    # transformers pinned: mlx-lm 0.31.x is incompatible with transformers >=5.6
+    "transformers==5.5.0",
+    "pipecat-ai[daily,openai,runner,silero,webrtc]>=1.4.0",
+    "pipecatcloud",
+    "pypdf>=6.14.2",
+    "resemblyzer>=0.1.4",
+    "speechbrain>=1.1.0",
+    "mcp>=1.28.1",
+    "pyobjc-framework-eventkit>=12.2.1",
+]
+
+[dependency-groups]
+dev = [
+    "pyright>=1.1.404,<2",
+    "ruff>=0.12.11,<1",
+]
+
+[tool.ruff]
+line-length = 100
+[tool.ruff.lint]
+select = ["I", "UP"]

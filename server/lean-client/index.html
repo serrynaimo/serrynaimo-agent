@@ -1,0 +1,1884 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>serrynaimo</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; background: #07080c; overflow: hidden; }
+
+  /* Starfield + colored mist, behind everything */
+  /* Hidden from first paint; fades in when the assistant reports ready. */
+  #bg { position: fixed; inset: 0; width: 100%; height: 100%; opacity: 0; transition: opacity 3s ease; }
+
+  /* The glass sphere darkens and frosts the starfield behind it. Sits
+     between the background and the orb canvas; sized just inside the
+     sphere's minimum radius so the shader's bright ring hides its edge. */
+  #orbGlass {
+    position: fixed;
+    left: 50%; top: 25vh;
+    transform: translate(-50%, -50%);
+    width: calc(min(46vh, 440px) * 0.54);
+    aspect-ratio: 1;
+    border-radius: 50%;
+    backdrop-filter: blur(3px) brightness(0.78);
+    -webkit-backdrop-filter: blur(3px) brightness(0.78);
+    -webkit-mask-image: radial-gradient(circle, black 55%, transparent 98%);
+            mask-image: radial-gradient(circle, black 55%, transparent 98%);
+    pointer-events: none;
+  }
+  body {
+    font-family: ui-monospace, "SF Mono", Menlo, Monaco, "Cascadia Mono", monospace;
+    color: #e8eaf0;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* WebGL orb — centered in the top half */
+  #orb {
+    position: fixed;
+    left: 50%; top: 25vh;
+    transform: translate(-50%, -50%);
+    width: min(92vh, 880px);
+    aspect-ratio: 2; /* wide: sparks can sit far left/right of the sphere */
+    pointer-events: none;
+  }
+
+  /* Tiny status line under the orb; fades away when idle */
+  #status {
+    position: fixed;
+    left: 50%; top: calc(25vh + min(21vh, 200px));
+    transform: translateX(-50%);
+    font-size: 12px;
+    letter-spacing: 0.08em;
+    color: rgba(232, 234, 240, 0.35);
+    transition: opacity 1.2s ease;
+    user-select: none;
+  }
+
+  /* Conversation — floating column in the lower half */
+  #chat {
+    position: fixed;
+    left: 50%; transform: translateX(-50%);
+    top: 52vh; bottom: 5vh;
+    width: min(640px, 92vw);
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    overflow-y: auto;
+    scrollbar-width: none;
+    -webkit-mask-image: linear-gradient(to bottom, transparent 0, black 130px);
+            mask-image: linear-gradient(to bottom, transparent 0, black 130px);
+  }
+  #chat::-webkit-scrollbar { display: none; }
+  #chat .spacer { margin-top: auto; }
+
+  /* When the wake gate is closed (10s since the bot last spoke, wake word
+     required), all text dims to half until the conversation resumes. */
+  #chat, #status { transition: opacity 0.8s ease; }
+  body.gated #chat, body.gated #status { opacity: 0.5; }
+
+  .msg {
+    max-width: 78%;
+    line-height: 1.55;
+    animation: rise 0.45s cubic-bezier(0.2, 0.8, 0.2, 1);
+    white-space: pre-wrap;
+    overflow-wrap: break-word;
+  }
+  .msg.bot {
+    align-self: flex-start;
+    font-size: 19px;
+    color: rgba(238, 240, 246, 0.92);
+    text-shadow: 0 0 24px rgba(0, 0, 0, 0.6);
+  }
+  .msg.bot strong { color: #ffffff; }
+  .msg.bot em { font-style: italic; }
+  .msg.bot code {
+    background: rgba(255, 255, 255, 0.08);
+    padding: 1px 6px;
+    border-radius: 5px;
+    font-size: 0.88em;
+  }
+  .msg.bot a { color: var(--accent, #8ab4ff); }
+  .msg.user {
+    align-self: flex-end;
+    font-size: 15px;
+    text-align: right;
+    color: var(--accent, #8ab4ff);
+    opacity: 0.85;
+  }
+  /* Live speech classification: soft and blurred while it reads as
+     background chatter; snaps sharp and fully opaque the moment it
+     qualifies as input (speaker matched + gate open / agent active /
+     wake word heard). */
+  .msg.user.pending { opacity: 0.85; filter: blur(1px); }
+  .msg.user.pending.qualifying { opacity: 1; filter: none; }
+  /* Permanent last row: reserves one line for the next utterance so the
+     chat never jumps when the user starts talking. */
+  .msg.user.slot { min-height: 1.55em; transition: opacity 0.35s ease, filter 0.35s ease; }
+  .msg.user.slot.fading { opacity: 0; transition: opacity 0.9s ease; }
+  @keyframes rise {
+    from { opacity: 0; transform: translateY(14px); }
+    to   { opacity: 1; transform: none; }
+  }
+
+  /* Corner buttons: typed-message entry (right), new session (left) */
+  #plus, #newSession, #mute {
+    position: fixed; bottom: 22px;
+    width: 44px; height: 44px;
+    border-radius: 50%;
+    border: 1px solid transparent; /* reserved so :active doesn't shift layout */
+    background: #23262e;
+    color: rgba(232, 234, 240, 0.75);
+    font-size: 22px;
+    cursor: pointer;
+    opacity: 0.35;
+    transition: opacity 0.25s ease, transform 0.25s ease;
+    z-index: 5;
+  }
+  #plus { right: 22px; }
+  #newSession { left: 22px; font-size: 20px; }
+  /* Mute toggle above the plus button: the strike shows the CURRENT state —
+     struck-out mic while the wake word is required, open mic while live. */
+  #mute { right: 22px; bottom: 76px; display: flex; align-items: center; justify-content: center; }
+  #mute svg { display: block; }
+  #mute .strike { display: none; }
+  body.gated #mute .strike { display: block; }
+  body.gated #mute { opacity: 0.6; }
+  #plus:hover, #plus:focus-visible, #mute:hover, #mute:focus-visible,
+  #newSession:hover, #newSession:focus-visible { opacity: 1; }
+  /* Engaged (plus while the composer is open, mute while live): the input's
+     hairline border, just under hover brightness. Hover still tops it. */
+  body.composing #plus, body:not(.gated) #mute {
+    opacity: 0.85;
+    border-color: rgba(255, 255, 255, 0.18);
+  }
+  body.composing #plus:hover, body:not(.gated) #mute:hover { opacity: 1; }
+  /* Controls stay hidden until the assistant reports ready ("getting
+     ready" fades out); then they ease in with their usual transition. */
+  body:not(.ready) #plus, body:not(.ready) #newSession, body:not(.ready) #mute {
+    opacity: 0 !important; pointer-events: none;
+  }
+  body.composing #plus { transform: rotate(45deg); }
+
+  #composer {
+    position: fixed;
+    left: 50%; transform: translateX(-50%);
+    bottom: 20px;
+    width: min(640px, 88vw);
+    display: none;
+    z-index: 4;
+  }
+  body.composing #composer { display: block; }
+  #composer input {
+    width: 100%;
+    padding: 13px 20px;
+    border-radius: 24px;
+    border: 1px solid rgba(255, 255, 255, 0.18);
+    background: transparent;
+    color: #e8eaf0;
+    font: inherit;
+    font-size: 15px;
+    outline: none;
+  }
+  #composer input::placeholder { color: rgba(232, 234, 240, 0.25); }
+
+  /* Soft cosmic haze along the bottom edge: glows while the assistant is
+     ready and the wake window is open (i.e. speech/messages are accepted);
+     fades out when the gate closes, the client mutes, or during startup. */
+  #glowHaze {
+    position: fixed;
+    left: 50%; bottom: 0;
+    transform: translateX(-50%);
+    width: min(900px, 72vw);
+    height: 42vh;
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 1.6s ease;
+    /* Hues track the orb: --accent-h is fed per-frame from orbState.hue,
+       with side lobes a step to either side for the cosmic blend. */
+    background:
+      radial-gradient(85% 75% at 50% 112%, oklch(60% 0.13 var(--accent-h, 285) / 0.14), transparent 58%),
+      radial-gradient(55% 50% at 30% 114%, oklch(68% 0.12 calc(var(--accent-h, 285) - 45) / 0.08), transparent 60%),
+      radial-gradient(55% 50% at 70% 114%, oklch(64% 0.13 calc(var(--accent-h, 285) + 45) / 0.07), transparent 60%);
+  }
+  #glowHaze::after {
+    content: "";
+    position: absolute; inset: 0;
+    background: radial-gradient(65% 55% at 50% 114%, oklch(66% 0.12 var(--accent-h, 285) / 0.08), transparent 55%);
+    animation: hazeBreathe 8s ease-in-out infinite alternate;
+  }
+  @keyframes hazeBreathe {
+    from { opacity: 0.35; }
+    to   { opacity: 1; }
+  }
+  body.ready:not(.gated) #glowHaze { opacity: 1; }
+
+  /* Shown only if the browser refuses autoplay without a gesture */
+  #tap {
+    position: fixed; inset: 0;
+    display: none;
+    align-items: center; justify-content: center;
+    background: rgba(7, 8, 12, 0.7);
+    color: rgba(232, 234, 240, 0.6);
+    font-size: 14px; letter-spacing: 0.1em;
+    cursor: pointer;
+    z-index: 10;
+  }
+</style>
+</head>
+<body>
+<canvas id="bg"></canvas>
+<div id="glowHaze"></div>
+<div id="orbGlass"></div>
+<canvas id="orb"></canvas>
+<div id="status">connecting</div>
+<div id="chat"><div class="spacer"></div></div>
+<button id="plus" title="Type a message" aria-label="Type a message">+</button>
+<button id="newSession" title="New session" aria-label="New session">↺</button>
+<button id="mute" title="Toggle wake word requirement" aria-label="Toggle wake word requirement">
+  <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor"
+       stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+    <rect x="9" y="3" width="6" height="11" rx="3"/>
+    <path d="M5 11a7 7 0 0 0 14 0"/>
+    <line x1="12" y1="18" x2="12" y2="21"/>
+    <line class="strike" x1="4" y1="4" x2="20" y2="20"/>
+  </svg>
+</button>
+<form id="composer"><input type="text" placeholder="Type a message…" autocomplete="off"></form>
+<div id="tap">tap to enable audio</div>
+
+<script>
+"use strict";
+
+/* ---------------------------------------------------------------- state */
+
+const orbState = {
+  level: 0,        // smoothed bot-audio amplitude 0..1
+  hue: 0.62,       // current palette offset
+  targetHue: 0.62,
+  conn: 0,         // 0 = connecting/dark, 1 = live
+  talking: false,
+  listening: false, // user is speaking
+  thinking: false,  // LLM is generating
+  act: 0,           // smoothed activity level 0..1
+  spin: 0,          // accumulated plasma swirl angle
+  memPulseUntil: 0, // memory-lookup activity pulse deadline
+};
+const activeCalls = new Set(); // tool calls currently in flight
+
+const statusEl = document.getElementById("status");
+let statusTimer = null;
+function setStatus(text, sticky) {
+  statusEl.textContent = text;
+  statusEl.style.opacity = "1";
+  clearTimeout(statusTimer);
+  if (!sticky) statusTimer = setTimeout(() => (statusEl.style.opacity = "0"), 2500);
+}
+
+/* ----------------------------------------------------------------- chat */
+
+const chatEl = document.getElementById("chat");
+
+/* The user slot is always the chat's last row: interim speech renders into
+   it, and it keeps one line reserved so nothing jumps when talking starts. */
+const userSlot = document.createElement("div");
+userSlot.className = "msg user pending slot";
+chatEl.appendChild(userSlot);
+
+function addMessage(cls, text) {
+  const el = document.createElement("div");
+  el.className = "msg " + cls;
+  el.textContent = text;
+  chatEl.insertBefore(el, userSlot);
+  // Keep only a comfortable backlog on screen.
+  const msgs = chatEl.querySelectorAll(".msg:not(.slot)");
+  if (msgs.length > 60) msgs[0].remove();
+  chatEl.scrollTo({ top: chatEl.scrollHeight, behavior: "smooth" });
+  return el;
+}
+
+/* Minimal markdown for bot bubbles: escape first, then inline formatting.
+   Unpaired markers stay literal until their pair streams in. */
+function mdToHtml(s) {
+  let h = s.replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+  h = h.replace(/`([^`\n]+)`/g, "<code>$1</code>");
+  h = h.replace(/\*\*\*([^*]+)\*\*\*/g, "<strong><em>$1</em></strong>");
+  h = h.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+  h = h.replace(/\*([^*\n]+)\*/g, "<em>$1</em>");
+  h = h.replace(/^#{1,4}\s*(.+)$/gm, "<strong>$1</strong>");
+  h = h.replace(/^[-*]\s+/gm, "• ");
+  h = h.replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g,
+                '<a href="$2" target="_blank" rel="noopener">$1</a>');
+  return h; // .msg is white-space: pre-wrap, so newlines render as-is
+}
+
+/* Bot text streams in as LLM tokens (which arrive well ahead of the voice),
+   is held until the bot actually starts speaking, then revealed with a paced
+   typewriter slightly faster than the speech. */
+let botFlow = { raw: "", buf: "", shown: 0, segStart: 0, el: null, speaking: false, releaseAt: 0 };
+// First-audio latency of the TTS (seconds of audio per streamed chunk); the
+// server sends the real value in a "config" server-message on connect. The
+// typewriter releases this long after the first token even if the
+// bot-started-speaking event is late (e.g. audio delayed by GPU contention).
+let ttsLeadMs = 2000;
+
+function finishBotFlow() {
+  // Flush whatever hasn't been revealed yet, honoring message splits.
+  const rest = botFlow.buf.slice(botFlow.segStart);
+  if (rest.trim()) {
+    const parts = rest.split(/\n{2,}/).map((s) => s.trim()).filter(Boolean);
+    if (botFlow.el) botFlow.el.innerHTML = mdToHtml(parts.shift() || "");
+    for (const part of parts) addMessage("bot", "").innerHTML = mdToHtml(part);
+  } else if (botFlow.el && !botFlow.el.textContent) {
+    botFlow.el.remove();
+  }
+  botFlow = { raw: "", buf: "", shown: 0, segStart: 0, el: null, speaking: false, releaseAt: 0 };
+}
+
+function onBotToken(text) {
+  if (!text) return;
+  if (!botFlow.raw) botFlow.releaseAt = performance.now() + ttsLeadMs;
+  botFlow.raw += text;
+  // Keep any <think> reasoning out of the transcript, even mid-stream.
+  botFlow.buf = botFlow.raw.replace(/<think>[\s\S]*?(<\/think>|$)/g, "").replace(/^\s+/, "");
+}
+
+function revealBotText(dt) {
+  // Hold until the voice starts — or until it *should* have (ttsLeadMs).
+  if (!botFlow.speaking && !(botFlow.releaseAt && performance.now() >= botFlow.releaseAt)) return;
+  const pending = botFlow.buf.length - botFlow.shown;
+  if (pending <= 0) return;
+  // ~24 chars/s — a touch faster than speech — with a gentle catch-up.
+  const rate = 24 + Math.min(20, pending * 0.05);
+  botFlow.shown = Math.min(botFlow.buf.length, botFlow.shown + Math.max(1, rate * dt));
+  // Blank lines split the answer into separate short bubbles as it types.
+  let visible = botFlow.buf.slice(botFlow.segStart, Math.floor(botFlow.shown));
+  let sep;
+  while ((sep = visible.indexOf("\n\n")) !== -1) {
+    if (!botFlow.el) botFlow.el = addMessage("bot", "");
+    botFlow.el.innerHTML = mdToHtml(visible.slice(0, sep).trim());
+    botFlow.el = null; // the next segment gets its own bubble
+    botFlow.segStart += sep + 2;
+    while (/\s/.test(botFlow.buf[botFlow.segStart] || "")) botFlow.segStart++;
+    visible = botFlow.buf.slice(botFlow.segStart, Math.floor(botFlow.shown));
+  }
+  if (visible) {
+    if (!botFlow.el) botFlow.el = addMessage("bot", "");
+    botFlow.el.innerHTML = mdToHtml(visible);
+  }
+  chatEl.scrollTop = chatEl.scrollHeight;
+}
+
+/* User speech: interim transcripts render live into the reserved slot at
+   the bottom. A final transcript graduates into a real message above it —
+   and if no final ever arrives (utterance dropped by the speaker or wake
+   gate), the slot's text quietly fades away again. */
+let userPendingTimer = null;
+// Explicit mute (button/space): sticky until the wake word is heard or the
+// user unmutes — bot speech must not brighten the gate while this is set.
+let userMuted = false;
+
+function dropUserPending() {
+  userSlot.classList.add("fading");
+  setTimeout(() => {
+    userSlot.textContent = "";
+    userSlot.classList.remove("fading", "qualifying");
+  }, 950);
+}
+
+/* Mirrors the server's qualification rules: interims already passed the
+   speaker gate (they aren't sent otherwise), so what remains is the wake
+   window / agent activity / wake word — all checkable here, live. */
+let wakeWords = ["serry"]; // replaced by the server's config event
+function utteranceQualifies(text) {
+  if (!userMuted && !document.body.classList.contains("gated")) return true; // window open
+  if (!userMuted && (activeCalls.size > 0 || orbState.talking || orbState.thinking)) return true;
+  const words = text.toLowerCase().match(/[\w']+/g) || [];
+  const candidates = words.slice(0, 10).concat(words.slice(-1));
+  return candidates.some((w) => wakeWords.some((ww) => w.includes(ww)));
+}
+
+function onUserInterim(text) {
+  // The user is still talking: push the filler timeout out so it can't
+  // fire mid-recognition — it counts from the LAST user activity.
+  if (filler.armed) filler.at = performance.now();
+  userSlot.classList.remove("fading");
+  userSlot.textContent = text;
+  // Sticky per utterance: once it qualifies as input, it stays opaque.
+  if (utteranceQualifies(text)) {
+    userSlot.classList.add("qualifying");
+    // Qualifying speech takes over right away: close the composer before
+    // the live transcript renders into the same spot (any draft is kept
+    // and reappears when the composer is reopened).
+    if (document.body.classList.contains("composing")) {
+      document.body.classList.remove("composing");
+      composerInput.blur();
+    }
+  }
+  chatEl.scrollTop = chatEl.scrollHeight;
+  clearTimeout(userPendingTimer);
+  userPendingTimer = setTimeout(dropUserPending, 4000);
+}
+
+function onUserText(text) {
+  // A final transcript only reaches the client if it passed the speaker and
+  // wake gates — the conversation is live: undim and restart the window.
+  userMuted = false; // server-side, a passed wake gate lifts the mute
+  openGateIndicator();
+  armGateIndicator();
+  // Back to voice: close the typed-message composer if it's open.
+  if (document.body.classList.contains("composing")) {
+    document.body.classList.remove("composing");
+    composerInput.blur();
+  }
+  clearTimeout(userPendingTimer);
+  userSlot.classList.remove("fading", "qualifying");
+  userSlot.textContent = "";
+  addMessage("user", text);
+  armFiller();
+}
+
+/* ---- client-side filler: acknowledgement clips in Serry's voice, played
+   locally so they never touch the pipeline or the conversation trail.
+   Arm on message submission; if no LLM text has arrived within
+   fillerDelayMs (server config: filler_delay_secs), play a clip and add
+   its line to the chat. While tools keep running silently, another clip
+   plays every ~15s. */
+// Full readiness (server "ready" event): models, prompt, tools, and filler
+// audio all in place — the moment speech will actually be understood.
+let assistantReady = false;
+let readySmooth = 0; // eased 0..1, drives the orb haze fade-in
+
+let fillerClips = []; // [{text, data: ArrayBuffer, buf: AudioBuffer|null}]
+let fillerIdx = 0;
+let filler = { armed: false, at: 0, lastAt: 0, repeats: 0 };
+let fillerDelayMs = 3000; // overridden by the server's filler_delay_secs
+let deadTurnTimer = null; // delayed stand-down after bot-llm-stopped
+let serverTalking = false;
+
+// The clips are synthesized during server startup, so a page that loads
+// early gets an empty manifest — retried on the server's "ready" event.
+async function loadFillerClips() {
+  try {
+    const man = await (await fetch("/filler/manifest.json")).json();
+    fillerClips = await Promise.all(
+      (man.phrases || []).map(async (p) => ({
+        text: p.text,
+        data: await (await fetch(p.url)).arrayBuffer(),
+        buf: null,
+      }))
+    );
+  } catch (e) {
+    console.warn("filler clips unavailable", e);
+  }
+}
+loadFillerClips();
+
+function armFiller() {
+  clearTimeout(deadTurnTimer); // a fresh turn must not inherit a stand-down
+  filler.armed = true;
+  filler.at = performance.now();
+  filler.repeats = 0;
+}
+
+async function playFiller() {
+  const ctx = wsOutCtx || audioCtx;
+  const gain = wsOutCtx ? wsOutGain : botGain;
+  filler.armed = false;
+  filler.lastAt = performance.now();
+  if (!ctx || !gain || !fillerClips.length) return;
+  const clip = fillerClips[fillerIdx++ % fillerClips.length];
+  try {
+    if (!clip.buf) clip.buf = await ctx.decodeAudioData(clip.data.slice(0));
+  } catch (e) { return; }
+  if (serverTalking) return; // real speech arrived while decoding
+  restoreBotAudio(); // an earlier interruption fade may have zeroed the gain
+  const src = ctx.createBufferSource();
+  src.buffer = clip.buf;
+  src.connect(gain);
+  src.start();
+  addMessage("bot", clip.text);
+  orbState.talking = true;
+  src.onended = () => { if (!serverTalking) orbState.talking = false; };
+}
+
+function fillerTick(now) {
+  if (!fillerClips.length || serverTalking) return;
+  if (filler.armed && now - filler.at > fillerDelayMs) {
+    playFiller(); // no LLM text within the delay: acknowledge the turn
+  } else if (!filler.armed && filler.lastAt && activeCalls.size > 0
+             && now - filler.lastAt > 15000 && filler.repeats < 3) {
+    filler.repeats++; // bounded: a missed tool-stop event must not loop forever
+    playFiller(); // long tool chain: keep the air alive
+  }
+}
+
+/* ------------------------------------------------------------ webrtc/rtvi */
+
+let pc = null;
+let dataChannel = null;
+let wsSock = null;
+let retryDelay = 2000;
+const audioEl = new Audio();
+audioEl.autoplay = true;
+
+/* ---- minimal protobuf codec for pipecat's WebSocket frame protocol ----
+   Frame is a oneof: 1=text 2=audio 3=transcription 4=message 5=interruption.
+   AudioRawFrame: 3=audio bytes, 4=sample_rate, 5=num_channels.
+   MessageFrame: 1=data (RTVI JSON). */
+function pbVarint(n) {
+  const out = [];
+  while (n > 127) { out.push((n & 127) | 128); n >>>= 7; }
+  out.push(n);
+  return out;
+}
+function pbLenField(fieldNo, bytes) {
+  return [(fieldNo << 3) | 2, ...pbVarint(bytes.length), ...bytes];
+}
+function pbEncodeMessage(json) {
+  const nested = pbLenField(1, Array.from(new TextEncoder().encode(json)));
+  return new Uint8Array(pbLenField(4, nested));
+}
+function pbEncodeAudio(int16, sampleRate) {
+  const bytes = Array.from(new Uint8Array(int16.buffer, int16.byteOffset, int16.byteLength));
+  const nested = [
+    ...pbLenField(3, bytes),
+    (4 << 3) | 0, ...pbVarint(sampleRate),
+    (5 << 3) | 0, ...pbVarint(1),
+  ];
+  return new Uint8Array(pbLenField(2, nested));
+}
+function pbReadVarint(u8, pos) {
+  let n = 0, shift = 0, b;
+  do { b = u8[pos++]; n += (b & 127) * 2 ** shift; shift += 7; } while (b & 128);
+  return [n, pos];
+}
+function pbFields(u8) {
+  const fields = [];
+  let pos = 0;
+  while (pos < u8.length) {
+    let key; [key, pos] = pbReadVarint(u8, pos);
+    const fieldNo = key >>> 3, wire = key & 7;
+    if (wire === 2) {
+      let len; [len, pos] = pbReadVarint(u8, pos);
+      fields.push([fieldNo, u8.subarray(pos, pos + len)]);
+      pos += len;
+    } else if (wire === 0) {
+      let v; [v, pos] = pbReadVarint(u8, pos);
+      fields.push([fieldNo, v]);
+    } else if (wire === 5) { pos += 4; }
+    else if (wire === 1) { pos += 8; }
+    else break;
+  }
+  return fields;
+}
+
+/* ---- WebSocket transport: audio playback (scheduled) and mic capture ---- */
+let wsOutCtx = null, wsOutGain = null, wsPlayCursor = 0, wsInCtx = null;
+const wsActiveSources = new Set();
+
+function wsPlayAudio(bytes, rate) {
+  if (!wsOutCtx) return;
+  if (wsOutGain.gain.value < 1) restoreBotAudio(); // new speech after a fade
+  const n = bytes.byteLength >> 1;
+  if (!n) return;
+  const i16 = new Int16Array(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + n * 2));
+  const buf = wsOutCtx.createBuffer(1, n, rate);
+  const ch = buf.getChannelData(0);
+  for (let i = 0; i < n; i++) ch[i] = i16[i] / 32768;
+  const src = wsOutCtx.createBufferSource();
+  src.buffer = buf;
+  src.connect(wsOutGain);
+  const t = Math.max(wsOutCtx.currentTime + 0.06, wsPlayCursor);
+  src.start(t);
+  wsPlayCursor = t + buf.duration;
+  wsActiveSources.add(src);
+  src.onended = () => wsActiveSources.delete(src);
+}
+
+function wsFlushPlayback() {
+  for (const s of wsActiveSources) { try { s.stop(); } catch (e) {} }
+  wsActiveSources.clear();
+  wsPlayCursor = 0;
+}
+
+function handleWsFrame(buf) {
+  for (const [no, val] of pbFields(new Uint8Array(buf))) {
+    if (no === 2) { // bot audio
+      let rate = 24000, bytes = null;
+      for (const [f, v] of pbFields(val)) {
+        if (f === 3) bytes = v;
+        else if (f === 4) rate = v;
+      }
+      if (bytes) wsPlayAudio(bytes, rate);
+    } else if (no === 4) { // transport message: RTVI JSON
+      for (const [f, v] of pbFields(val)) {
+        if (f === 1) {
+          try { handleRtvi(JSON.parse(new TextDecoder().decode(v))); } catch (e) {}
+        }
+      }
+    } else if (no === 5) { // interruption: fade queued speech out, then drop it
+      fadeOutBotAudio();
+      setTimeout(wsFlushPlayback, 70);
+    }
+  }
+}
+
+async function startWsCapture(mic, ws) {
+  wsInCtx = new AudioContext({ sampleRate: 16000 });
+  const worklet = "class Cap extends AudioWorkletProcessor{process(i){const c=i[0][0];if(c)this.port.postMessage(c.slice(0));return true;}}registerProcessor('cap',Cap);";
+  await wsInCtx.audioWorklet.addModule(
+    URL.createObjectURL(new Blob([worklet], { type: "application/javascript" }))
+  );
+  const src = wsInCtx.createMediaStreamSource(mic);
+  const node = new AudioWorkletNode(wsInCtx, "cap");
+  const mute = wsInCtx.createGain();
+  mute.gain.value = 0; // keep the worklet in a rendered graph, silently
+  src.connect(node);
+  node.connect(mute).connect(wsInCtx.destination);
+  let acc = new Float32Array(0);
+  node.port.onmessage = (ev) => {
+    const merged = new Float32Array(acc.length + ev.data.length);
+    merged.set(acc);
+    merged.set(ev.data, acc.length);
+    acc = merged;
+    const CHUNK = 320; // 20ms @ 16 kHz
+    while (acc.length >= CHUNK) {
+      const i16 = new Int16Array(CHUNK);
+      for (let i = 0; i < CHUNK; i++) {
+        i16[i] = Math.max(-32768, Math.min(32767, acc[i] * 32768));
+      }
+      if (ws.readyState === WebSocket.OPEN) ws.send(pbEncodeAudio(i16, 16000));
+      acc = acc.slice(CHUNK);
+    }
+  };
+  if (wsInCtx.state === "suspended") await wsInCtx.resume();
+}
+
+async function connectWS() {
+  setStatus("connecting", true);
+  try {
+    const mic = await getMic();
+    const proto = location.protocol === "https:" ? "wss://" : "ws://";
+    wsSock = new WebSocket(proto + location.host + "/ws-client");
+    wsSock.binaryType = "arraybuffer";
+    wsSock.onmessage = (ev) => handleWsFrame(ev.data);
+    wsSock.onclose = () => scheduleReconnect();
+    wsSock.onopen = async () => {
+      wsOutCtx = new AudioContext({ sampleRate: 24000 });
+      wsOutGain = wsOutCtx.createGain();
+      wsOutGain.connect(wsOutCtx.destination);
+      // Orb level analyser taps the playback graph.
+      audioCtx = wsOutCtx;
+      analyser = wsOutCtx.createAnalyser();
+      analyser.fftSize = 512;
+      analyser.smoothingTimeConstant = 0.6;
+      wsOutGain.connect(analyser);
+      analyserData = new Uint8Array(analyser.fftSize);
+      if (wsOutCtx.state === "suspended") showTapToStart();
+      await startWsCapture(mic, wsSock);
+      sendClientReady("lean-client-ws");
+      orbState.conn = 1;
+      retryDelay = 2000;
+      setStatus("charging up", true);
+    };
+  } catch (err) {
+    console.error(err);
+    scheduleReconnect();
+  }
+}
+
+async function getMic() {
+  return navigator.mediaDevices.getUserMedia({
+    audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+  });
+}
+
+function sendRtvi(obj) {
+  const payload = JSON.stringify(obj);
+  if (dataChannel && dataChannel.readyState === "open") {
+    dataChannel.send(payload);
+  } else if (wsSock && wsSock.readyState === WebSocket.OPEN) {
+    wsSock.send(pbEncodeMessage(payload));
+  }
+}
+
+function sendClientReady(library) {
+  sendRtvi({
+    label: "rtvi-ai",
+    type: "client-ready",
+    id: "cr-" + Math.random().toString(36).slice(2),
+    data: { version: "1.0.0", about: { library } },
+  });
+}
+
+/* WebRTC first (echo cancellation lives there); if it can't establish —
+   e.g. all networking is off, so the browser has no ICE candidates — fall
+   back to the plain WebSocket transport: pure localhost TCP, no ICE at all.
+   Force it with ?ws=1. */
+async function connect() {
+  setStatus("connecting", true);
+  if (new URLSearchParams(location.search).get("ws") === "1") return connectWS();
+  try {
+    await connectWebRTC();
+  } catch (err) {
+    console.warn("WebRTC failed, falling back to local WebSocket:", err);
+    try { pc && pc.close(); } catch (e) {}
+    pc = null;
+    dataChannel = null;
+    connectWS();
+  }
+}
+
+function connectWebRTC() {
+  return new Promise(async (resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("webrtc connect timeout")), 4500);
+    try {
+      const mic = await getMic();
+
+      pc = new RTCPeerConnection();
+      mic.getTracks().forEach((t) => pc.addTrack(t, mic));
+
+      const dc = pc.createDataChannel("rtvi");
+      dataChannel = dc;
+      dc.onmessage = onRtviMessage;
+      dc.onopen = () => {
+        clearTimeout(timer);
+        sendClientReady("lean-client");
+        orbState.conn = 1;
+        retryDelay = 2000;
+        setStatus("charging up", true);
+        resolve();
+      };
+
+      pc.ontrack = (ev) => {
+        const stream = ev.streams[0] || new MediaStream([ev.track]);
+        audioEl.srcObject = stream;
+        audioEl.play().catch(showTapToStart);
+        attachAnalyser(stream);
+      };
+
+      pc.onconnectionstatechange = () => {
+        if (["failed", "disconnected", "closed"].includes(pc.connectionState)) {
+          if (orbState.conn) scheduleReconnect(); // established before: normal retry
+          else reject(new Error("webrtc " + pc.connectionState));
+        }
+      };
+
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      await waitForIceGathering(pc);
+
+      const resp = await fetch("/api/offer", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sdp: pc.localDescription.sdp, type: pc.localDescription.type }),
+      });
+      if (!resp.ok) throw new Error("offer failed: " + resp.status);
+      await pc.setRemoteDescription(await resp.json());
+    } catch (err) {
+      clearTimeout(timer);
+      reject(err);
+    }
+  });
+}
+
+function waitForIceGathering(pc) {
+  if (pc.iceGatheringState === "complete") return Promise.resolve();
+  return new Promise((resolve) => {
+    const timeout = setTimeout(resolve, 2000); // host candidates are instant locally
+    pc.addEventListener("icegatheringstatechange", () => {
+      if (pc.iceGatheringState === "complete") { clearTimeout(timeout); resolve(); }
+    });
+  });
+}
+
+let reconnectTimer = null;
+function scheduleReconnect() {
+  if (reconnectTimer) return;
+  orbState.conn = 0;
+  orbState.talking = false;
+  setStatus("reconnecting", true);
+  try { pc && pc.close(); } catch (e) {}
+  pc = null;
+  dataChannel = null;
+  try { wsSock && wsSock.close(); } catch (e) {}
+  wsSock = null;
+  wsFlushPlayback();
+  for (const ctx of [wsInCtx, wsOutCtx]) { try { ctx && ctx.close(); } catch (e) {} }
+  wsInCtx = wsOutCtx = null;
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    connect();
+  }, retryDelay);
+  retryDelay = Math.min(retryDelay * 1.6, 12000);
+}
+
+function onRtviMessage(ev) {
+  let msg;
+  try { msg = JSON.parse(ev.data); } catch (e) { return; }
+  handleRtvi(msg);
+}
+
+function handleRtvi(msg) {
+  if (!msg || msg.label !== "rtvi-ai") return;
+  const data = msg.data || {};
+  switch (msg.type) {
+    case "user-transcription":
+      if (data.final && data.text) {
+        onUserText(data.text.trim());
+      } else if (data.text) {
+        onUserInterim(data.text.trim());
+        // Interims double as the "someone is speaking" signal now that
+        // unverified turns no longer emit user-speaking events.
+        orbState.listening = true;
+        clearTimeout(listeningTimer);
+        listeningTimer = setTimeout(() => (orbState.listening = false), 1300);
+        if (!document.body.classList.contains("gated")) armGateIndicator();
+      }
+      break;
+    case "user-started-speaking":
+      orbState.listening = true;
+      // A pending filler waits out ongoing user speech (see onUserInterim).
+      if (filler.armed) filler.at = performance.now();
+      // Ongoing speech holds the gate open (unless it's already closed).
+      if (!document.body.classList.contains("gated")) clearTimeout(gateTimer);
+      break;
+    case "user-stopped-speaking":
+      orbState.listening = false;
+      if (!document.body.classList.contains("gated")) armGateIndicator();
+      break;
+    case "bot-llm-started": // new answer: close out the previous bubble
+      finishBotFlow();
+      orbState.thinking = true;
+      clearTimeout(deadTurnTimer); // the turn continues — not dead after all
+      break;
+    case "bot-llm-stopped":
+      orbState.thinking = false;
+      // Dead-turn check (failed request, empty completion, cancelled run):
+      // stand down so fillers never fire against a turn that produced
+      // nothing. Delayed, because tool-call events routinely arrive AFTER
+      // llm-stopped — deciding instantly would kill the filler on exactly
+      // the silent tool turns it exists for.
+      clearTimeout(deadTurnTimer);
+      deadTurnTimer = setTimeout(() => {
+        if (activeCalls.size === 0 && !serverTalking) {
+          filler.armed = false;
+          filler.lastAt = 0;
+        }
+      }, 2000);
+      break;
+    case "bot-llm-text": // token stream, arrives ahead of the voice
+      if (data.text) filler.armed = false; // the model responded — no filler
+      onBotToken(data.text || "");
+      break;
+    case "bot-tts-text": {
+      // Spoken text that never went through the LLM stream — fillers like
+      // "Let me check." and tool confirmations — still belongs on screen.
+      // Compare on bare alphanumerics: quotes/dashes differ between the raw
+      // tokens and the TTS-side text (typography normalization), which
+      // would otherwise duplicate every sentence.
+      const spoken = (data.text || "").trim();
+      const norm = (s) => s.toLowerCase().replace(/[^a-z0-9]+/g, "");
+      const spokenNorm = norm(spoken);
+      if (spokenNorm && !norm(botFlow.raw).includes(spokenNorm)) {
+        addMessage("bot", spoken);
+      }
+      break;
+    }
+    case "bot-interrupted":
+      fadeOutBotAudio(); // soften the cut: 50ms ramp instead of a click
+      // Voice was cut, but the text is uninterruptable: release the
+      // typewriter so everything already generated still appears.
+      if (botFlow.buf) botFlow.speaking = true;
+      break;
+    case "bot-started-speaking":
+      restoreBotAudio();
+      serverTalking = true;
+      filler.armed = false; // the real voice arrived — no filler needed
+      filler.lastAt = 0;    // and no "still working" repeats this turn
+      orbState.talking = true;
+      orbState.thinking = false; // speech has its own animation
+      botFlow.speaking = true; // release the transcript typewriter
+      if (!userMuted) openGateIndicator(); // muted stays dim — mute is sticky
+      // Wander to a new color every time the bot starts talking.
+      orbState.targetHue += 0.17 + Math.random() * 0.14;
+      break;
+    case "bot-stopped-speaking":
+      serverTalking = false;
+      orbState.talking = false;
+      armGateIndicator(); // wake-word window: 10s from now
+      break;
+    case "llm-function-call-in-progress": // a tool call began: spawn a spark
+      addSpark(data.tool_call_id);
+      activeCalls.add(data.tool_call_id);
+      break;
+    case "llm-function-call-stopped": // tool call finished or was cancelled
+      endSpark(data.tool_call_id);
+      activeCalls.delete(data.tool_call_id);
+      break;
+    case "server-message": // custom events from the bot pipeline
+      if (data && data.event === "memory-lookup") {
+        // Instant background recall: strike in, linger a few seconds, fade.
+        const id = "mem-" + Math.random().toString(36).slice(2);
+        addSpark(id);
+        endSpark(id);
+        orbState.memPulseUntil = performance.now() + 1500;
+      } else if (data && data.event === "config") {
+        if (data.tts_lead_secs > 0) ttsLeadMs = data.tts_lead_secs * 1000;
+        if (data.filler_delay_secs > 0) fillerDelayMs = data.filler_delay_secs * 1000;
+        if (Array.isArray(data.wake_words) && data.wake_words.length) {
+          wakeWords = data.wake_words.map((w) => String(w).toLowerCase());
+        }
+      } else if (data && data.event === "ready") {
+        // Everything is loaded — you can talk now. Stars, haze, and the
+        // control buttons fade in together.
+        // "ready" also means filler synthesis finished — a page that loaded
+        // during server startup fetched an empty manifest, so retry now.
+        if (!fillerClips.length) loadFillerClips();
+        assistantReady = true;
+        document.body.classList.add("ready");
+        bgCanvas.style.opacity = "1";
+        setStatus("opening aperture");
+      } else if (data && data.event === "session-reset") {
+        // Fresh conversation (button or idle timeout): clear the page.
+        finishBotFlow();
+        chatEl.querySelectorAll(".msg:not(.slot)").forEach((el) => el.remove());
+        userSlot.textContent = "";
+        userSlot.classList.remove("fading", "qualifying");
+        fadeOutBotAudio(); // any remaining speech dies with the old session
+        // The old session's work dies too: stale tool sparks would keep the
+        // 15s "still working" filler loop alive forever.
+        activeCalls.clear();
+        sparks.forEach((s) => { if (!s.fadeStart) s.fadeStart = performance.now(); });
+        filler.armed = false;
+        filler.lastAt = 0;
+        // Context is cleared, but LM Studio is still prefilling the fresh
+        // system prompt — back to the boot look until session-ready:
+        // buttons, stars, and haze all fade out with the ready state.
+        assistantReady = false;
+        document.body.classList.remove("ready");
+        bgCanvas.style.opacity = "0";
+        setStatus("charging up", true);
+      } else if (data && data.event === "session-ready") {
+        // Fresh session live, prompt prefix cached — ready to talk.
+        assistantReady = true;
+        document.body.classList.add("ready");
+        bgCanvas.style.opacity = "1";
+        setStatus("opening aperture");
+      }
+      break;
+  }
+}
+
+/* ------------------------------------------------------- typed messages */
+
+const plusBtn = document.getElementById("plus");
+const composer = document.getElementById("composer");
+const composerInput = composer.querySelector("input");
+
+plusBtn.addEventListener("click", () => {
+  const open = document.body.classList.toggle("composing");
+  if (open) composerInput.focus();
+});
+
+document.getElementById("newSession").addEventListener("click", () => {
+  // Server resets the context and broadcasts session-reset, which clears
+  // the page — no optimistic clearing, so the UI stays truthful.
+  setStatus("charging up", true); // until the reset lands (session-reset)
+  sendRtvi({
+    label: "rtvi-ai",
+    type: "client-message",
+    id: "ns-" + Math.random().toString(36).slice(2),
+    data: { t: "new-session" },
+  });
+});
+
+/* Keyboard: delete/backspace = mute toggle, Esc = stop the voice,
+   ctrl/cmd+N = new session, any other printable key opens the composer and
+   becomes the start of the message. */
+document.addEventListener("keydown", (ev) => {
+  if (!assistantReady) return; // shortcuts arm with the controls, on ready
+  if (ev.target === composerInput) return; // already typing a message
+  if (ev.target && ev.target.tagName === "BUTTON") return; // let buttons be buttons
+  if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === "n") {
+    ev.preventDefault();
+    document.getElementById("newSession").click();
+    return;
+  }
+  if (ev.key === "Escape") {
+    // Cut the bot's voice (text and tool work continue). Fade locally right
+    // away; the server stops the stream like a spoken interruption.
+    fadeOutBotAudio();
+    sendRtvi({
+      label: "rtvi-ai",
+      type: "client-message",
+      id: "sv-" + Math.random().toString(36).slice(2),
+      data: { t: "stop-voice" },
+    });
+    return;
+  }
+  if (ev.ctrlKey || ev.metaKey || ev.altKey) return; // other browser shortcuts
+  if (ev.key === "Backspace" || ev.key === "Delete") {
+    ev.preventDefault(); // no browser back-navigation
+    document.getElementById("mute").click(); // toggle mute / wake window
+    return;
+  }
+  if (ev.key === " ") return; // a stray space shouldn't open the composer
+  if (ev.key === "Enter") {
+    ev.preventDefault(); // just open it — no phantom submit
+    document.body.classList.add("composing");
+    composerInput.focus();
+    return;
+  }
+  if (ev.key.length === 1) {
+    // Printable character: open the composer; focusing during keydown makes
+    // this very keystroke land in the input as the message's first letter.
+    document.body.classList.add("composing");
+    composerInput.focus();
+  }
+});
+
+document.getElementById("mute").addEventListener("click", () => {
+  // Toggle the wake window. Muting: speech needs the wake word again.
+  // Unmuting: talk right away — the usual idle timeout re-arms it.
+  const muted = document.body.classList.contains("gated");
+  sendRtvi({
+    label: "rtvi-ai",
+    type: "client-message",
+    id: "mu-" + Math.random().toString(36).slice(2),
+    data: { t: muted ? "unmute" : "mute" },
+  });
+  userMuted = !muted;
+  if (muted) {
+    openGateIndicator();
+    armGateIndicator();
+  } else {
+    clearTimeout(gateTimer);
+    document.body.classList.add("gated");
+  }
+});
+
+composer.addEventListener("submit", (ev) => {
+  ev.preventDefault();
+  const text = composerInput.value.trim();
+  const open = (dataChannel && dataChannel.readyState === "open")
+            || (wsSock && wsSock.readyState === WebSocket.OPEN);
+  if (!text || !open) return;
+  // send-text: the bot interrupts, appends this to context, and replies aloud.
+  sendRtvi({
+    label: "rtvi-ai",
+    type: "send-text",
+    id: "st-" + Math.random().toString(36).slice(2),
+    data: { content: text },
+  });
+  addMessage("user", text);
+  armFiller();
+  composerInput.value = "";
+});
+
+composerInput.addEventListener("keydown", (ev) => {
+  if (ev.key === "Escape") {
+    document.body.classList.remove("composing");
+    composerInput.blur();
+  }
+});
+
+/* Mirrors the wake-gate rhythm: text brightens while the bot speaks and for
+   10s after, then dims. (Note: after a TYPED message the server keeps the
+   voice gate locked regardless — the brightness here is about readability,
+   not voice-gate state.) */
+const WAKE_TIMEOUT_MS = 10000;
+let gateTimer = null;
+let listeningTimer = null;
+
+function openGateIndicator() {
+  clearTimeout(gateTimer);
+  gateTimer = null;
+  document.body.classList.remove("gated");
+}
+
+function armGateIndicator() {
+  clearTimeout(gateTimer);
+  gateTimer = setTimeout(() => document.body.classList.add("gated"), WAKE_TIMEOUT_MS);
+}
+
+document.body.classList.add("gated"); // cold start: gate is closed until the greeting
+
+/* Autoplay fallback: one tap resumes audio, then hides forever. */
+const tapEl = document.getElementById("tap");
+function showTapToStart() { tapEl.style.display = "flex"; }
+tapEl.addEventListener("click", () => {
+  tapEl.style.display = "none";
+  audioEl.play().catch(() => {});
+  for (const ctx of [audioCtx, wsOutCtx, wsInCtx]) {
+    if (ctx && ctx.state === "suspended") ctx.resume();
+  }
+});
+
+/* ---------------------------------------------- function-call spark orbs */
+
+const MAX_SPARKS = 6;
+let sparks = []; // {id, x, y, seed, birth, fadeStart}
+
+function addSpark(id) {
+  if (sparks.length >= MAX_SPARKS) sparks.shift();
+  // Random spot on a loose ring around the glass sphere (R ≈ 0.56),
+  // sometimes stretched far out to the left or right of it.
+  const angle = Math.random() * Math.PI * 2;
+  const dist = 0.7 + Math.random() * 0.25;
+  const stretch = 1 + Math.random() * Math.random() * 1.6;
+  sparks.push({
+    id: id || Math.random().toString(36),
+    x: Math.cos(angle) * dist * stretch,
+    y: Math.sin(angle) * dist,
+    seed: Math.random(),
+    birth: performance.now(),
+    fadeStart: null,
+  });
+}
+
+function endSpark(id) {
+  const s = sparks.find((s) => s.id === id && !s.fadeStart);
+  // Linger for 3-5s after the call ends, then fade out.
+  if (s) s.fadeStart = performance.now() + 3000 + Math.random() * 2000;
+}
+
+function sparkIntensity(s, now) {
+  const age = (now - s.birth) / 1000;
+  if (age > 90 && !s.fadeStart) s.fadeStart = now; // safety: never immortal
+  const fadeIn = Math.min(1, age / 0.3);
+  const flash = age < 0.5 ? Math.max(0, 1.5 - age * 3) : 0; // arrival flash
+  // Two overlapping waves make an irregular on/off sparking pattern.
+  const flicker = 0.5 + 0.5 * Math.sin(age * (5 + s.seed * 5) + s.seed * 20);
+  const gate = Math.sin(age * (2.2 + s.seed * 2.5) + s.seed * 40) > -0.55 ? 1 : 0.15;
+  let v = fadeIn * (0.25 + 0.75 * flicker) * gate + flash;
+  if (s.fadeStart && now > s.fadeStart) {
+    const f = 1 - (now - s.fadeStart) / 900;
+    if (f <= 0) return 0;
+    v *= f * f;
+  }
+  return Math.min(1.6, v);
+}
+
+function boltIntensity(s, now) {
+  // Strikes stop only once the spark is actually fading out — the arrival
+  // strike always completes even if the call finished within milliseconds,
+  // and re-strikes keep going through the linger.
+  if (s.fadeStart && now > s.fadeStart) return 0;
+  const age = (now - s.birth) / 1000;
+  if (age < 0.6) return 1 - (age / 0.6) * 0.4; // strong connecting strike on arrival
+  // Brief random re-strikes.
+  const slot = Math.floor(age * 2.5);
+  const h = Math.abs(Math.sin(slot * 12.9898 + s.seed * 78.233)) % 1;
+  if (h < 0.3) {
+    const phase = (age * 2.5) % 1;
+    return Math.max(0, 1 - phase * 2.2) * (0.5 + h);
+  }
+  return 0;
+}
+
+function updateSparkUniform(now) {
+  const flat = new Float32Array(MAX_SPARKS * 4);
+  const bolts = new Float32Array(MAX_SPARKS);
+  const alive = [];
+  for (const s of sparks) {
+    const v = sparkIntensity(s, now);
+    if (v <= 0) continue; // fully faded: drop
+    alive.push(s);
+    const i = (alive.length - 1) * 4;
+    flat[i] = s.x; flat[i + 1] = s.y; flat[i + 2] = v; flat[i + 3] = s.seed;
+    bolts[alive.length - 1] = boltIntensity(s, now);
+  }
+  sparks = alive.slice(0, MAX_SPARKS);
+  gl.uniform4fv(uniforms.u_sparks, flat);
+  gl.uniform1fv(uniforms.u_bolts, bolts);
+}
+
+/* ------------------------------------------------ bot audio level analyser */
+
+let audioCtx = null;
+let analyser = null;
+let analyserData = null;
+
+function attachAnalyser(stream) {
+  try {
+    audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+    const src = audioCtx.createMediaStreamSource(stream);
+    analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 512;
+    analyser.smoothingTimeConstant = 0.6;
+    src.connect(analyser);
+    analyserData = new Uint8Array(analyser.fftSize);
+    // Route playback through a gain node so interruptions fade out (50ms)
+    // instead of clicking. The <audio> element must stay attached and
+    // playing for WebRTC audio to flow, so mute it rather than drop it.
+    botGain = audioCtx.createGain();
+    src.connect(botGain);
+    botGain.connect(audioCtx.destination);
+    audioEl.muted = true;
+    if (audioCtx.state === "suspended") audioCtx.resume();
+  } catch (e) {
+    console.warn("audio analyser unavailable", e);
+  }
+}
+
+/* Interruption fade: ramp whichever output path is live down to zero over
+   50ms — the jitter buffer's unplayed tail decays instead of hard-cutting. */
+let botGain = null;
+
+function fadeOutBotAudio() {
+  for (const [ctx, g] of [[audioCtx, botGain], [wsOutCtx, wsOutGain]]) {
+    if (!ctx || !g) continue;
+    const t = ctx.currentTime;
+    g.gain.cancelScheduledValues(t);
+    g.gain.setValueAtTime(g.gain.value, t);
+    g.gain.linearRampToValueAtTime(0, t + 0.05);
+  }
+}
+
+function restoreBotAudio() {
+  for (const [ctx, g] of [[audioCtx, botGain], [wsOutCtx, wsOutGain]]) {
+    if (!ctx || !g) continue;
+    const t = ctx.currentTime;
+    g.gain.cancelScheduledValues(t);
+    g.gain.setValueAtTime(g.gain.value, t);
+    g.gain.linearRampToValueAtTime(1, t + 0.02);
+  }
+}
+
+function currentBotLevel() {
+  if (analyser) {
+    analyser.getByteTimeDomainData(analyserData);
+    let sum = 0;
+    for (let i = 0; i < analyserData.length; i++) {
+      const v = (analyserData[i] - 128) / 128;
+      sum += v * v;
+    }
+    const rms = Math.sqrt(sum / analyserData.length);
+    return Math.min(1, rms * 4.5);
+  }
+  // Fallback: square wave from speaking events if the analyser failed.
+  return orbState.talking ? 0.5 : 0;
+}
+
+/* ------------------------------------------------------------- webgl orb */
+
+const canvas = document.getElementById("orb");
+const gl = canvas.getContext("webgl", { alpha: true, premultipliedAlpha: false, antialias: false });
+
+const VERT = `
+attribute vec2 p;
+void main() { gl_Position = vec4(p, 0.0, 1.0); }
+`;
+
+const FRAG = `
+precision highp float;
+uniform vec2  u_res;
+uniform float u_time;
+uniform float u_level; // bot audio 0..1
+uniform float u_hue;   // palette offset
+uniform float u_conn;  // 0 dark .. 1 live
+uniform vec4  u_sparks[6]; // xy = position, z = intensity, w = seed
+uniform float u_bolts[6];  // lightning intensity per spark, 0..1
+uniform float u_spin;      // accumulated swirl angle (drives rim shimmer)
+uniform mat3  u_rot;       // accumulated plasma rotation (wandering axis)
+uniform float u_act;       // conversation activity 0..1 (listen/think/work)
+uniform float u_ready;     // 0 until the assistant is fully ready, eases to 1
+
+float hash(vec2 p) {
+  p = fract(p * vec2(123.34, 456.21));
+  p += dot(p, p + 45.32);
+  return fract(p.x * p.y);
+}
+float noise(vec2 p) {
+  vec2 i = floor(p), f = fract(p);
+  f = f * f * (3.0 - 2.0 * f);
+  return mix(mix(hash(i), hash(i + vec2(1.0, 0.0)), f.x),
+             mix(hash(i + vec2(0.0, 1.0)), hash(i + vec2(1.0, 1.0)), f.x), f.y);
+}
+float fbm(vec2 p) {
+  float v = 0.0, a = 0.5;
+  for (int i = 0; i < 5; i++) {
+    v += a * noise(p);
+    p = p * 2.03 + 7.3;
+    a *= 0.55;
+  }
+  return v;
+}
+vec3 palette(float t) {
+  return 0.5 + 0.5 * cos(6.28318 * (t + vec3(0.0, 0.33, 0.67)));
+}
+
+void main() {
+  vec2 uv = (gl_FragCoord.xy * 2.0 - u_res) / min(u_res.x, u_res.y);
+  float r = length(uv);
+  float t = u_time * 0.22;
+  float hueBase = u_hue - u_time * 0.015;
+
+  // Glass sphere: near-constant radius, breathing faintly, nudged by audio.
+  float R = 0.56 + 0.02 * sin(u_time * 1.6) + 0.04 * u_level;
+
+  /* ---- haze: slow nebula wrapped around (and faintly behind) the glass */
+  float hz1 = fbm(uv * 1.9 + vec2(t * 0.55, -t * 0.4));
+  float hz2 = fbm(uv * 3.1 - vec2(t * 0.35, t * 0.5) + hz1 * 1.7);
+  float haze = hz2 * hz2 * exp(-max(r - R, 0.0) * 3.2);
+  haze *= smoothstep(1.05, 0.6, r);                       // gone before the canvas edge
+  haze *= mix(0.3, 1.0, smoothstep(R - 0.15, R + 0.1, r)); // dimmer seen through the glass
+  haze *= 0.5 + 0.9 * u_level;
+  haze *= u_ready; // fades in once the assistant is fully ready
+  vec3 hazeCol = palette(hueBase + hz1 * 0.35 - 0.08) * haze;
+
+  /* ---- inside: plasma seen through a lens */
+  float inside = 1.0 - smoothstep(R - 0.012, R + 0.012, r);
+  float nz = sqrt(max(R * R - r * r, 0.0)) / R;   // pseudo sphere-normal z
+  // Planetary rotation: the sphere's surface point turns by the accumulated
+  // rotation (composed incrementally in JS around a slowly wandering, tilted
+  // axis), so the plasma streams across the disc like a spinning globe —
+  // faster while listening/thinking/working.
+  vec3 sp3 = vec3(uv / max(R, 0.001), nz);
+  vec3 rp = u_rot * sp3;
+  vec2 puv = rp.xy * R * mix(1.25, 0.78, nz);     // refraction + rotation
+
+  float n1 = fbm(puv * 2.2 + vec2(t * 0.9, -t * 0.7));
+  float n2 = fbm(puv * 4.2 - vec2(t * 0.6, t * 0.85) + n1 * 1.3);
+  float core = exp(-dot(puv, puv) * (6.0 - 2.5 * u_level)) * (0.5 + 1.3 * u_level + 0.3 * u_act);
+  float fil  = pow(n2, 3.0) * (1.1 + 1.9 * u_level) * (1.0 + 0.5 * u_act);
+  // Hue varies with noise, radius and a slow angular swirl, and the
+  // filaments blend toward a second hue a third of the palette away.
+  float ang = atan(puv.y, puv.x);
+  float hue = hueBase + n2 * 0.26 + r * 0.08 + 0.09 * sin(ang * 2.0 + u_time * 0.4);
+  vec3 filCol = mix(palette(hue), palette(hue + 0.3), n1);
+  vec3 plasma = filCol * fil + (vec3(0.9) + palette(hue) * 0.6) * core;
+
+  /* ---- glass shell: fresnel rim, bright ring, specular highlight */
+  float fres = pow(1.0 - nz, 3.0);
+  vec3 glass = palette(hueBase + 0.18) * fres * 0.9 + vec3(0.5) * fres * 0.25;
+  // Rim shimmer: faint travelling glints while the bot is busy.
+  float shimmer = noise(vec2(ang * 4.0 + u_spin * 2.0, u_time * 5.0));
+  float ring = exp(-(r - R) * (r - R) * 6000.0)
+             * (0.35 + 0.45 * u_level + 0.35 * u_act * shimmer);
+  vec3 ringCol = palette(hueBase + 0.05) * ring + vec3(0.3) * ring;
+
+  // Halo around the glass — wide, soft falloff. Nearly gone at rest,
+  // blooming with the voice.
+  float glow = exp(-max(r - R, 0.0) * 3.0)
+             * smoothstep(R - 0.02, R + 0.06, r)
+             * (0.025 + 0.38 * u_level);
+  vec3 glowCol = palette(hueBase + 0.08) * glow;
+  vec2 hl = uv - vec2(-0.32, 0.38) * R;
+  float highlight = exp(-dot(hl, hl) * 60.0) * 0.5 + exp(-dot(hl, hl) * 9.0) * 0.12;
+
+  float glassBody = 0.10 + fres * 0.55;           // translucency of the empty glass
+  vec3 insideCol = plasma + glass + vec3(1.0) * highlight;
+
+  vec3 c = hazeCol + insideCol * inside + ringCol + glowCol;
+
+  /* ---- tiny spark orbs around the sphere while tool calls run */
+  float sparkAlpha = 0.0;
+  for (int i = 0; i < 6; i++) {
+    vec4 s = u_sparks[i];
+    if (s.z > 0.001) {
+      vec2 sd = uv - s.xy;
+      float dd = dot(sd, sd);
+      float sdist = sqrt(dd);
+      // Thin bright core; the light comes from a wide, smooth halo.
+      float body = exp(-dd * 2600.0) * 1.2
+                 + exp(-dd * 300.0) * 0.25
+                 + exp(-sdist * 5.5) * 0.30;
+      vec3 scol = palette(hueBase + s.w * 0.6 + 0.15);
+      c += (scol * 0.85 + vec3(0.5)) * body * s.z;
+      sparkAlpha += body * s.z;
+
+      /* lightning arc from the glass rim out to the spark */
+      float bi = u_bolts[i];
+      if (bi > 0.001) {
+        float tl = max(length(s.xy), 0.001);
+        vec2 dirn = s.xy / tl;
+        vec2 origin = dirn * R;
+        vec2 seg = s.xy - origin;
+        float tp = clamp(dot(uv - origin, seg) / max(dot(seg, seg), 0.0001), 0.0, 1.0);
+        vec2 perp = vec2(-dirn.y, dirn.x);
+        // jagged displacement, zero at both endpoints, dancing over time
+        float wob = (fbm(vec2(tp * 9.0 + s.w * 60.0, u_time * 9.0 + s.w * 13.0)) - 0.5)
+                  * 0.16 * sin(3.14159 * tp);
+        vec2 disp = origin + seg * tp + perp * wob;
+        float bd2 = dot(uv - disp, uv - disp);
+        // Same idea: razor-thin filament, broad soft light around it.
+        float bolt = (exp(-bd2 * 7000.0) * 1.1
+                    + exp(-bd2 * 900.0) * 0.25
+                    + exp(-sqrt(bd2) * 9.0) * 0.4) * bi;
+        c += (scol * 0.6 + vec3(0.85)) * bolt;
+        sparkAlpha += bolt;
+      }
+    }
+  }
+
+  c *= 0.25 + 0.75 * u_conn;
+
+  float alpha = clamp(haze * 0.85
+                    + (glassBody + fil * 0.7 + core) * inside
+                    + ring + glow + sparkAlpha, 0.0, 1.0);
+  gl_FragColor = vec4(c, alpha);
+}
+`;
+
+function buildProgram() {
+  function compile(type, src) {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src);
+    gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+      throw new Error(gl.getShaderInfoLog(s));
+    }
+    return s;
+  }
+  const prog = gl.createProgram();
+  gl.attachShader(prog, compile(gl.VERTEX_SHADER, VERT));
+  gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, FRAG));
+  gl.linkProgram(prog);
+  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+    throw new Error(gl.getProgramInfoLog(prog));
+  }
+  return prog;
+}
+
+let uniforms = {};
+function initGL() {
+  const prog = buildProgram();
+  gl.useProgram(prog);
+  const buf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+  const loc = gl.getAttribLocation(prog, "p");
+  gl.enableVertexAttribArray(loc);
+  gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+  for (const name of ["u_res", "u_time", "u_level", "u_hue", "u_conn", "u_spin", "u_rot", "u_act", "u_ready"]) {
+    uniforms[name] = gl.getUniformLocation(prog, name);
+  }
+  // Array uniforms may be reported with a [0] suffix depending on the driver.
+  uniforms.u_sparks =
+    gl.getUniformLocation(prog, "u_sparks") || gl.getUniformLocation(prog, "u_sparks[0]");
+  uniforms.u_bolts =
+    gl.getUniformLocation(prog, "u_bolts") || gl.getUniformLocation(prog, "u_bolts[0]");
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+}
+
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2.5);
+  canvas.width = Math.round(canvas.clientWidth * dpr);
+  canvas.height = Math.round(canvas.clientHeight * dpr);
+  gl.viewport(0, 0, canvas.width, canvas.height);
+}
+window.addEventListener("resize", resize);
+
+/* Plasma rotation: composed incrementally as a quaternion so the axis can
+   wander and the speed can surge/settle without the pattern ever jumping. */
+const spinState = {
+  q: [0, 0, 0, 1],
+  axis: [0.35, 1, 0.18],
+  targetAxis: [0.35, 1, 0.18],
+  speed: 1,
+  targetSpeed: 1,
+  nextAxisChange: 0,
+  nextSpeedChange: 0,
+  planeAngle: 0, // accumulated in-plane (screen) component of the rotation
+  rateNow: 0.05, // current angular speed, rad/s
+};
+
+function quatMul(a, b) {
+  return [
+    a[3] * b[0] + a[0] * b[3] + a[1] * b[2] - a[2] * b[1],
+    a[3] * b[1] - a[0] * b[2] + a[1] * b[3] + a[2] * b[0],
+    a[3] * b[2] + a[0] * b[1] - a[1] * b[0] + a[2] * b[3],
+    a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2],
+  ];
+}
+
+function stepSpin(now, dt, rate) {
+  const s = spinState;
+  if (now > s.nextAxisChange) { // re-tilt the pole every so often
+    s.targetAxis = [(Math.random() - 0.5) * 1.2, 1, (Math.random() - 0.5) * 0.8];
+    s.nextAxisChange = now + 9000 + Math.random() * 15000;
+  }
+  if (now > s.nextSpeedChange) { // surge or settle occasionally
+    s.targetSpeed = 0.45 + Math.random() * 1.25;
+    s.nextSpeedChange = now + 4000 + Math.random() * 9000;
+  }
+  for (let i = 0; i < 3; i++) s.axis[i] += (s.targetAxis[i] - s.axis[i]) * 0.01;
+  s.speed += (s.targetSpeed - s.speed) * 0.02;
+
+  const len = Math.hypot(...s.axis) || 1;
+  s.rateNow = rate * s.speed; // current angular speed, rad/s
+  const advance = s.rateNow * dt;
+  const half = advance * 0.5;
+  const sh = Math.sin(half) / len;
+  s.q = quatMul([s.axis[0] * sh, s.axis[1] * sh, s.axis[2] * sh, Math.cos(half)], s.q);
+  const qn = Math.hypot(...s.q) || 1;
+  s.q = s.q.map((v) => v / qn);
+  // The z-component of the axis is the part of the spin that visibly turns
+  // features around the disc center — the lens flare follows exactly that.
+  s.planeAngle += advance * (s.axis[2] / len);
+  return advance; // angle advanced this frame
+}
+
+function spinMat3() {
+  const [x, y, z, w] = spinState.q;
+  return new Float32Array([
+    1 - 2 * (y * y + z * z), 2 * (x * y + w * z), 2 * (x * z - w * y),
+    2 * (x * y - w * z), 1 - 2 * (x * x + z * z), 2 * (y * z + w * x),
+    2 * (x * z + w * y), 2 * (y * z - w * x), 1 - 2 * (x * x + y * y),
+  ]);
+}
+
+let connSmooth = 0;
+const t0 = performance.now();
+let lastFrameTime = t0;
+function frame() {
+  const now = performance.now();
+  const time = (now - t0) / 1000;
+  const dt = Math.min((now - lastFrameTime) / 1000, 0.1);
+  lastFrameTime = now;
+
+  revealBotText(dt);
+  fillerTick(now);
+  readySmooth += ((assistantReady ? 1 : 0) - readySmooth) * 0.02;
+
+  // Smooth the audio level: fast attack, gentle release.
+  const target = currentBotLevel();
+  orbState.level += (target - orbState.level) * (target > orbState.level ? 0.35 : 0.06);
+
+  // Ease hue toward its target; drift a little extra while talking.
+  if (orbState.talking) orbState.targetHue += 0.0004;
+  orbState.hue += (orbState.targetHue - orbState.hue) * 0.02;
+
+  // Activity: thinking churns hardest, tool work close behind, listening
+  // stirs gently. Eases up quickly, settles back down slowly.
+  const actTarget = Math.max(
+    orbState.thinking ? 1 : 0,
+    activeCalls.size > 0 ? 0.85 : 0,
+    now < orbState.memPulseUntil ? 0.85 : 0,
+    orbState.listening ? 0.45 : 0,
+  );
+  orbState.act += (actTarget - orbState.act) * (actTarget > orbState.act ? 0.08 : 0.025);
+  orbState.spin += stepSpin(now, dt, 0.05 + orbState.act * 0.9);
+
+  connSmooth += (orbState.conn - connSmooth) * 0.03;
+
+  // Feed the accent color (matches the orb) to the chat CSS; the bottom
+  // haze derives its gradient hues from the same angle.
+  const deg = ((orbState.hue % 1) + 1) % 1 * 360;
+  document.documentElement.style.setProperty("--accent", `oklch(78% 0.14 ${deg.toFixed(0)})`);
+  document.documentElement.style.setProperty("--accent-h", deg.toFixed(0));
+
+  gl.clearColor(0, 0, 0, 0);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  updateSparkUniform(now);
+  gl.uniform2f(uniforms.u_res, canvas.width, canvas.height);
+  gl.uniform1f(uniforms.u_time, time);
+  gl.uniform1f(uniforms.u_level, orbState.level);
+  gl.uniform1f(uniforms.u_hue, orbState.hue);
+  gl.uniform1f(uniforms.u_conn, connSmooth);
+  gl.uniform1f(uniforms.u_spin, orbState.spin);
+  gl.uniformMatrix3fv(uniforms.u_rot, false, spinMat3());
+  gl.uniform1f(uniforms.u_act, orbState.act);
+  gl.uniform1f(uniforms.u_ready, readySmooth);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+  // Sample the freshly drawn plasma (must happen in the same frame as the
+  // draw) to drive the lens flares. Every 3rd frame: readback is a GPU sync.
+  if (frameCounter++ % 3 === 0) probeFlareBrightness();
+
+  renderBG(time);
+
+  requestAnimationFrame(frame);
+}
+let frameCounter = 0;
+
+/* -------------------------------------------- starfield + mist background */
+
+const bgCanvas = document.getElementById("bg");
+const bgGl = bgCanvas.getContext("webgl", { alpha: false, antialias: false });
+
+const BG_FRAG = `
+precision highp float;
+uniform vec2  u_res;
+uniform float u_time;
+uniform vec2  u_orb; // orb center, same normalized space as p
+uniform float u_hue; // live orb hue — the glow band and flares follow it
+uniform vec3  u_flares[16]; // xy = source position, z = intensity 0..1
+uniform float u_flareT;    // slow phase (ghosts drift)
+uniform vec2  u_flareDir;  // shared flare axis (rotates with the orb)
+
+// Static palette: deep blue/violet mist with a faint warm counter-layer.
+const float HUE = 0.62;
+
+float hash(vec2 p) {
+  p = fract(p * vec2(123.34, 456.21));
+  p += dot(p, p + 45.32);
+  return fract(p.x * p.y);
+}
+float noise(vec2 p) {
+  vec2 i = floor(p), f = fract(p);
+  f = f * f * (3.0 - 2.0 * f);
+  return mix(mix(hash(i), hash(i + vec2(1.0, 0.0)), f.x),
+             mix(hash(i + vec2(0.0, 1.0)), hash(i + vec2(1.0, 1.0)), f.x), f.y);
+}
+float fbm(vec2 p) {
+  float v = 0.0, a = 0.5;
+  for (int i = 0; i < 3; i++) {
+    v += a * noise(p);
+    p = p * 2.03 + 7.3;
+    a *= 0.55;
+  }
+  return v;
+}
+vec3 palette(float t) {
+  return 0.5 + 0.5 * cos(6.28318 * (t + vec3(0.0, 0.33, 0.67)));
+}
+
+void main() {
+  vec2 p = (gl_FragCoord.xy * 2.0 - u_res) / min(u_res.x, u_res.y);
+  vec3 c = vec3(0.027, 0.031, 0.047); // matches the page background
+
+  // Two star layers, twinkling, spread across the whole viewport,
+  // wheeling very slowly around the orb like a night sky.
+  float ra = u_time * 0.003;
+  mat2 rot = mat2(cos(ra), -sin(ra), sin(ra), cos(ra));
+  vec2 pr = rot * (p - u_orb) + u_orb;
+  for (int l = 0; l < 2; l++) {
+    float scale = l == 0 ? 26.0 : 52.0;
+    vec2 g = pr * scale + float(l) * 37.0;
+    vec2 cell = floor(g);
+    vec2 f = fract(g);
+    float h = hash(cell);
+    vec2 sp = vec2(hash(cell + 1.7), hash(cell + 4.3)) * 0.8 + 0.1;
+    vec2 sd = f - sp;
+    float tw = 0.55 + 0.45 * sin(u_time * (0.5 + h * 2.2) + h * 40.0);
+    float star = exp(-dot(sd, sd) * 240.0) * step(0.8, h) * tw;
+    c += vec3(0.75, 0.82, 1.0) * star * (l == 0 ? 0.55 : 0.3);
+  }
+
+  // Slow colored mist: everywhere, but denser around the orb.
+  float t = u_time * 0.03;
+  float m1 = fbm(p * 1.1 + vec2(t, -t * 0.7));
+  float m2 = fbm(p * 1.8 - vec2(t * 0.8, t * 0.5) + m1);
+  vec2 od = p - u_orb;
+  float focus = exp(-dot(od, od) * 0.5);
+  float mist = m2 * m2 * (0.35 + 0.65 * focus);
+  c += palette(HUE + m1 * 0.3) * mist * 0.16;
+  c += palette(HUE + 0.45 + m2 * 0.2) * m1 * m1 * 0.06;
+
+  // Dim glow band stretching left and right from behind the orb:
+  // tight vertically, reaching far horizontally.
+  // Tinted well away from the orb's body color (past its highlight tone),
+  // and glowing brighter the closer it gets to the orb itself.
+  float band = exp(-(od.x * od.x * 0.4 + od.y * od.y * 5.5));
+  float bandGain = 0.09 + 0.11 * exp(-dot(od, od) * 2.0);
+  c += palette(u_hue - u_time * 0.015 + 0.42) * band * bandGain;
+
+  // Lens flares born directly from bright plasma: every sample point on
+  // the sphere emits its own flare when bright — no selection, so flares
+  // only ever change through their own smooth intensity.
+  vec2 fperp = vec2(-u_flareDir.y, u_flareDir.x);
+  for (int s = 0; s < 16; s++) {
+    vec3 fl = u_flares[s];
+    if (fl.z > 0.004) {
+      vec2 rel = p - fl.xy;
+      float along = dot(rel, u_flareDir);
+      float across = dot(rel, fperp);
+      vec3 fc = vec3(0.0);
+      // anamorphic streak through the source, reaching across the page
+      float streak = exp(-across * across * 220.0) * exp(-abs(along) * 0.9);
+      fc += (palette(u_hue + 0.08) * 0.6 + vec3(0.5)) * streak * 0.8;
+      // ghost circles drifting along the shared axis
+      for (int i = 0; i < 5; i++) {
+        float fi = float(i);
+        float k = (fi - 2.0) * (0.5 + 0.4 * u_flareT);
+        if (abs(k) > 0.05) {
+          vec2 gp = fl.xy + u_flareDir * k;
+          float d2 = dot(p - gp, p - gp);
+          fc += palette(u_hue + 0.15 + fi * 0.1) * exp(-d2 * (90.0 + fi * 70.0))
+              * (0.45 - 0.06 * fi);
+        }
+      }
+      // soft halo ring around the source
+      fc += (palette(u_hue + 0.05) * 0.7 + vec3(0.3))
+          * exp(-abs(length(rel) - 0.42) * 9.0) * 0.25;
+      c += fc * fl.z * 0.13;
+    }
+  }
+
+  // Fade the whole scene into black towards the bottom (under the chat).
+  c *= smoothstep(0.0, 0.55, gl_FragCoord.y / u_res.y);
+
+  gl_FragColor = vec4(c, 1.0);
+}
+`;
+
+let bgUniforms = null;
+function initBG() {
+  function compile(type, src) {
+    const s = bgGl.createShader(type);
+    bgGl.shaderSource(s, src);
+    bgGl.compileShader(s);
+    if (!bgGl.getShaderParameter(s, bgGl.COMPILE_STATUS)) {
+      throw new Error(bgGl.getShaderInfoLog(s));
+    }
+    return s;
+  }
+  const prog = bgGl.createProgram();
+  bgGl.attachShader(prog, compile(bgGl.VERTEX_SHADER, VERT));
+  bgGl.attachShader(prog, compile(bgGl.FRAGMENT_SHADER, BG_FRAG));
+  bgGl.linkProgram(prog);
+  if (!bgGl.getProgramParameter(prog, bgGl.LINK_STATUS)) {
+    throw new Error(bgGl.getProgramInfoLog(prog));
+  }
+  bgGl.useProgram(prog);
+  const buf = bgGl.createBuffer();
+  bgGl.bindBuffer(bgGl.ARRAY_BUFFER, buf);
+  bgGl.bufferData(bgGl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), bgGl.STATIC_DRAW);
+  const loc = bgGl.getAttribLocation(prog, "p");
+  bgGl.enableVertexAttribArray(loc);
+  bgGl.vertexAttribPointer(loc, 2, bgGl.FLOAT, false, 0, 0);
+  bgUniforms = {};
+  for (const name of ["u_res", "u_time", "u_orb", "u_hue",
+                      "u_flareT", "u_flareDir"]) {
+    bgUniforms[name] = bgGl.getUniformLocation(prog, name);
+  }
+  bgUniforms.u_flares =
+    bgGl.getUniformLocation(prog, "u_flares") || bgGl.getUniformLocation(prog, "u_flares[0]");
+}
+
+function resizeBG() {
+  // Soft content: plain 1x resolution is plenty and keeps the GPU cool.
+  bgCanvas.width = bgCanvas.clientWidth;
+  bgCanvas.height = bgCanvas.clientHeight;
+  bgGl.viewport(0, 0, bgCanvas.width, bgCanvas.height);
+}
+window.addEventListener("resize", resizeBG);
+
+/* Lens flare, driven by the plasma itself: probes the rendered orb pixels
+   along the 10:30 / 4:30 diagonal — when the sphere's rotation brings bright
+   filaments there, the flares light up, and while talking they pulse with
+   the plasma's audio-driven brightness. */
+const FLARE_BASE_ANGLE = Math.PI * 0.75; // 10:30 on the clock
+
+// The flare axis turns with the orb: base diagonal plus the accumulated
+// in-plane component of the plasma rotation (same speed, same surges).
+function currentFlareDir() {
+  const a = FLARE_BASE_ANGLE + spinState.planeAngle;
+  return [Math.cos(a), Math.sin(a)];
+}
+
+/* Flares are EMITTED by bright plasma, not tracked: a fixed polar grid of
+   sample points covers the disc, each with its own eased intensity. Points
+   where the rendered plasma is bright become flare sources in place — they
+   bloom and fade as the rotation carries brightness through them, several
+   at once when both sides are lit. Nothing moves, so nothing can jump. */
+const PROBE_RADII = [0.2, 0.38];
+const PROBE_ANGLES = 8;
+const probeGrid = []; // fixed [ux, uy] sample positions
+for (let a = 0; a < PROBE_ANGLES; a++) {
+  const ang = (a * 2 * Math.PI) / PROBE_ANGLES;
+  for (const rr of PROBE_RADII) {
+    probeGrid.push([Math.cos(ang) * rr, Math.sin(ang) * rr]);
+  }
+}
+const probeVals = new Float32Array(probeGrid.length);   // probe-rate eased glow
+const flareRender = new Float32Array(probeGrid.length); // render-rate smoothed
+
+/* One batched readback of the disc's bounding box per probe cycle — a
+   single GPU sync instead of sixteen. Individual readPixels calls each
+   stall the GPU pipeline; at probe rate that fought the LLM for the GPU
+   and could starve the whole system. */
+let probeBuf = null, probeSide = 0, probeX0 = 0, probeY0 = 0;
+
+function probeFlareBrightness() {
+  const W = canvas.width, H = canvas.height, m = Math.min(W, H);
+  const dir = currentFlareDir();
+  const R = Math.ceil(0.46 * m * 0.5) * 2; // covers probes out to 0.4 uv
+  if (!probeBuf || probeSide !== R) {
+    probeSide = R;
+    probeBuf = new Uint8Array(R * R * 4);
+  }
+  probeX0 = Math.max(0, Math.floor((W - R) / 2));
+  probeY0 = Math.max(0, Math.floor((H - R) / 2));
+  gl.readPixels(probeX0, probeY0, R, R, gl.RGBA, gl.UNSIGNED_BYTE, probeBuf);
+  for (let i = 0; i < probeGrid.length; i++) {
+    const [ux, uy] = probeGrid[i];
+    const px = Math.min(R - 1, Math.max(0, Math.round((ux * m + W) / 2) - probeX0));
+    const py = Math.min(R - 1, Math.max(0, Math.round((uy * m + H) / 2) - probeY0));
+    const o = (py * R + px) * 4;
+    const lum = (probeBuf[o] + probeBuf[o + 1] + probeBuf[o + 2]) / 765;
+    // Brightness near the rotating diagonal counts extra (clock rule).
+    const rr = Math.hypot(ux, uy);
+    const cosT = (ux * dir[0] + uy * dir[1]) / rr;
+    // Soft onset (smoothstep) so flicker around the threshold barely
+    // registers, and slow easing so flares breathe in over ~a second.
+    // Soft gate against noise, then intensity tracks the actual pixel
+    // luminance (superlinear, so truly bright spots clearly outshine).
+    const g = Math.min(1, Math.max(0, (lum - 0.18) / 0.12));
+    const gate = g * g * (3 - 2 * g);
+    const target = gate * Math.pow(lum, 1.5) * (0.3 + 0.7 * cosT * cosT);
+    // Fade speed follows the spin: dreamy when the orb turns slowly,
+    // responsive when it whirls, so flares keep up with moving brightness.
+    const mul = 1 + spinState.rateNow * 3;
+    const cur = probeVals[i];
+    probeVals[i] += (target - cur)
+      * (target > cur ? Math.min(0.16, 0.04 * mul) : Math.min(0.1, 0.02 * mul));
+  }
+}
+
+let flareGateSmooth = 1; // eases to 0 while muted: lens flares rest with the gate
+
+function renderBG(time) {
+  if (!bgUniforms) return;
+  const gateTarget = document.body.classList.contains("gated") ? 0 : 1;
+  flareGateSmooth += (gateTarget - flareGateSmooth) * 0.03;
+  const talkMul = (orbState.talking ? 0.45 + 0.75 * orbState.level : 0.7) * flareGateSmooth;
+  const fT = (time * 0.12) % 1; // ghosts drift gently while flares live
+  const W = bgCanvas.width, H = bgCanvas.height, m = Math.min(W, H);
+  bgGl.uniform2f(bgUniforms.u_res, W, H);
+  bgGl.uniform1f(bgUniforms.u_time, time);
+  bgGl.uniform1f(bgUniforms.u_hue, orbState.hue);
+  const fDir = currentFlareDir();
+  const orbY = 0.5 * H / m; // orb center: horizontally centered, 25% down
+  const uvScale = canvas.clientHeight / m; // orb-uv → bg coordinate space
+  // Per-frame smoothing over every grid point: probe data arrives at half
+  // rate and the talk pulse moves fast, so this layer turns both into
+  // silky fades (quicker bloom, slower dissolve).
+  const easeMul = 1 + spinState.rateNow * 3;
+  for (let i = 0; i < flareRender.length; i++) {
+    const t = probeVals[i] * talkMul;
+    flareRender[i] += (t - flareRender[i])
+      * (t > flareRender[i] ? Math.min(0.08, 0.02 * easeMul) : Math.min(0.05, 0.012 * easeMul));
+  }
+  // Every grid point is a potential flare — upload them all; the shader
+  // skips the dark ones. No top-N selection, so nothing can pop in or out.
+  const flares = new Float32Array(probeGrid.length * 3);
+  for (let i = 0; i < probeGrid.length; i++) {
+    flares[i * 3] = probeGrid[i][0] * uvScale;
+    flares[i * 3 + 1] = orbY + probeGrid[i][1] * uvScale;
+    flares[i * 3 + 2] = flareRender[i];
+  }
+  bgGl.uniform3fv(bgUniforms.u_flares, flares);
+  bgGl.uniform1f(bgUniforms.u_flareT, fT);
+  bgGl.uniform2f(bgUniforms.u_flareDir, fDir[0], fDir[1]);
+  bgGl.uniform2f(bgUniforms.u_orb, 0, orbY);
+  bgGl.drawArrays(bgGl.TRIANGLES, 0, 3);
+}
+
+/* ------------------------------------------------------------------ boot */
+
+initGL();
+resize();
+initBG();
+resizeBG();
+requestAnimationFrame(frame);
+connect();
+</script>
+</body>
+</html>
