@@ -12,6 +12,7 @@
 #
 
 import asyncio
+import base64
 import io
 import os
 import re
@@ -548,6 +549,13 @@ class Qwen3ASRSTTService(SegmentedSTTService):
         # transcript lands (talking + ASR latency would otherwise push an
         # in-window utterance past the deadline).
         self._utterance_started_active = False
+        # LLM_AUDIO_INPUT=1: after ALL gates pass (speaker, wake, mute),
+        # stash the utterance audio so the pipeline can hand it to an
+        # audio-native LLM (e.g. Qwen3-Omni) instead of only the transcript.
+        self._llm_audio_input = (
+            os.getenv("LLM_AUDIO_INPUT", "0").strip().lower() in ("1", "true", "yes")
+        )
+        self._llm_audio: dict | None = None
         # Session-reset fence: utterances that STARTED before this stamp are
         # discarded wherever they surface (capture, interim, transcription),
         # so speech from the old session never leaks into a fresh one.
@@ -597,6 +605,22 @@ class Qwen3ASRSTTService(SegmentedSTTService):
         """A typed message arrived: the bot's spoken reply must not open the
         voice window — the next voice utterance still needs the wake word."""
         self._voice_driven = False
+
+    def take_llm_audio(self) -> dict | None:
+        """The gated utterance audio for the LLM ({text, b64}), consumed once."""
+        audio, self._llm_audio = self._llm_audio, None
+        return audio
+
+    @staticmethod
+    def _wav_b64(samples) -> str:
+        """float32 mono @16k -> base64 WAV (16-bit PCM)."""
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(QWEN3_ASR_SAMPLE_RATE)
+            w.writeframes(_float_to_pcm16(samples))
+        return base64.b64encode(buf.getvalue()).decode()
 
     def abandon_utterances(self):
         """Discard any utterance in flight (session reset): everything that
@@ -970,6 +994,8 @@ class Qwen3ASRSTTService(SegmentedSTTService):
         self._last_activity = time.monotonic()
 
         logger.debug(f"Qwen3-ASR transcription: [{text}]")
+        if self._llm_audio_input:
+            self._llm_audio = {"text": text, "b64": self._wav_b64(samples)}
         yield TranscriptionFrame(
             text,
             getattr(self, "_user_id", "") or "",

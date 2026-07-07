@@ -78,6 +78,7 @@ from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.frames.frames import (
     Frame,
+    LLMContextFrame,
     LLMFullResponseStartFrame,
     LLMMessagesAppendFrame,
     LLMRunFrame,
@@ -1885,6 +1886,53 @@ class MemoryInjector(FrameProcessor):
         )
 
 
+class AudioToLLMAttach(FrameProcessor):
+    """Hand gated utterance AUDIO to an audio-native LLM (LLM_AUDIO_INPUT=1).
+
+    Sits between the user aggregator and the LLM. When the STT stashed audio
+    for the utterance that just became the newest user message, the message
+    content is rewritten to [input_audio, transcript-note] parts. The
+    transcript note keeps audio-blind servers working (they simply read the
+    ASR text, i.e. today's behavior) and keeps the trail searchable.
+    """
+
+    def __init__(self, stt, context, **kwargs):
+        super().__init__(**kwargs)
+        self._stt = stt
+        self._context = context
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+        if isinstance(frame, LLMContextFrame):
+            try:
+                self._attach_audio()
+            except Exception as exc:  # noqa: BLE001 — never block the turn
+                logger.warning(f"Audio attach failed: {exc}")
+        await self.push_frame(frame, direction)
+
+    def _attach_audio(self):
+        audio = self._stt.take_llm_audio()
+        if not audio:
+            return
+        for m in reversed(self._context.get_messages()):
+            if not (isinstance(m, dict) and m.get("role") == "user"):
+                continue
+            if m.get("content") == audio["text"]:
+                m["content"] = [
+                    {
+                        "type": "input_audio",
+                        "input_audio": {"data": audio["b64"], "format": "wav"},
+                    },
+                    {
+                        "type": "text",
+                        "text": f"[voice message — ASR transcript, may contain "
+                                f"mishearings: {audio['text']}]",
+                    },
+                ]
+                logger.info("Attached utterance audio to the LLM turn")
+            break  # only ever consider the newest user message
+
+
 def _recent_memories_block() -> str:
     """The five newest memories for the system prompt, so the model has
     recency awareness without a recall call."""
@@ -2725,6 +2773,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
             stt,
             MemoryInjector(context),
             user_aggregator,
+            AudioToLLMAttach(stt, context),
             llm,
             voice_gate,
             tts,
