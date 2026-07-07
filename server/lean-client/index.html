@@ -428,6 +428,10 @@ function onUserInterim(text) {
 }
 
 function onUserText(text) {
+  // A control command (new session / mute) is handled server-side and by the
+  // "command" server-message — suppress the normal client flow (no bubble,
+  // no filler, and crucially no gate re-open that would fight a mute).
+  if (classifyCommand(text)) { userSlot.textContent = ""; userSlot.classList.remove("qualifying"); return; }
   // A final transcript only reaches the client if it passed the speaker and
   // wake gates — the conversation is live: undim and restart the window.
   userMuted = false; // server-side, a passed wake gate lifts the mute
@@ -979,12 +983,19 @@ function handleRtvi(msg) {
         addSpark(id);
         endSpark(id);
         orbState.memPulseUntil = performance.now() + 1500;
+      } else if (data && data.event === "command") {
+        // A spoken control phrase the server caught before the LLM: act on it.
+        // (Server already re-armed the wake gate for "mute".)
+        if (data.action === "new-session") triggerNewSession();
+        else if (data.action === "mute") triggerQuiet();
       } else if (data && data.event === "config") {
         if (data.tts_lead_secs > 0) ttsLeadMs = data.tts_lead_secs * 1000;
         if (data.filler_delay_secs > 0) fillerDelayMs = data.filler_delay_secs * 1000;
         if (Array.isArray(data.wake_words) && data.wake_words.length) {
           wakeWords = data.wake_words.map((w) => String(w).toLowerCase());
         }
+        if (Array.isArray(data.new_session_phrases)) newSessionPhrases = data.new_session_phrases;
+        if (Array.isArray(data.mute_phrases)) mutePhrases = data.mute_phrases;
       } else if (data && data.event === "ready") {
         // Everything is loaded — you can talk now. Stars, haze, and the
         // control buttons fade in together.
@@ -1041,6 +1052,36 @@ plusBtn.addEventListener("click", () => {
   const open = document.body.classList.toggle("composing");
   if (open) composerInput.focus();
 });
+
+// Control-command phrases, sent from the server (.env-configured) via config.
+// The SERVER also matches these on voice transcripts and swallows them before
+// the LLM — these client copies only catch TYPED commands before they send.
+let newSessionPhrases = ["start a new session", "start new session"];
+let mutePhrases = ["shut up", "mute yourself", "be quiet",
+                   "im not talking to you", "i am not talking to you"];
+function normalizeCommand(text) {
+  let t = (text || "").toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
+  for (const w of (wakeWords && wakeWords.length ? wakeWords : ["serry"])) {
+    if (t.startsWith(w + " ")) { t = t.slice(w.length + 1).trim(); break; }
+  }
+  return t.replace(/^please\s+/, "").replace(/\s+(please|now|thanks)$/, "");
+}
+function classifyCommand(text) {
+  const t = normalizeCommand(text);
+  if (newSessionPhrases.some((p) => normalizeCommand(p) === t)) return "new-session";
+  if (mutePhrases.some((p) => normalizeCommand(p) === t)) return "mute";
+  return null;
+}
+function triggerNewSession() {
+  playSubmitSound();
+  document.getElementById("newSession").click(); // reloads the page
+}
+function triggerQuiet() {
+  // Speaking already interrupted any bot audio; just require the wake word again.
+  if (!document.body.classList.contains("gated")) {
+    document.getElementById("mute").click();
+  }
+}
 
 document.getElementById("newSession").addEventListener("click", () => {
   // Full page reload: tears down the WebRTC connection, which cancels the
@@ -1119,6 +1160,12 @@ document.getElementById("mute").addEventListener("click", () => {
 composer.addEventListener("submit", (ev) => {
   ev.preventDefault();
   const text = composerInput.value.trim();
+  const cmd = classifyCommand(text);
+  if (cmd) {
+    composerInput.value = "";
+    if (cmd === "new-session") triggerNewSession(); else triggerQuiet();
+    return;
+  }
   const open = (dataChannel && dataChannel.readyState === "open")
             || (wsSock && wsSock.readyState === WebSocket.OPEN);
   if (!text || !open) return;

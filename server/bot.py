@@ -1766,6 +1766,83 @@ class LMStudioLLMService(OpenAILLMService):
         return "".join(self._verbatim_parts)
 
 
+def _parse_phrase_list(env_name: str, default: list[str]) -> list[str]:
+    """Command phrases from .env — a JSON array or a comma-separated string."""
+    raw = os.getenv(env_name, "").strip()
+    if not raw:
+        return default
+    try:
+        import json as _json
+        v = _json.loads(raw)
+        if isinstance(v, list):
+            return [str(x).strip() for x in v if str(x).strip()]
+    except ValueError:
+        pass
+    return [p.strip() for p in raw.split(",") if p.strip()]
+
+
+NEW_SESSION_PHRASES = _parse_phrase_list(
+    "COMMAND_NEW_SESSION_PHRASES", ["start a new session", "start new session"]
+)
+MUTE_PHRASES = _parse_phrase_list(
+    "COMMAND_MUTE_PHRASES",
+    ["shut up", "mute yourself", "be quiet",
+     "i'm not talking to you", "i am not talking to you"],
+)
+
+
+def _normalize_command(text: str, wake_words: list[str]) -> str:
+    """Lowercase, strip punctuation, drop a leading wake word and please/now."""
+    t = re.sub(r"[^a-z0-9\s]", " ", str(text).lower())
+    t = re.sub(r"\s+", " ", t).strip()
+    for w in (wake_words or ["serry"]):
+        if t.startswith(w + " "):
+            t = t[len(w) + 1:].strip()
+            break
+    t = re.sub(r"^please\s+", "", t)
+    t = re.sub(r"\s+(please|now|thanks)$", "", t)
+    return t
+
+
+def classify_command(text: str, wake_words: list[str]) -> str | None:
+    """Return 'new-session', 'mute', or None for a transcript/typed message."""
+    t = _normalize_command(text, wake_words)
+    norm = lambda ps: {_normalize_command(p, wake_words) for p in ps}
+    if t in norm(NEW_SESSION_PHRASES):
+        return "new-session"
+    if t in norm(MUTE_PHRASES):
+        return "mute"
+    return None
+
+
+class VoiceCommandInterceptor(FrameProcessor):
+    """Catch spoken control phrases BEFORE they reach the LLM.
+
+    Sits right after the STT service. A transcript that matches a configured
+    command (new session / mute) is SWALLOWED — never forwarded to memory
+    injection or the LLM — and the action is taken: the client is told to
+    reload / show muted, and mute also re-arms the server wake gate.
+    """
+
+    def __init__(self, stt, **kwargs):
+        super().__init__(**kwargs)
+        self._stt = stt
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+        if isinstance(frame, TranscriptionFrame) and frame.text.strip():
+            action = classify_command(frame.text, self._stt._wake_words)  # noqa: SLF001
+            if action:
+                logger.info(f"Voice command intercepted: {action} [{frame.text[:40]}]")
+                if action == "mute":
+                    self._stt.require_wake_word()
+                await self.push_frame(
+                    RTVIServerMessageFrame(data={"event": "command", "action": action})
+                )
+                return  # swallow — the LLM never sees it
+        await self.push_frame(frame, direction)
+
+
 class MemoryInjector(FrameProcessor):
     """Auto-recall: for every user utterance, search long-term memory with the
     utterance's own words and prepend the top matches to the LLM context.
@@ -2772,6 +2849,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
         [
             transport.input(),
             stt,
+            VoiceCommandInterceptor(stt),
             MemoryInjector(context),
             user_aggregator,
             AudioToLLMAttach(stt, context),
@@ -2926,6 +3004,10 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
                     # The client mirrors the wake gate for its live-transcript
                     # dimming, so it needs the real wake words.
                     "wake_words": stt._wake_words,  # noqa: SLF001
+                    # Command phrases (also matched server-side for voice) —
+                    # the client uses these to catch TYPED commands before send.
+                    "new_session_phrases": NEW_SESSION_PHRASES,
+                    "mute_phrases": MUTE_PHRASES,
                 }
             )
         )
