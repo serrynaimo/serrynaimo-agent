@@ -436,6 +436,7 @@ function onUserText(text) {
   userSlot.classList.remove("fading", "qualifying");
   userSlot.textContent = "";
   addMessage("user", text);
+  playSubmitSound();
   armFiller();
 }
 
@@ -474,6 +475,27 @@ async function loadFillerClips() {
   }
 }
 loadFillerClips();
+
+/* ---- submit sound: the macOS "Pop" plays on every submitted message ---- */
+let plopData = null;
+let plopBuf = null;
+fetch("plop.wav").then((r) => r.arrayBuffer()).then((b) => (plopData = b)).catch(() => {});
+async function playSubmitSound() {
+  const ctx = wsOutCtx || audioCtx;
+  if (!ctx || !plopData) return;
+  try {
+    if (!plopBuf) plopBuf = await ctx.decodeAudioData(plopData.slice(0));
+  } catch (e) { return; }
+  // Straight to the destination at fixed volume: independent of bot-audio
+  // gain, so barge-in fades never duck the confirmation sound.
+  const g = ctx.createGain();
+  g.gain.value = 0.7;
+  g.connect(ctx.destination);
+  const src = ctx.createBufferSource();
+  src.buffer = plopBuf;
+  src.connect(g);
+  src.start();
+}
 
 function armFiller() {
   clearTimeout(deadTurnTimer); // a fresh turn must not inherit a stand-down
@@ -984,15 +1006,12 @@ plusBtn.addEventListener("click", () => {
 });
 
 document.getElementById("newSession").addEventListener("click", () => {
-  // Server resets the context and broadcasts session-reset, which clears
-  // the page — no optimistic clearing, so the UI stays truthful.
-  setStatus("charging up", true); // until the reset lands (session-reset)
-  sendRtvi({
-    label: "rtvi-ai",
-    type: "client-message",
-    id: "ns-" + Math.random().toString(36).slice(2),
-    data: { t: "new-session" },
-  });
+  // Full page reload: tears down the WebRTC connection, which cancels the
+  // whole server pipeline (tools, generation, TTS) and starts a genuinely
+  // fresh session on reconnect. The old in-place reset left stray work
+  // running server-side.
+  setStatus("charging up", true);
+  location.reload();
 });
 
 /* Keyboard: delete/backspace = mute toggle, Esc = stop the voice,
@@ -1074,6 +1093,7 @@ composer.addEventListener("submit", (ev) => {
     data: { content: text },
   });
   addMessage("user", text);
+  playSubmitSound();
   armFiller();
   composerInput.value = "";
 });
