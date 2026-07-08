@@ -62,6 +62,31 @@ def _mem_id(note_key: str, content: str) -> str:
     return hashlib.sha1(f"{note_key}\x00{_norm(content)}".encode("utf-8")).hexdigest()[:8]
 
 
+def _osa_str(s: str) -> str:
+    """Escape a Python string for embedding in an AppleScript double-quoted literal."""
+    return s.replace("\\", "\\\\").replace('"', '\\"')
+
+
+# Field/record separators for the batch fetch: ASCII unit/record separators,
+# which never occur in Notes' HTML bodies (unlike the "|||"/"<<<>>>" the griches
+# MCP server uses, which a note body could contain).
+_US, _RS = "\x1f", "\x1e"
+
+# Shared handlers: stamp a Notes date as a fixed-width, lexically-sortable
+# "YYYYMMDDhhmmss" string. Fixed width means string order == chronological
+# order, so no locale-dependent date parsing or large-integer epoch math.
+_OSA_PRELUDE = """
+on pad2(n)
+	set padded to (n as integer) as text
+	if (length of padded) < 2 then set padded to "0" & padded
+	return padded
+end pad2
+on fmtStamp(d)
+	return ((year of d) as text) & pad2(month of d as integer) & pad2(day of d) & pad2(hours of d) & pad2(minutes of d) & pad2(seconds of d)
+end fmtStamp
+"""
+
+
 class NotesMemoryStore:
     def __init__(self, agent_name: str, stats_db_path: str, call_tool):
         """call_tool: async (toolset_key, tool_name, args) -> str text output."""
@@ -86,7 +111,9 @@ class NotesMemoryStore:
         self._lock = threading.RLock()
         self._mem: dict[str, dict] = {}      # id -> {id, content, kind, person, location, note_path, order, created_at}
         self._people: dict[str, dict] = {}   # lower-name -> {name, aliases, description}
-        self._note_mod: dict[str, str] = {}  # "folder\x00title" -> modificationDate
+        # Cheap change-detector for the poll: (note count, newest "YYYYMMDDhhmmss"
+        # modification stamp) across the agent's folders as of the last load.
+        self._last_fp: tuple[int, str] = (0, "0")
 
         # async write plumbing
         self._dirty: set[str] = set()         # note paths ("folder\x00title") to rewrite
@@ -105,6 +132,80 @@ class NotesMemoryStore:
                 await self._mcp("create_folder", {"name": f})
             except Exception as exc:  # noqa: BLE001 — already-exists is fine
                 logger.debug(f"notes folder {f}: {exc}")
+
+    # ---- direct AppleScript (read paths) --------------------------------
+    #
+    # The griches Notes MCP server only offers list_notes + per-note get_note,
+    # so a poll or a reload would spawn one osascript per folder (poll) or per
+    # note (reload). Both the poll's "did anything change?" check and the batch
+    # fetch below run their whole scan inside ONE osascript instead, driving
+    # Notes far less. Writes still go through the MCP server (see flush()).
+
+    @staticmethod
+    async def _run_osascript(script: str) -> str:
+        proc = await asyncio.create_subprocess_exec(
+            "osascript", "-e", script,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        out, err = await proc.communicate()
+        if proc.returncode != 0:
+            raise RuntimeError((err or b"").decode("utf-8", "replace").strip() or "osascript failed")
+        return out.decode("utf-8", "replace").rstrip("\n")
+
+    def _folder_list_literal(self) -> str:
+        folders = (self._root, self._profiles, self._actions)
+        return "{" + ", ".join(f'"{_osa_str(f)}"' for f in folders) + "}"
+
+    async def _fingerprint(self) -> tuple[int, str]:
+        """One osascript: (note count, newest modification stamp) over all folders.
+
+        This is the 30s poll. It reads only each note's modification date — never
+        a body — so it stays cheap even with many notes.
+        """
+        script = f'''{_OSA_PRELUDE}
+tell application "Notes"
+	set noteCount to 0
+	set maxStamp to "0"
+	repeat with fn in {self._folder_list_literal()}
+		try
+			repeat with n in notes of folder (fn as text)
+				set noteCount to noteCount + 1
+				set curStamp to my fmtStamp(modification date of n)
+				if curStamp > maxStamp then set maxStamp to curStamp
+			end repeat
+		end try
+	end repeat
+	return (noteCount as text) & "|" & maxStamp
+end tell'''
+        raw = await self._run_osascript(script)
+        count_s, _, stamp = raw.partition("|")
+        return (int(count_s or 0), stamp or "0")
+
+    async def _fetch_folder(self, folder: str) -> list[dict]:
+        """One osascript: every note's title + body + modification stamp in a folder.
+
+        Replaces list_notes + one get_note per note (N+1 osascript spawns) with a
+        single scan. Body is Notes' raw HTML, exactly as get_note returned it, so
+        _parse_note is unchanged.
+        """
+        script = f'''{_OSA_PRELUDE}
+tell application "Notes"
+	set out to ""
+	repeat with n in notes of folder "{_osa_str(folder)}"
+		set out to out & (name of n) & "{_US}" & (body of n) & "{_US}" & my fmtStamp(modification date of n) & "{_RS}"
+	end repeat
+	return out
+end tell'''
+        raw = await self._run_osascript(script)
+        notes = []
+        for record in raw.split(_RS):
+            if not record:
+                continue
+            parts = record.split(_US)
+            if len(parts) < 3:
+                continue
+            notes.append({"title": parts[0], "body": parts[1], "modificationDate": parts[2]})
+        return notes
 
     # ---- parsing / rendering -------------------------------------------
 
@@ -228,25 +329,23 @@ class NotesMemoryStore:
         """Full rebuild of the RAM index from Notes."""
         mem: dict[str, dict] = {}
         people: dict[str, dict] = {}
-        note_mod: dict[str, str] = {}
-        import json
+        count = 0
+        max_stamp = "0"
 
         async def load_folder(folder: str, kind: str, person_from_title: bool):
+            nonlocal count, max_stamp
             try:
-                listing = json.loads(await self._mcp("list_notes", {"folder": folder}))
+                notes = await self._fetch_folder(folder)
             except Exception as exc:  # noqa: BLE001
-                logger.warning(f"notes list {folder}: {exc}")
+                logger.warning(f"notes fetch {folder}: {exc}")
                 return
-            for meta in listing if isinstance(listing, list) else []:
-                title = meta.get("title", "")
-                note_mod[self._note_key(folder, title)] = meta.get("modificationDate", "")
-                try:
-                    note = json.loads(await self._mcp("get_note", {"title": title, "folder": folder}))
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning(f"notes get {folder}/{title}: {exc}")
-                    continue
+            for meta in notes:
+                title = meta["title"]
+                count += 1
+                if meta["modificationDate"] > max_stamp:
+                    max_stamp = meta["modificationDate"]
                 person = title if person_from_title and title.lower() != "you" else None
-                mems, aliases, desc = self._parse_note(folder, title, note.get("body", ""), kind, person)
+                mems, aliases, desc = self._parse_note(folder, title, meta["body"], kind, person)
                 if person_from_title:
                     people[title.lower()] = {"name": title, "aliases": aliases, "description": desc}
                 for rec in mems:
@@ -269,29 +368,26 @@ class NotesMemoryStore:
                     "SELECT created_at FROM memory_stats WHERE memory_id = ?", (mid,)
                 ).fetchone()
                 rec["created_at"] = row[0] if row and row[0] else now
-            self._mem, self._people, self._note_mod = mem, people, note_mod
+            self._mem, self._people = mem, people
+            # Record the state we just loaded so the poll only reloads on a change.
+            self._last_fp = (count, max_stamp)
         logger.info(f"Notes memory loaded: {len(mem)} memories, {len(people)} people")
 
     async def refresh(self):
-        """Poll for externally-edited notes and reload if any changed."""
-        import json
-        changed = False
-        for folder in (self._profiles, self._actions, self._root):
-            try:
-                listing = json.loads(await self._mcp("list_notes", {"folder": folder}))
-            except Exception:  # noqa: BLE001
-                continue
-            seen = set()
-            for meta in listing if isinstance(listing, list) else []:
-                k = self._note_key(folder, meta.get("title", ""))
-                seen.add(k)
-                if self._note_mod.get(k) != meta.get("modificationDate", ""):
-                    changed = True
-            # a note that vanished also counts as a change
-            for k in list(self._note_mod):
-                if k.startswith(folder + "\x00") and k not in seen:
-                    changed = True
-        if changed:
+        """Poll (every 30s): reload only if a note was added, edited, or removed.
+
+        One osascript reads the note count and newest modification stamp across
+        the agent's folders. A newer stamp means something was edited or added;
+        a different count catches an add or a delete (a deletion advances no
+        stamp). Either way we do a full reload; otherwise nothing touches Notes.
+        """
+        try:
+            count, stamp = await self._fingerprint()
+        except Exception as exc:  # noqa: BLE001 — a poll hiccup must not kill the loop
+            logger.debug(f"notes poll: {exc}")
+            return
+        last_count, last_stamp = self._last_fp
+        if count != last_count or stamp > last_stamp:
             logger.info("Notes changed externally — reloading memory index")
             await self.reload()
 
@@ -312,17 +408,25 @@ class NotesMemoryStore:
 
     async def flush(self):
         """Drain all pending note writes/deletes, awaiting completion."""
+        wrote = False
         while True:
             with self._lock:
                 dirty = self._dirty; self._dirty = set()
                 deleted = self._deleted_notes; self._deleted_notes = set()
             if not dirty and not deleted:
+                # Our own writes bumped modification stamps (and counts); resync the
+                # fingerprint so the next poll doesn't reload them straight back in.
+                if wrote:
+                    try:
+                        self._last_fp = await self._fingerprint()
+                    except Exception as exc:  # noqa: BLE001
+                        logger.debug(f"notes fingerprint resync: {exc}")
                 return
+            wrote = True
             for key in deleted:
                 folder, title = key.split("\x00", 1)
                 try:
                     await self._mcp("delete_note", {"title": title, "folder": folder})
-                    self._note_mod.pop(key, None)
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(f"notes delete {key}: {exc}")
             for key in dirty:
@@ -348,7 +452,6 @@ class NotesMemoryStore:
                         await self._mcp("update_note", {
                             "title": title, "folder": folder, "body": header_body,
                         })
-                    self._note_mod[key] = _now()
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(f"notes write {key}: {exc}")
 
