@@ -2595,6 +2595,10 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
             if w.strip()
         ],
         wake_timeout_secs=float(os.getenv("WAKE_TIMEOUT_SECS", "10")),
+        # If a closed-gate turn runs this long with no wake word, stop
+        # transcribing it and wait for the next turn. Needs interims on (the
+        # partials are what let the wake word be spotted mid-turn). 0 disables.
+        wake_giveup_secs=float(os.getenv("WAKE_GIVEUP_SECS", "20")),
         # Live partial transcripts while speaking; ASR_INTERIM=0 disables to
         # take load off the shared MLX worker.
         interim_transcripts=os.getenv("ASR_INTERIM", "1").lower() not in ("0", "false", "no"),

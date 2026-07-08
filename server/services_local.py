@@ -479,6 +479,7 @@ class Qwen3ASRSTTService(SegmentedSTTService):
         calibrate: bool = False,
         wake_words: list[str] | None = None,
         wake_timeout_secs: float = 10.0,
+        wake_giveup_secs: float = 20.0,
         wake_word_window: int = 10,
         interim_transcripts: bool = True,
         **kwargs,
@@ -516,6 +517,10 @@ class Qwen3ASRSTTService(SegmentedSTTService):
             logger.info(f"Speaker gating enabled ({mode})")
         self._wake_words = [w.strip().lower() for w in (wake_words or []) if w.strip()]
         self._wake_timeout_secs = wake_timeout_secs
+        # When the wake gate is closed, a single utterance that runs this long
+        # without the wake word appearing is given up on: transcription of it
+        # stops and nothing resumes until the next fresh turn. 0 disables it.
+        self._wake_giveup_secs = wake_giveup_secs
         self._wake_word_window = wake_word_window
         # Monotonic time of the last activity that keeps the wake gate open:
         # bot speech, plus the user's own accepted speech (so continuing to
@@ -549,6 +554,9 @@ class Qwen3ASRSTTService(SegmentedSTTService):
         # transcript lands (talking + ASR latency would otherwise push an
         # in-window utterance past the deadline).
         self._utterance_started_active = False
+        # Per-utterance: whether the wake word has been heard yet in this turn's
+        # partials. Once true, the give-up timer is disarmed for the turn.
+        self._utterance_wake_seen = False
         # LLM_AUDIO_INPUT=1: after ALL gates pass (speaker, wake, mute),
         # stash the utterance audio so the pipeline can hand it to an
         # audio-native LLM (e.g. Qwen3-Omni) instead of only the transcript.
@@ -566,6 +574,11 @@ class Qwen3ASRSTTService(SegmentedSTTService):
                 f"Wake gate enabled: from {wake_timeout_secs:.0f}s after the bot last spoke, "
                 f"utterances must contain one of {self._wake_words} "
                 f"in the first {wake_word_window} words"
+                + (
+                    f"; a closed-gate turn with no wake word within "
+                    f"{wake_giveup_secs:.0f}s is ignored until the next turn"
+                    if wake_giveup_secs else ""
+                )
             )
         logger.info("Qwen3-ASR model ready")
 
@@ -736,6 +749,39 @@ class Qwen3ASRSTTService(SegmentedSTTService):
         # Substring match so "serry" also catches "serrynaimo" and "serry's".
         return any(wake in word for word in candidates for wake in self._wake_words)
 
+    def _wake_giveup_armed(self) -> bool:
+        """True while the current turn is a candidate for the give-up timer:
+        wake gating is on with a give-up window, the turn began with the gate
+        already closed (so it needs the wake word), and no wake word has been
+        heard in it yet."""
+        return bool(
+            self._wake_words
+            and self._wake_giveup_secs
+            and not self._utterance_started_active
+            and not self._utterance_wake_seen
+        )
+
+    def _mark_wake_seen(self):
+        """A partial revealed the wake word mid-turn: open the window now so the
+        rest of the turn (and its final transcript) is accepted, and disarm the
+        give-up timer."""
+        self._utterance_wake_seen = True
+        self._muted = False
+        self._last_activity = time.monotonic()
+        logger.info("Wake gate: wake word heard (partial)")
+
+    def _giveup_no_wake(self):
+        """The wake word never came within the give-up window: abandon this turn
+        everywhere it might still surface (partials + final), and stay quiet
+        until the next turn starts after the natural pause. Reuses the session
+        fence, which already drops in-flight utterances started before it."""
+        logger.info(
+            f"Wake gate: no wake word within {self._wake_giveup_secs:.0f}s — "
+            "ignoring this turn and pausing transcription until the next one"
+        )
+        self._abandoned_at = time.monotonic()
+        self._notify_dropped()
+
     # --- interim transcription: words appear while the user is speaking ----
 
     INTERIM_MIN_SECS = 1.0   # shortest partial worth transcribing
@@ -745,6 +791,7 @@ class Qwen3ASRSTTService(SegmentedSTTService):
         await super()._handle_user_started_speaking(frame)
         self._utterance_started_active = self.conversation_active()
         self._utterance_started_at = time.monotonic()
+        self._utterance_wake_seen = False
         # Speech that begins inside the window holds the window open, so a
         # user who keeps talking (with pauses) is never timed out mid-flow.
         if self._utterance_started_active:
@@ -788,6 +835,16 @@ class Qwen3ASRSTTService(SegmentedSTTService):
                     return
                 if self._utterance_abandoned(self._utterance_started_at):
                     return  # session reset — stop showing partials for it
+                # Give-up timer: a closed-gate turn that has run this long with
+                # no wake word is abandoned before we spend any more ASR on it.
+                # Checked before the buffer/speaker work so even a non-matching
+                # or near-silent monologue stops on time.
+                if (
+                    self._wake_giveup_armed()
+                    and time.monotonic() - self._utterance_started_at >= self._wake_giveup_secs
+                ):
+                    self._giveup_no_wake()
+                    return
                 buf = bytes(self._audio_buffer)
                 grew = len(buf) - last_len >= self.sample_rate  # >= 0.5s of new audio
                 if len(buf) < int(self.sample_rate * 2 * self.INTERIM_MIN_SECS) or not grew:
@@ -809,6 +866,12 @@ class Qwen3ASRSTTService(SegmentedSTTService):
                     text = await self._worker.run(self._transcribe, samples)
                 except Exception:  # noqa: BLE001 — partials are best-effort
                     continue
+                # The wake word showing up in a partial opens the window mid-turn,
+                # so a genuine long command that opens with the wake word is never
+                # given up on (and its final transcript is accepted even if the
+                # word later scrolls out of the wake-check window).
+                if self._wake_giveup_armed() and text and self._has_wake_word(text):
+                    self._mark_wake_seen()
                 if self._user_speaking and text and text != last_text:
                     last_text = text
                     await self.push_frame(
