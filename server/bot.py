@@ -3328,13 +3328,13 @@ if __name__ == "__main__":
         result = await run_text_chat(req.prompt, req.history or [], req.max_tool_rounds)
         return _JSONResponse(result)
 
-    # Minimal dark-mode voice client at /lean-client (auto-connects, orb + chat)
+    # Minimal dark-mode voice client at /serrynaimo (auto-connects, orb + chat)
     from fastapi.staticfiles import StaticFiles
 
     runner_run.app.mount(
-        "/lean-client",
-        StaticFiles(directory=os.path.join(os.path.dirname(__file__), "lean-client"), html=True),
-        name="lean-client",
+        "/serrynaimo",
+        StaticFiles(directory=os.path.join(os.path.dirname(__file__), "serrynaimo"), html=True),
+        name="serrynaimo",
     )
 
     # Bind to all interfaces so the bot is reachable via the machine's LAN IP,

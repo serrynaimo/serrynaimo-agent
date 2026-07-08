@@ -212,7 +212,11 @@
   #glowHaze {
     position: fixed;
     left: 50%; bottom: 0;
-    transform: translateX(-50%);
+    /* --mic (0..1, fed per-frame from the mic's voice-band level) grows the
+       haze upward and brightens it — a subtle pulse on the user's voice. */
+    transform: translateX(-50%) scaleY(var(--mic-scale, 1));
+    transform-origin: bottom center;
+    filter: brightness(var(--mic-bright, 1));
     width: min(900px, 72vw);
     height: 42vh;
     pointer-events: none;
@@ -278,6 +282,7 @@
 
 const orbState = {
   level: 0,        // smoothed bot-audio amplitude 0..1
+  mic: 0,          // smoothed mic voice-band level 0..1 (drives the bottom haze)
   hue: 0.62,       // current palette offset
   targetHue: 0.62,
   conn: 0,         // 0 = connecting/dark, 1 = live
@@ -859,6 +864,7 @@ async function connectWS() {
   setStatus("connecting", true);
   try {
     const mic = await getMic();
+    attachMicAnalyser(mic); // voice-band level for the bottom haze pulse
     const proto = location.protocol === "https:" ? "wss://" : "ws://";
     wsSock = new WebSocket(proto + location.host + "/ws-client");
     wsSock.binaryType = "arraybuffer";
@@ -936,6 +942,7 @@ function connectWebRTC() {
     const timer = setTimeout(() => reject(new Error("webrtc connect timeout")), 4500);
     try {
       const mic = await getMic();
+    attachMicAnalyser(mic); // voice-band level for the bottom haze pulse
 
       pc = new RTCPeerConnection();
       mic.getTracks().forEach((t) => pc.addTrack(t, mic));
@@ -1376,7 +1383,7 @@ function showTapToStart() { tapEl.style.display = "flex"; }
 tapEl.addEventListener("click", () => {
   tapEl.style.display = "none";
   audioEl.play().catch(() => {});
-  for (const ctx of [audioCtx, wsOutCtx, wsInCtx]) {
+  for (const ctx of [audioCtx, wsOutCtx, wsInCtx, micCtx]) {
     if (ctx && ctx.state === "suspended") ctx.resume();
   }
 });
@@ -1526,6 +1533,43 @@ function currentBotLevel() {
   }
   // Fallback: square wave from speaking events if the analyser failed.
   return orbState.talking ? 0.5 : 0;
+}
+
+/* ------------------------------------------ mic input level (voice pulse) */
+
+// A separate analyser on the raw mic stream (independent of the transport,
+// so it works on both the WebRTC and WebSocket paths). Only used to nudge
+// the bottom haze — never touches the audio that's sent to the server.
+const glowHaze = document.getElementById("glowHaze");
+let micCtx = null, micAnalyser = null, micFreq = null;
+
+function attachMicAnalyser(stream) {
+  try {
+    micCtx = micCtx || new (window.AudioContext || window.webkitAudioContext)();
+    const src = micCtx.createMediaStreamSource(stream);
+    micAnalyser = micCtx.createAnalyser();
+    micAnalyser.fftSize = 512;
+    micAnalyser.smoothingTimeConstant = 0.78;
+    src.connect(micAnalyser); // analyser only — not routed to any destination
+    micFreq = new Uint8Array(micAnalyser.frequencyBinCount);
+    if (micCtx.state === "suspended") micCtx.resume();
+  } catch (e) {
+    console.warn("mic analyser unavailable", e);
+  }
+}
+
+// Mean energy across the voice band (~120 Hz – 3.2 kHz), normalized 0..1 —
+// ignores low rumble and high hiss so the haze responds to speech, not noise.
+function currentMicLevel() {
+  if (!micAnalyser) return 0;
+  micAnalyser.getByteFrequencyData(micFreq);
+  const binHz = micCtx.sampleRate / micAnalyser.fftSize;
+  const lo = Math.max(1, Math.floor(120 / binHz));
+  const hi = Math.min(micFreq.length - 1, Math.ceil(3200 / binHz));
+  let sum = 0;
+  for (let i = lo; i <= hi; i++) sum += micFreq[i];
+  const avg = sum / (hi - lo + 1) / 255;
+  return Math.min(1, avg * 1.7);
 }
 
 /* ------------------------------------------------------------- webgl orb */
@@ -1839,6 +1883,14 @@ function frame() {
   orbState.spin += stepSpin(now, dt, 0.05 + orbState.act * 0.9);
 
   connSmooth += (orbState.conn - connSmooth) * 0.03;
+
+  // Mic voice pulse for the bottom haze: only while the wake window is open
+  // (the haze is hidden otherwise). Fast attack, gentle release.
+  const micTarget = (assistantReady && !document.body.classList.contains("gated"))
+    ? currentMicLevel() : 0;
+  orbState.mic += (micTarget - orbState.mic) * (micTarget > orbState.mic ? 0.4 : 0.08);
+  glowHaze.style.setProperty("--mic-scale", (1 + orbState.mic * 0.12).toFixed(3));
+  glowHaze.style.setProperty("--mic-bright", (1 + orbState.mic * 0.7).toFixed(3));
 
   // Feed the accent color (matches the orb) to the chat CSS; the bottom
   // haze derives its gradient hues from the same angle.
