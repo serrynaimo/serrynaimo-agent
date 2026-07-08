@@ -626,7 +626,7 @@ remember_schema = FunctionSchema(
             "enum": ["fact", "action"],
             "description": (
                 "fact (default) = something that is true. action = HOW to do "
-                "a task for Thomas: procedure, tool quirks, his preferences. "
+                "a task: procedure, tool quirks, his preferences. "
                 "Store an action memory whenever doing a task surfaced "
                 "corrections or specifics worth reusing."
             ),
@@ -760,7 +760,7 @@ def _resolve_user_path(raw: str) -> str:
 
     The model mangles paths from the ~/... display: it drops the tilde
     (/Desktop/x.pdf, Desktop/x.pdf) or rebuilds an absolute path with the
-    WRONG username (/Users/thomasgorissen/... vs the real home). Anything
+    WRONG username (/Users/username/... vs the real home). Anything
     outside HOME or missing is retried as home-relative; the retry only
     wins if it lands under HOME and actually exists.
     """
@@ -1975,7 +1975,7 @@ class MemoryInjector(FrameProcessor):
         await self._inject_kind(words, text, "fact", self.MARK, "use if relevant", 4)
         await self._inject_kind(
             words, text, "action", self.ACTION_MARK,
-            "how Thomas wants this done — follow these", 2,
+            "how the user wants this done — follow these", 2,
         )
 
     async def _inject_kind(self, words, text, kind, mark, hint, limit):
@@ -2372,7 +2372,7 @@ def build_system_prompt(calendar_block: str = "", files_block: str = "") -> str:
     "correspondence), treat an empty recall as the start of the hunt: keep "
     "digging — files, then email, then calendar. say you don't know or ask "
     "only after all of those come up empty. "
-    "Action memories hold HOW Thomas wants tasks done and tool quirks. "
+    f"Action memories hold HOW {USER_NAME_SHORT} wants tasks done and tool quirks. "
     "Before any tool-driven task: follow the attached Action notes; if none "
     "are attached, recall kind 'action' with the task words FIRST. When "
     "doing a task surfaces corrections, quirks, or preferences, remember "
@@ -2381,7 +2381,7 @@ def build_system_prompt(calendar_block: str = "", files_block: str = "") -> str:
     "result: if it says dry run, not available, or error, the action did "
     "NOT happen — say so instead of claiming success. "
     "When an exchange surfaces something genuinely noteworthy — a discovery, "
-    f"decision, or new fact about {USER_NAME_SHORT} or his world — finish speaking first, "
+    f"decision, or new fact about {USER_NAME} or his world — finish speaking first, "
     "then quietly remember it on your own judgement.\n"
     f"The time now is {session_start.strftime('%A, %d %B %Y at %-I:%M %p')} "
     f"{local_timezone_name()} (UTC{session_start.strftime('%z')})."
