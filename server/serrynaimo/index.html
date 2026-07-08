@@ -1885,12 +1885,14 @@ function frame() {
   connSmooth += (orbState.conn - connSmooth) * 0.03;
 
   // Mic voice pulse for the bottom haze: only while the wake window is open
-  // (the haze is hidden otherwise). Fast attack, gentle release.
-  const micTarget = (assistantReady && !document.body.classList.contains("gated"))
+  // (the haze is hidden otherwise) and the bot isn't speaking — so speaker
+  // bleed into the mic doesn't drive it. Fast attack, gentle release.
+  const micTarget = (assistantReady && !document.body.classList.contains("gated")
+                     && !orbState.talking)
     ? currentMicLevel() : 0;
   orbState.mic += (micTarget - orbState.mic) * (micTarget > orbState.mic ? 0.4 : 0.08);
-  glowHaze.style.setProperty("--mic-scale", (1 + orbState.mic * 0.12).toFixed(3));
-  glowHaze.style.setProperty("--mic-bright", (1 + orbState.mic * 0.7).toFixed(3));
+  glowHaze.style.setProperty("--mic-scale", (1 + orbState.mic * 0.22).toFixed(3));
+  glowHaze.style.setProperty("--mic-bright", (1 + orbState.mic * 1.25).toFixed(3));
 
   // Feed the accent color (matches the orb) to the chat CSS; the bottom
   // haze derives its gradient hues from the same angle.
