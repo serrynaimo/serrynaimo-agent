@@ -586,7 +586,7 @@ function onUserText(text) {
   clearTimeout(userPendingTimer);
   userSlot.classList.remove("fading", "qualifying");
   userSlot.textContent = "";
-  addMessage("user", stripWakeWords(text));
+  addMessage("user", text);
   playSubmitSound();
   armFiller();
 }
@@ -1328,15 +1328,15 @@ composer.addEventListener("submit", (ev) => {
   const open = (dataChannel && dataChannel.readyState === "open")
             || (wsSock && wsSock.readyState === WebSocket.OPEN);
   if (!text || !open) return;
-  const clean = stripWakeWords(text);
-  // send-text: the bot interrupts, appends this to context, and replies aloud.
+  // Show what was typed, but strip a leading/trailing wake word from what the
+  // model actually receives.
   sendRtvi({
     label: "rtvi-ai",
     type: "send-text",
     id: "st-" + Math.random().toString(36).slice(2),
-    data: { content: clean },
+    data: { content: stripWakeWords(text) },
   });
-  addMessage("user", clean);
+  addMessage("user", text);
   playSubmitSound();
   armFiller();
   composerInput.value = "";
