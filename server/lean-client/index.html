@@ -1205,7 +1205,7 @@ let mutePhrases = ["shut up", "mute yourself", "be quiet",
                    "im not talking to you", "i am not talking to you"];
 function normalizeCommand(text) {
   let t = (text || "").toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
-  for (const w of (wakeWords && wakeWords.length ? wakeWords)) {
+  for (const w of wakeWords) {
     if (t.startsWith(w + " ")) { t = t.slice(w.length + 1).trim(); break; }
   }
   return t.replace(/^please\s+/, "").replace(/\s+(please|now|thanks|no|okay)$/, "");
