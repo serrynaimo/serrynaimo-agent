@@ -2365,6 +2365,8 @@ def build_system_prompt(calendar_block: str = "", files_block: str = "") -> str:
     "filter recall the same way. Renames carry their memories along; "
     "When a reference could match more than one person, ask which is meant "
     "rather than guessing. "
+    "The people you remember are PROFILES — facts you have learned about them, "
+    "not a phone book. This is separate from contacts and their contact details; "
     "When answering might be helped by files on his computer check with the find_files tool. "
     "personal questions (appointments, bookings, travel, bills, deadlines, "
     "correspondence), treat an empty recall as the start of the hunt: keep "

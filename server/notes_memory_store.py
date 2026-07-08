@@ -5,8 +5,8 @@ per-memory STATS (recall counts, timestamps — and future perf logging); a RAM
 index is the fast working copy that all reads hit. Layout under a folder named
 after the agent:
 
-    {AGENT}/                      <- "General" note (facts with no contact)
-    {AGENT}/Profiles             <- one note per contact + a "You" note
+    {AGENT}/                      <- "General" note (facts about no specific person)
+    {AGENT}/Profiles             <- one note per profiled person + a "You" note
     {AGENT}/Actions              <- one note per action memory
 
 A memory is one PARAGRAPH (a block of text between blank lines). There are NO
@@ -21,7 +21,7 @@ A paragraph may optionally start with an "@Location:" prefix:
 
     @Singapore: Gregor Gregersen founded Silver Bullion Group.
 
-Contact notes carry an optional header (Aliases: / About:) before the memories.
+Profile notes carry an optional header (Aliases: / About:) before the memories.
 
 Reads are synchronous (pure RAM). Writes update RAM + SQLite synchronously and
 enqueue an async Notes rewrite (the affected note is regenerated wholesale from
@@ -113,7 +113,7 @@ class NotesMemoryStore:
         return f"{folder}\x00{title}"
 
     def _parse_note(self, folder: str, title: str, body: str, kind: str, person: str | None):
-        """Parse one note's body into memory records + (for contacts) header.
+        """Parse one note's body into memory records + (for profiles) header.
 
         get_note returns the body as HTML (<div>line</div>...). Normalize tags
         to newlines, then group the lines into paragraphs (blank line = break);
@@ -159,7 +159,7 @@ class NotesMemoryStore:
                 flush_para()
                 continue
             if not seen_content and not para:
-                # header region: title echo + Aliases:/About: (contacts)
+                # header region: title echo + Aliases:/About: (profiles)
                 if line == title:
                     continue
                 low = line.lower()
@@ -603,7 +603,7 @@ class NotesMemoryStore:
             self._db.commit()
             # Forgetting a memory never deletes the note — just re-render it
             # (an emptied note keeps its title/header). Whole-note deletion is
-            # reserved for removing a contact/profile.
+            # reserved for removing a profile (person).
             self._mark_dirty(rec["note_path"])
         return {"id": mid, "forgotten": rec["content"]}
 

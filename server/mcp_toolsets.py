@@ -50,7 +50,7 @@ TOOLSETS: dict[str, dict] = {
     "contacts": {
         "command": "npx",
         "args": ["-y", "@griches/apple-contacts-mcp"],
-        "when": "looking up or editing a person's contact details (phone, email, address)",
+        "when": "finding a contact or looking up/editing their details in Apple Contacts (phone, email, postal address)",
     },
     "notes": {
         "command": "npx",
