@@ -180,11 +180,11 @@ def _net_error(action: str, exc: Exception) -> dict:
     return {"error": f"{action} failed: {exc}"}
 
 
-async def _xai_search(query: str, tool_type: str) -> dict:
-    """Run a search through xAI's Responses API server-side tools.
+async def _xai_responses(input_messages: list, tools: list, timeout: int = 60,
+                         action: str = "web search") -> dict:
+    """Call xAI's Responses API with server-side tools; parse answer+citations.
 
-    tool_type is "web_search" or "x_search". Returns {"answer", "citations"}
-    or {"error": ...}.
+    Shared by the quick searches and the deeper escalate_to_grok tool.
     """
     api_key = os.getenv("XAI_API_KEY")
     if not api_key:
@@ -192,8 +192,8 @@ async def _xai_search(query: str, tool_type: str) -> dict:
 
     payload = {
         "model": os.getenv("XAI_MODEL", "grok-4.3"),
-        "input": [{"role": "user", "content": query}],
-        "tools": [{"type": tool_type}],
+        "input": input_messages,
+        "tools": tools,
     }
     try:
         async with aiohttp.ClientSession() as session:
@@ -201,14 +201,14 @@ async def _xai_search(query: str, tool_type: str) -> dict:
                 "https://api.x.ai/v1/responses",
                 json=payload,
                 headers={"Authorization": f"Bearer {api_key}"},
-                timeout=aiohttp.ClientTimeout(total=60),
+                timeout=aiohttp.ClientTimeout(total=timeout),
             ) as response:
                 data = await response.json()
                 if response.status != 200:
                     msg = data.get("error", data)
-                    return {"error": f"xAI search failed ({response.status}): {msg}"}
+                    return {"error": f"xAI request failed ({response.status}): {msg}"}
     except Exception as exc:  # noqa: BLE001
-        return _net_error("web search", exc)
+        return _net_error(action, exc)
 
     # Collect the output text and any citations, tolerating shape variations.
     texts, citations = [], []
@@ -223,8 +223,48 @@ async def _xai_search(query: str, tool_type: str) -> dict:
     citations.extend(data.get("citations") or [])
     answer = "\n".join(t for t in texts if t).strip()
     if not answer:
-        return {"error": "xAI search returned no text"}
+        return {"error": "xAI returned no text"}
     return {"answer": answer, "citations": list(dict.fromkeys(citations))[:8]}
+
+
+async def _xai_search(query: str, tool_type: str) -> dict:
+    """Quick search through one xAI server-side tool ("web_search"/"x_search")."""
+    return await _xai_responses(
+        [{"role": "user", "content": query}], [{"type": tool_type}]
+    )
+
+
+async def escalate_to_grok(params: FunctionCallParams):
+    """Tool handler: hand a hard query to Grok (xAI) for deep synthesis.
+
+    Grok answers with live web + X search available; it has NO access to the
+    user's files, memory, calendar, or mail — pass everything it needs in the
+    query. Use when the question needs careful synthesis or the local model is
+    not confident (high hallucination risk).
+    """
+    query = str(params.arguments.get("query", "")).strip()
+    if not query:
+        await params.result_callback({"error": "empty query"})
+        return
+    context_note = str(params.arguments.get("context") or "").strip()
+    logger.info(f"escalate_to_grok: [{query[:80]}]")
+    instructions = (
+        "You are a careful expert consultant. Reason step by step and give a "
+        "thorough, well-grounded synthesis. Prefer verified facts; use web and "
+        "X search to check anything uncertain. If evidence is thin or "
+        "conflicting, say so plainly rather than guessing. Cite key sources."
+    )
+    user = query if not context_note else f"{query}\n\nContext from the user:\n{context_note}"
+    result = await _xai_responses(
+        [{"role": "system", "content": instructions},
+         {"role": "user", "content": user}],
+        [{"type": "web_search"}, {"type": "x_search"}],
+        timeout=120,
+        action="the escalation to Grok",
+    )
+    if "error" in result and "not configured" in result["error"]:
+        result["hint"] = "XAI_API_KEY is required for escalation"
+    await params.result_callback(result)
 
 
 async def _google_search(query: str) -> dict:
@@ -1617,6 +1657,35 @@ x_search_schema = FunctionSchema(
 )
 
 
+escalate_to_grok_schema = FunctionSchema(
+    name="escalate_to_grok",
+    description=(
+        "Escalate a hard question to Grok (a larger cloud model) for deep "
+        "synthesis or fact-critical answers when you are NOT confident "
+        "Grok has live web and X search but NO access to other tools — include every needed detail in the "
+        "query but mask private information. Use sparingly. "
+    ),
+    properties={
+        "query": {
+            "type": "string",
+            "description": (
+                "The full question for Grok, self-contained (Grok can't see this "
+                "chat). Mask the user's private details with placeholders first."
+            ),
+        },
+        "context": {
+            "type": "string",
+            "description": (
+                "Optional: facts from the conversation Grok needs but couldn't "
+                "find online — with private identifiers masked by placeholders"
+            ),
+        },
+    },
+    required=["query"],
+    handler=escalate_to_grok,
+)
+
+
 class _ParamsWithCallback:
     """Proxy for FunctionCallParams with a swapped result_callback."""
 
@@ -1656,6 +1725,7 @@ def _with_current_time(handler):
 # see mcp_toolsets._proxy; get_current_time would be redundant).
 for _schema in (
     google_search_schema, x_web_search_schema, x_search_schema,
+    escalate_to_grok_schema,
     open_in_safari_schema, find_files_schema, open_file_schema,
     read_file_schema, run_javascript_schema, get_weather_schema,
     remember_schema, recall_schema, forget_schema,
@@ -1669,6 +1739,7 @@ for _schema in (
 # verified-speech hook in run_bot once the speaker gate confirms the voice.
 for _schema in (
     google_search_schema, x_web_search_schema, x_search_schema,
+    escalate_to_grok_schema,
     get_current_time_schema, open_in_safari_schema, find_files_schema,
     open_file_schema, read_file_schema, run_javascript_schema,
     get_weather_schema, get_financial_info_schema, remember_schema,
@@ -1682,6 +1753,7 @@ for _schema in (
 # session-bound and excluded — the API preloads all MCP toolsets instead).
 NATIVE_TOOL_SCHEMAS = (
     google_search_schema, x_web_search_schema, x_search_schema,
+    escalate_to_grok_schema,
     get_current_time_schema, open_in_safari_schema, find_files_schema,
     open_file_schema, read_file_schema, run_javascript_schema,
     get_weather_schema, get_financial_info_schema, remember_schema,
@@ -2703,6 +2775,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
         google_search_schema,
         x_web_search_schema,
         x_search_schema,
+        escalate_to_grok_schema,
         get_current_time_schema,
         open_in_safari_schema,
         find_files_schema,
