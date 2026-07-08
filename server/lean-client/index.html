@@ -586,7 +586,7 @@ function onUserText(text) {
   clearTimeout(userPendingTimer);
   userSlot.classList.remove("fading", "qualifying");
   userSlot.textContent = "";
-  addMessage("user", text);
+  addMessage("user", stripWakeWords(text));
   playSubmitSound();
   armFiller();
 }
@@ -1216,6 +1216,21 @@ function classifyCommand(text) {
   if (mutePhrases.some((p) => normalizeCommand(p) === t)) return "mute";
   return null;
 }
+// Drop a wake word (and any hugging commas/punctuation) from the start or end
+// of a message before it's shown/sent — "Serry, what's up" -> "what's up",
+// "thanks, Serrynaimo." -> "thanks." A lone wake word is left untouched.
+function stripWakeWords(text) {
+  if (!text || !wakeWords || !wakeWords.length) return text;
+  const alt = [...wakeWords]
+    .sort((a, b) => b.length - a.length) // longest first: match "serrynaimo" before "serry"
+    .map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+    .join("|");
+  const lead = new RegExp("^[\\s,]*(?:" + alt + ")(?=[\\s,]|$)[\\s,]*", "i");
+  const tail = new RegExp("[\\s,]+(?:" + alt + ")[\\s,.!?]*$", "i");
+  let t = text, prev;
+  do { prev = t; t = t.replace(lead, "").replace(tail, "").trim(); } while (t !== prev);
+  return t || text; // never blank out a message that was ONLY a wake word
+}
 function triggerNewSession() {
   playSubmitSound();
   document.getElementById("newSession").click(); // reloads the page
@@ -1313,14 +1328,15 @@ composer.addEventListener("submit", (ev) => {
   const open = (dataChannel && dataChannel.readyState === "open")
             || (wsSock && wsSock.readyState === WebSocket.OPEN);
   if (!text || !open) return;
+  const clean = stripWakeWords(text);
   // send-text: the bot interrupts, appends this to context, and replies aloud.
   sendRtvi({
     label: "rtvi-ai",
     type: "send-text",
     id: "st-" + Math.random().toString(36).slice(2),
-    data: { content: text },
+    data: { content: clean },
   });
-  addMessage("user", text);
+  addMessage("user", clean);
   playSubmitSound();
   armFiller();
   composerInput.value = "";
