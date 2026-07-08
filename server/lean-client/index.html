@@ -18,7 +18,8 @@
   #orbGlass {
     position: fixed;
     left: 50%; top: 25vh;
-    transform: translate(-50%, -50%);
+    transform: translate(-50%, -50%) scale(0.8);
+    transition: transform 4s cubic-bezier(0.22, 0.61, 0.36, 1);
     width: calc(min(46vh, 440px) * 0.54);
     aspect-ratio: 1;
     border-radius: 50%;
@@ -38,10 +39,16 @@
   #orb {
     position: fixed;
     left: 50%; top: 25vh;
-    transform: translate(-50%, -50%);
+    /* ~20% smaller during "charging up"; grows to full over 4s when the
+       aperture opens (body.ready). */
+    transform: translate(-50%, -50%) scale(0.8);
+    transition: transform 4s cubic-bezier(0.22, 0.61, 0.36, 1);
     width: min(92vh, 880px);
     aspect-ratio: 2; /* wide: sparks can sit far left/right of the sphere */
     pointer-events: none;
+  }
+  body.ready #orb, body.ready #orbGlass {
+    transform: translate(-50%, -50%) scale(1);
   }
 
   /* Tiny status line under the orb; fades away when idle */
@@ -59,7 +66,13 @@
   /* Conversation — floating column in the lower half */
   #chat {
     position: fixed;
-    left: 50%; transform: translateX(-50%);
+    /* Centered via negative margin (not translateX) so the transform is free
+       to move on z / y without any horizontal drift. */
+    left: 50%; margin-left: calc(min(640px, 92vw) / -2);
+    /* Very subtle Star Wars lean: the top recedes on z, pivoting from the
+       bottom (where new messages appear) so they tilt into depth. */
+    transform: perspective(1700px) rotateX(5deg);
+    transform-origin: center bottom;
     top: 52vh; bottom: 5vh;
     width: min(640px, 92vw);
     display: flex;
@@ -76,13 +89,17 @@
   /* Chat text holds back until 2s AFTER the aperture opens (JS adds
      .chatReady), so bot messages fade in with the bloom, never before it. */
   #status { transition: opacity 0.8s ease; }
-  #chat { opacity: 0; transition: opacity 1.4s ease; }
+  #chat { opacity: 0; transition: opacity 1.4s ease, transform 1s ease; }
   body.chatReady #chat { opacity: 1; }
   /* When the wake gate is closed (10s since the bot last spoke, wake word
      required), text dims until the conversation resumes. The chat rule ALSO
      requires .chatReady so the cold-start gate can't reveal text early. */
   body.gated #status { opacity: 0.3; }
-  body.gated.chatReady #chat { opacity: 0.3; }
+  body.gated.chatReady #chat {
+    opacity: 0.3;
+    /* Recede into the background and sink a few px — stays centered. */
+    transform: perspective(1700px) rotateX(6deg) translateZ(-55px) translateY(6px);
+  }
 
   .msg {
     max-width: 78%;
