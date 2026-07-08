@@ -292,11 +292,99 @@ const activeCalls = new Set(); // tool calls currently in flight
 
 const statusEl = document.getElementById("status");
 let statusTimer = null;
+// While a tool call is running its UI label owns the status line; setStatus
+// records the base text but doesn't overwrite the visible label.
+let statusBase = "", statusBaseSticky = true;
+// function name -> UI label for the status line (client-side only; the tool
+// NAME arrives on the same events that drive the spark orbs). Unknown tools
+// fall back to a humanized name.
+const toolLabels = {
+  google_search: "searching the web",
+  x_web_search: "researching web info",
+  x_search: "browsing X",
+  escalate_to_grok: "checking with grok",
+  get_current_time: "checking time",
+  open_in_safari: "opening browser",
+  find_files: "looking for files",
+  open_file: "opening file",
+  read_file: "reading file",
+  run_javascript: "calculating",
+  get_weather: "checking weather",
+  get_financial_info: "checking markets",
+  remember: "saving a memory",
+  recall: "recalling a memory",
+  forget: "forgetting",
+  add_person: "saving a profile",
+  edit_person: "updating a profile",
+  list_people: "checking profiles",
+  load_toolset: "learning",
+  // apple-mail (MCP)
+  search_emails: "finding email",
+  move_email: "moving email",
+  manage_trash: "clearing email",
+  get_mailbox_unread_counts: "checking email",
+  list_mailboxes: "checking mailboxes",
+  list_accounts: "checking accounts",
+  update_email_status: "updating email",
+  save_email_attachment: "saving attachment",
+  create_mailbox: "creating mailbox",
+  synchronize_account: "syncing mail",
+  send_email: "sending email",
+  compose_email: "composing email",
+  reply_email: "writing reply",
+  get_email: "retrieving email",
+  get_email_content: "reading email",
+  // calendar (MCP)
+  get_events: "checking calendar",
+  search_events: "searching calendar",
+  create_events: "creating events",
+  create_event: "creating event",
+  update_events: "updating events",
+  update_event: "updating event",
+  delete_events: "deleting events",
+  delete_event: "deleting event",
+  list_calendars: "checking calendars",
+};
+let toolLabelActive = false;
+let toolFadeTimer = null, toolBlingTimer = null, toolLabelSeq = 0;
 function setStatus(text, sticky) {
+  statusBase = text; statusBaseSticky = !!sticky;
+  if (toolLabelActive) return;
   statusEl.textContent = text;
   statusEl.style.opacity = "1";
   clearTimeout(statusTimer);
   if (!sticky) statusTimer = setTimeout(() => (statusEl.style.opacity = "0"), 2500);
+}
+function showToolLabel(fnName) {
+  const label = (toolLabels[fnName] || String(fnName || "").replace(/_/g, " ") || "working").toLowerCase();
+  clearTimeout(statusTimer); clearTimeout(toolFadeTimer); clearTimeout(toolBlingTimer);
+  const seq = ++toolLabelSeq;
+  toolLabelActive = true;
+  // 1) bling up: a quick pop-in with a tiny overshoot (replaces in place).
+  statusEl.style.transition = "none";
+  statusEl.textContent = label;
+  statusEl.style.opacity = "0";
+  statusEl.style.transform = "translateX(-50%) scale(0.88)";
+  void statusEl.offsetWidth; // commit the start frame
+  statusEl.style.transition =
+    "opacity 150ms ease-out, transform 150ms cubic-bezier(0.2, 1.5, 0.3, 1)";
+  statusEl.style.opacity = "1";
+  statusEl.style.transform = "translateX(-50%) scale(1)";
+  // 2) then fade out — fast at first, long slow tail (strong ease-out).
+  toolBlingTimer = setTimeout(() => {
+    if (seq !== toolLabelSeq) return;
+    statusEl.style.transition = "opacity 4000ms cubic-bezier(0.16, 1, 0.3, 1)";
+    statusEl.style.opacity = "0";
+  }, 150);
+  // 3) once faded (and nothing newer replaced it), just release the line —
+  // the label is gone, leave it blank rather than re-showing the base status.
+  toolFadeTimer = setTimeout(() => {
+    if (seq !== toolLabelSeq) return;
+    toolLabelActive = false;
+    statusEl.style.transition = "";      // reset for any future setStatus
+    statusEl.style.transform = "translateX(-50%)";
+    statusEl.textContent = "";           // stays faded/blank
+  }, 4150);
 }
 
 /* ----------------------------------------------------------------- chat */
@@ -988,6 +1076,7 @@ function handleRtvi(msg) {
     case "llm-function-call-in-progress": // a tool call began: spawn a spark
       addSpark(data.tool_call_id);
       activeCalls.add(data.tool_call_id);
+      showToolLabel(data.function_name); // latest tool label in the status line
       break;
     case "llm-function-call-stopped": // tool call finished or was cancelled
       endSpark(data.tool_call_id);

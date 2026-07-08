@@ -87,7 +87,11 @@ from pipecat.frames.frames import (
     TTSSpeakFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
-from pipecat.processors.frameworks.rtvi import RTVIServerMessageFrame
+from pipecat.processors.frameworks.rtvi import (
+    RTVIFunctionCallReportLevel,
+    RTVIObserverParams,
+    RTVIServerMessageFrame,
+)
 from pipecat.utils.context.llm_context_summarization import (
     LLMAutoContextSummarizationConfig,
     LLMContextSummaryConfig,
@@ -756,15 +760,25 @@ def _home_display(path: str) -> str:
 def _resolve_user_path(raw: str) -> str:
     """Resolve a model-provided path, tolerating home-relative spellings.
 
-    The model routinely drops the tilde from ~/Desktop/x.pdf and sends
-    /Desktop/x.pdf (or a bare Desktop/x.pdf). Anything that resolves outside
-    the home directory or to a missing file is retried as home-relative;
-    the retry only wins if it lands under HOME and actually exists.
+    The model mangles paths from the ~/... display: it drops the tilde
+    (/Desktop/x.pdf, Desktop/x.pdf) or rebuilds an absolute path with the
+    WRONG username (/Users/thomasgorissen/... vs the real home). Anything
+    outside HOME or missing is retried as home-relative; the retry only
+    wins if it lands under HOME and actually exists.
     """
     raw = str(raw).strip()
     path = os.path.realpath(os.path.expanduser(raw))
     if not path.startswith(HOME + os.sep) or not os.path.exists(path):
-        candidate = os.path.realpath(os.path.join(HOME, raw.lstrip("/")))
+        # Derive a home-relative tail: strip a leading ~, or a wrong
+        # /Users/<user>/ or /home/<user>/ prefix, else a leading slash.
+        tail = raw
+        if tail.startswith("~"):
+            tail = tail[1:]
+        else:
+            m = re.match(r"^/(?:Users|home)/[^/]+/(.*)$", tail)
+            if m:
+                tail = m.group(1)
+        candidate = os.path.realpath(os.path.join(HOME, tail.lstrip("/")))
         if candidate.startswith(HOME + os.sep) and os.path.exists(candidate):
             return candidate
     return path
@@ -2308,7 +2322,7 @@ def build_system_prompt(calendar_block: str = "", files_block: str = "") -> str:
     "Hard cap: Keep each message strictly under 100 characters — one "
     "short sentences max. Output multiple short messages if absolutely necessary "
     "separated by a blank line, and rather stop early."
-    "Consider your built-in knowledge stale! Always look facts up first to make sure."
+    "Consider your built-in knowledge stale! Always look facts up first to make sure. Use memory and file information everytime before assuming you know from existing context."
     "Answer with a one short sentence summary about tool results. Ask if details are needed. Don't reference tool names or tool results. They're invisible to the user."
     + (
         ""
@@ -2329,7 +2343,7 @@ def build_system_prompt(calendar_block: str = "", files_block: str = "") -> str:
     "unrelated facts into separate memories, and update an existing memory "
     "by id rather than storing a near-duplicate. Every memory shown to you starts with its id in brackets. Use recall when the context seems to "
     "assume deeper knowledge, or more context, a person/location. "
-    "Memory recalls are silent and not be referenced as such: answer as if "
+    "Memory recalls are silent and fast and not be referenced as such: answer as if "
     "you simply knew. When he speaks as if you know something it is probably in "
     "memory so recall first; ask him only after recall and even file_search coms up"
     "empty. Correct a memory via remember with its id;"
@@ -2945,6 +2959,12 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
             enable_usage_metrics=True,
         ),
         observers=[],
+        # Expose the tool NAME (not its arguments) on function-call events so
+        # the client can label the status line. Pipecat defaults to NONE, which
+        # redacts the name; NAME un-redacts it, FULL would also leak arguments.
+        rtvi_observer_params=RTVIObserverParams(
+            function_call_report_level={"*": RTVIFunctionCallReportLevel.NAME},
+        ),
         # No idle watchdog: its timer only counts SPEECH frames, so five
         # quiet minutes with the page open would kill the session — the
         # client silently reconnects into a fresh context (new system
