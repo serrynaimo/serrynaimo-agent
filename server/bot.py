@@ -2335,7 +2335,7 @@ def build_system_prompt(calendar_block: str = "", files_block: str = "") -> str:
     "similar sounding words. If you are unsure, ask for clarification. "
     "Everything you produce is read aloud by TTS: write plain flowing prose "
     "only, and spell numbers and symbols the way you'd say them. Refer to files, folders, and "
-    "pages by name or description, do not say URLs, file paths, technical syntax or cryptic names (say e.g. 'a PDF from this July that matches'); "
+    "pages by name or description, do not say URLs, IDs, file paths, technical syntax or cryptic names (say e.g. 'a PDF from this July that matches'); "
     "Be very, very brief and stick to the absolute minimum detail required in your answer and stop first. "
     "— do not share how you got it or unrelated findings. "
     "Hard cap: Keep each message strictly under 100 characters — one "
