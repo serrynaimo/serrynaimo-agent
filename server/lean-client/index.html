@@ -512,15 +512,15 @@ async function playAperture() {
   src.start();
 }
 
-/* ---- submit sound: the macOS "Pop" plays on every submitted message ---- */
-let plopData = null;
-let plopBuf = null;
-fetch("plop.wav").then((r) => r.arrayBuffer()).then((b) => (plopData = b)).catch(() => {});
+/* ---- submit sound: a soft crystalline glint on every submitted message ---- */
+let submitData = null;
+let submitBuf = null;
+fetch("submit_ethereal.wav").then((r) => r.arrayBuffer()).then((b) => (submitData = b)).catch(() => {});
 async function playSubmitSound() {
   const ctx = wsOutCtx || audioCtx;
-  if (!ctx || !plopData) return;
+  if (!ctx || !submitData) return;
   try {
-    if (!plopBuf) plopBuf = await ctx.decodeAudioData(plopData.slice(0));
+    if (!submitBuf) submitBuf = await ctx.decodeAudioData(submitData.slice(0));
   } catch (e) { return; }
   // Straight to the destination at fixed volume: independent of bot-audio
   // gain, so barge-in fades never duck the confirmation sound.
@@ -528,7 +528,7 @@ async function playSubmitSound() {
   g.gain.value = 0.7;
   g.connect(ctx.destination);
   const src = ctx.createBufferSource();
-  src.buffer = plopBuf;
+  src.buffer = submitBuf;
   src.connect(g);
   src.start();
 }

@@ -1660,10 +1660,11 @@ x_search_schema = FunctionSchema(
 escalate_to_grok_schema = FunctionSchema(
     name="escalate_to_grok",
     description=(
-        "Escalate a hard question to Grok (a larger cloud model) for deep "
-        "synthesis or fact-critical answers when you are NOT confident "
-        "Grok has live web and X search but NO access to other tools — include every needed detail in the "
-        "query but mask private information. Use sparingly. "
+        "Escalate a hard question to Grok AI for deep "
+        "synthesis or fact-critical answers or when you are not confident enough. "
+        "Grok has live web and X search but NO access to other tools — include all non-public details in the "
+        "query but mask private and identifiable information. "
+        "Tell the user you're checking with Grok before you do. "
     ),
     properties={
         "query": {
