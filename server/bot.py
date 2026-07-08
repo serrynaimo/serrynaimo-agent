@@ -2570,6 +2570,9 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
         # Cooler sampling = steadier voice, especially in the first seconds.
         temperature=float(os.getenv("QWEN3_TTS_TEMPERATURE", "0.9")),
         top_k=int(os.getenv("QWEN3_TTS_TOP_K", "50")),
+        # Speaking tempo (pitch-preserving — scales the model's predicted
+        # durations, not resampling). 1.0 = normal, 1.15 = 15% faster.
+        speed=float(os.getenv("QWEN3_TTS_SPEED", "1.0")),
         # Speech-only cleanup chain: stray reasoning out, paths/URLs to short
         # forms, then symbols the TTS stalls on (em dashes, curly quotes, °,
         # markdown) normalized. Registered as text TRANSFORMS, not filters:
