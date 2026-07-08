@@ -143,14 +143,14 @@ load_dotenv(override=True)
 # imported into Notes once (2026-07-08) and is now just an inert backup.
 _SIDECAR_DB = os.path.join(os.path.dirname(__file__), "notes_memory.db")
 memory = NotesMemoryStore(
-    os.getenv("AGENT_NAME", "serrynaimo").strip(),
+    os.getenv("AGENT_NAME").strip(),
     _SIDECAR_DB,
     call_mcp_tool,
 )
 
 # Default action memories (kind='action'): procedures and tool quirks that
 # used to live in the system prompt. Seeded once at startup; edits by voice
-# stick — "Serry, when deleting emails, also ..." updates the note.
+# stick — "Agent, when deleting emails, also ..." updates the note.
 SEED_ACTION_MEMORIES = [
     "Searching or finding emails, mail, messages: mailbox defaults to Inbox "
     "only — pass mailbox 'All' to search every folder; most mail sits in "
@@ -784,10 +784,10 @@ def _resolve_user_path(raw: str) -> str:
 # Identity: the assistant's name and its user's name (see .env). The short
 # forms are what gets spoken; the full forms appear in the system prompt,
 # ASR vocabulary, and wake words.
-AGENT_NAME = os.getenv("AGENT_NAME", "serrynaimo").strip()
-AGENT_NAME_SHORT = os.getenv("AGENT_NAME_SHORT", "Serry").strip()
-USER_NAME = os.getenv("USER_NAME", "Thomas Gorissen").strip()
-USER_NAME_SHORT = os.getenv("USER_NAME_SHORT", "Thomas").strip()
+AGENT_NAME = os.getenv("AGENT_NAME").strip()
+AGENT_NAME_SHORT = os.getenv("AGENT_NAME_SHORT").strip()
+USER_NAME = os.getenv("USER_NAME").strip()
+USER_NAME_SHORT = os.getenv("USER_NAME_SHORT").strip()
 
 # File types the agent is allowed to open/read (text-like documents, code, PDFs).
 OPENABLE_EXTENSIONS = {
@@ -1880,7 +1880,7 @@ def _normalize_command(text: str, wake_words: list[str]) -> str:
     """Lowercase, strip punctuation, drop a leading wake word and please/now."""
     t = re.sub(r"[^a-z0-9\s]", " ", str(text).lower())
     t = re.sub(r"\s+", " ", t).strip()
-    for w in (wake_words or ["serry"]):
+    for w in (wake_words):
         if t.startswith(w + " "):
             t = t[len(w) + 1:].strip()
             break

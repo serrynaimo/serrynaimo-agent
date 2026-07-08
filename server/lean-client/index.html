@@ -537,7 +537,7 @@ function dropUserPending() {
 /* Mirrors the server's qualification rules: interims already passed the
    speaker gate (they aren't sent otherwise), so what remains is the wake
    window / agent activity / wake word — all checkable here, live. */
-let wakeWords = ["serry"]; // replaced by the server's config event
+let wakeWords = ["serry", "serrynaimo"]; // replaced by the server's config event
 function utteranceQualifies(text) {
   if (!userMuted && !document.body.classList.contains("gated")) return true; // window open
   if (!userMuted && (activeCalls.size > 0 || orbState.talking || orbState.thinking)) return true;
@@ -1205,10 +1205,10 @@ let mutePhrases = ["shut up", "mute yourself", "be quiet",
                    "im not talking to you", "i am not talking to you"];
 function normalizeCommand(text) {
   let t = (text || "").toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
-  for (const w of (wakeWords && wakeWords.length ? wakeWords : ["serry"])) {
+  for (const w of (wakeWords && wakeWords.length ? wakeWords)) {
     if (t.startsWith(w + " ")) { t = t.slice(w.length + 1).trim(); break; }
   }
-  return t.replace(/^please\s+/, "").replace(/\s+(please|now|thanks)$/, "");
+  return t.replace(/^please\s+/, "").replace(/\s+(please|now|thanks|no|okay)$/, "");
 }
 function classifyCommand(text) {
   const t = normalizeCommand(text);
