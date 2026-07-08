@@ -198,7 +198,7 @@ async def _xai_responses(input_messages: list, tools: list, timeout: int = 60,
         return {"error": "XAI_API_KEY not configured"}
 
     payload = {
-        "model": os.getenv("XAI_MODEL", "grok-4.3"),
+        "model": os.getenv("XAI_MODEL", "grok-4.5"),
         "input": input_messages,
         "tools": tools,
     }
