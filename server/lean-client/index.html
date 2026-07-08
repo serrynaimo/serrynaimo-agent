@@ -831,6 +831,7 @@ async function connectWS() {
     wsSock.onopen = async () => {
       wsOutCtx = new AudioContext({ sampleRate: 24000 });
       wsOutGain = wsOutCtx.createGain();
+      wsOutGain.gain.value = 1; // voice at full volume (only dips on barge-in)
       wsOutGain.connect(wsOutCtx.destination);
       // Orb level analyser taps the playback graph.
       audioCtx = wsOutCtx;
@@ -1426,6 +1427,7 @@ function attachAnalyser(stream) {
     // instead of clicking. The <audio> element must stay attached and
     // playing for WebRTC audio to flow, so mute it rather than drop it.
     botGain = audioCtx.createGain();
+    botGain.gain.value = 1; // voice at full volume (only dips on barge-in)
     src.connect(botGain);
     botGain.connect(audioCtx.destination);
     audioEl.muted = true;
