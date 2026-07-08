@@ -122,7 +122,7 @@ from mcp_toolsets import (
     proxy_handler,
     toolset_catalog,
 )
-from memory_store import MemoryStore
+from notes_memory_store import NotesMemoryStore
 from pipecat.turns.user_start import TranscriptionUserTurnStartStrategy
 from pipecat.turns.user_turn_strategies import UserTurnStrategies
 from services_local import (
@@ -138,11 +138,19 @@ from services_local import (
 
 load_dotenv(override=True)
 
-memory = MemoryStore(os.getenv("MEMORY_DB_PATH", os.path.join(os.path.dirname(__file__), "memories.db")))
+# Long-term memory lives in Apple Notes (folder = agent name). A SQLite
+# sidecar holds ids + recall stats (+ future caches). The old memories.db was
+# imported into Notes once (2026-07-08) and is now just an inert backup.
+_SIDECAR_DB = os.path.join(os.path.dirname(__file__), "notes_memory.db")
+memory = NotesMemoryStore(
+    os.getenv("AGENT_NAME", "serrynaimo").strip(),
+    _SIDECAR_DB,
+    call_mcp_tool,
+)
 
 # Default action memories (kind='action'): procedures and tool quirks that
-# used to live in the system prompt. Seeded once; edits by voice stick —
-# "Serry, when deleting emails, also ..." updates the note, not this file.
+# used to live in the system prompt. Seeded once at startup; edits by voice
+# stick — "Serry, when deleting emails, also ..." updates the note.
 SEED_ACTION_MEMORIES = [
     "Searching or finding emails, mail, messages: mailbox defaults to Inbox "
     "only — pass mailbox 'All' to search every folder; most mail sits in "
@@ -156,11 +164,6 @@ SEED_ACTION_MEMORIES = [
     "Trash mailbox. manage_trash only PREVIEWS by default: after the "
     "go-ahead call it again with dry_run=false, or nothing is deleted.",
 ]
-try:
-    if _n := memory.seed_actions(SEED_ACTION_MEMORIES):
-        logger.info(f"Seeded {_n} default action memories")
-except Exception as _exc:  # noqa: BLE001
-    logger.warning(f"Could not seed action memories: {_exc}")
 
 
 def _net_error(action: str, exc: Exception) -> dict:
@@ -454,11 +457,7 @@ async def remember(params: FunctionCallParams):
         return
     memory_id = params.arguments.get("id")
     if memory_id is not None:
-        try:
-            memory_id = int(memory_id)
-        except (TypeError, ValueError):
-            await params.result_callback({"error": f"invalid memory id: {memory_id!r}"})
-            return
+        memory_id = str(memory_id).strip() or None
     snapshot = _recent_conversation(params.context)
     location = str(params.arguments.get("location") or "").strip() or None
     person = str(params.arguments.get("person") or "").strip() or None
@@ -476,10 +475,9 @@ async def remember(params: FunctionCallParams):
 
 async def forget(params: FunctionCallParams):
     """Tool handler: delete a memory by id."""
-    try:
-        memory_id = int(params.arguments.get("id"))
-    except (TypeError, ValueError):
-        await params.result_callback({"error": "a numeric memory id is required"})
+    memory_id = str(params.arguments.get("id") or "").strip()
+    if not memory_id:
+        await params.result_callback({"error": "a memory id is required"})
         return
     result = await asyncio.to_thread(memory.forget, memory_id)
     logger.info(f"forget: id {memory_id} -> {result}")
@@ -620,8 +618,8 @@ remember_schema = FunctionSchema(
             "description": "The fact or note to remember, phrased so it makes sense on its own",
         },
         "id": {
-            "type": "integer",
-            "description": "Optional: id of an existing memory to overwrite with the new content",
+            "type": "string",
+            "description": "Optional: id of an existing memory (from recall) to overwrite with the new content",
         },
         "kind": {
             "type": "string",
@@ -657,7 +655,7 @@ forget_schema = FunctionSchema(
         "first). Use when the user asks you to forget something or a memory is wrong."
     ),
     properties={
-        "id": {"type": "integer", "description": "The id of the memory to delete"},
+        "id": {"type": "string", "description": "The id of the memory to delete (from recall)"},
     },
     required=["id"],
     handler=forget,
@@ -2302,6 +2300,27 @@ async def _recent_files_block() -> str:
     return "\n" + "\n".join(lines)
 
 
+def _eager_toolset_keys() -> set[str]:
+    """Which MCP toolsets are loaded up front (MCP_EAGER_TOOLSETS)."""
+    spec = os.getenv("MCP_EAGER_TOOLSETS", "").strip()
+    if spec.lower() in ("1", "all", "true", "yes"):
+        return set(TOOLSETS)
+    if spec:
+        return {k.strip() for k in spec.split(",") if k.strip()}
+    return set()
+
+
+def _lazy_toolset_hint() -> str:
+    """Prompt line telling the model which toolsets it must load on demand."""
+    lazy = [k for k in TOOLSETS if k not in _eager_toolset_keys()]
+    if not lazy:
+        return ""
+    return (
+        "Some tools load on demand — before acting on their topic, call "
+        f"load_toolset for: {', '.join(lazy)} — silently, like plumbing. "
+    )
+
+
 def build_system_prompt(calendar_block: str = "", files_block: str = "") -> str:
     """The assistant's system prompt — shared by the voice pipeline and /api/chat."""
     session_start = datetime.now().astimezone()
@@ -2324,12 +2343,7 @@ def build_system_prompt(calendar_block: str = "", files_block: str = "") -> str:
     "separated by a blank line, and rather stop early."
     "Consider your built-in knowledge stale! Always look facts up first to make sure. Use memory and file information everytime before assuming you know from existing context."
     "Answer with a one short sentence summary about tool results. Ask if details are needed. Don't reference tool names or tool results. They're invisible to the user."
-    + (
-        ""
-        if os.getenv("MCP_EAGER_TOOLSETS", "").strip()
-        else "Email and calendar tools load on demand: call "
-        "load_toolset when the topic comes up — silently, like plumbing. "
-    )
+    + _lazy_toolset_hint()
     + "Never announce an action you don't take: if you say you'll "
     "check or do something, call the tool in the SAME response — "
     "otherwise nothing happens. Read and search freely; before "
@@ -2341,7 +2355,7 @@ def build_system_prompt(calendar_block: str = "", files_block: str = "") -> str:
     "Memory persists across conversations. Store keepers with remember: "
     "one lean, precise fact per memory — a single tight sentence; split "
     "unrelated facts into separate memories, and update an existing memory "
-    "by id rather than storing a near-duplicate. Every memory shown to you starts with its id in brackets. Use recall when the context seems to "
+    "by id rather than storing a near-duplicate. Recall returns each memory with its id; pass that id to remember/forget to edit or delete it. Use recall when the context seems to "
     "assume deeper knowledge, or more context, a person/location. "
     "Memory recalls are silent and fast and not be referenced as such: answer as if "
     "you simply knew. When he speaks as if you know something it is probably in "
@@ -2492,6 +2506,29 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
             standard web/telephony pipelines don't need it.
     """
     logger.info("Starting bot")
+
+    # Long-term memory: load the RAM index from Apple Notes, import the legacy
+    # SQLite store once, seed default action memories, then start the async
+    # write-drainer and the 30s external-edit poll. Must precede the system
+    # prompt (which reads recent/top memories). A memory hiccup must not block
+    # the session, so failures are logged, not raised.
+    _mem_writer = _mem_refresh = None
+    try:
+        await memory.start(asyncio.get_running_loop())
+        memory.seed_actions(SEED_ACTION_MEMORIES)
+        _mem_writer = asyncio.create_task(memory.run_writer())
+
+        async def _memory_refresh_loop():
+            while True:
+                await asyncio.sleep(30)
+                try:
+                    await memory.refresh()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(f"Memory refresh failed: {exc}")
+
+        _mem_refresh = asyncio.create_task(_memory_refresh_loop())
+    except Exception as exc:  # noqa: BLE001
+        logger.error(f"Memory (Notes) startup failed — running with whatever loaded: {exc}")
 
     # Speech-to-Text service — Qwen3-ASR, local via mlx-audio.
     # Speaker gating: with VOICE_ENROLL_AUDIO set, only the enrolled voice is
@@ -3134,6 +3171,14 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
         logger.info("Client disconnected")
         if stall_task is not None:
             stall_task.cancel()
+        for _t in (_mem_writer, _mem_refresh):
+            if _t is not None:
+                _t.cancel()
+        # Flush any pending memory writes to Notes before tearing down.
+        try:
+            await memory.flush()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"Final memory flush failed: {exc}")
         await worker.cancel()
 
     runner = WorkerRunner(handle_sigint=False)

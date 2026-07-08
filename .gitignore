@@ -224,6 +224,8 @@ __marimo__/
 # --- Personal data: never publish ---
 # Long-term memory database (personal facts)
 server/memories.db
+# Notes-backed memory stats/cache sidecar (recall counts — local runtime state)
+server/notes_memory.db
 # Voice recordings of the enrolled user + speaker-gate captures
 server/enroll_samples/
 server/gate_samples/

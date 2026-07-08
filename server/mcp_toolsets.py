@@ -39,6 +39,24 @@ TOOLSETS: dict[str, dict] = {
         ],
         "when": "viewing, creating, or changing calendar events and checking availability",
     },
+    # Apple Notes / Reminders / Contacts via griches/apple-mcp (npx, per-app
+    # packages — no overlap with the calendar/mail servers above). Reminders
+    # uses EventKit directly; Notes goes through AppleScript.
+    "reminders": {
+        "command": "npx",
+        "args": ["-y", "@griches/apple-reminders-mcp"],
+        "when": "viewing, creating, completing, or changing reminders and to-do lists",
+    },
+    "contacts": {
+        "command": "npx",
+        "args": ["-y", "@griches/apple-contacts-mcp"],
+        "when": "looking up or editing a person's contact details (phone, email, address)",
+    },
+    "notes": {
+        "command": "npx",
+        "args": ["-y", "@griches/apple-notes-mcp"],
+        "when": "reading, searching, creating, or editing notes in the Notes app",
+    },
 }
 
 MAX_TOOL_RESULT_CHARS = 6000  # protect the context window from huge outputs
