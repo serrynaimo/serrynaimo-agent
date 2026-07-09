@@ -2742,8 +2742,8 @@ class NotificationAnnouncer:
         system = (
             f"You are {AGENT_NAME_SHORT}, {USER_NAME_SHORT}'s voice assistant. A notification "
             "arrived while the conversation is idle. Decide whether it deserves a spoken "
-            "heads-up. If it does, READ IT ALOUD VERBATIM."
-            "Optionally naming the app or sender first  Do NOT paraphrase, summarise, translate, or reword it. Only "
+            "heads-up. If it does and is just one sentance, read the message verbatim. Otherwise summarize."
+            "Optionally naming the app or sender first. Only "
             "adjust for text-to-speech: spell out symbols and drop any URLs or emoji; If it is routine, an ad, a login or verification code, or "
             "not worth interrupting for, reply with exactly: [SKIP]. Use anything you you can recall from memory "
             "to judge whether it's worth reading."
