@@ -2013,7 +2013,7 @@ NEW_SESSION_PHRASES = _parse_phrase_list(
 MUTE_PHRASES = _parse_phrase_list(
     "COMMAND_MUTE_PHRASES",
     ["shut up", "mute yourself", "be quiet", "stop", "stop talking",
-     "i'm not talking to you", "i am not talking to you", "that's it", "got it"],
+     "i'm not talking to you", "i am not talking to you", "that's it", "got it", "okay thanks"],
 )
 
 
