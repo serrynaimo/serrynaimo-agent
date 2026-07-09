@@ -537,14 +537,14 @@ async def recall(params: FunctionCallParams):
     matched = set(result.get("matched_people") or [])
     stems = {
         w[:4] for kw in keywords
-        for w in re.findall(r"[\w']+", str(kw).lower()) if len(w) > 3
+        for w in re.findall(r"[\w']+", str(kw).lower()) if len(w) > 2
     }
     if stems or matched:
         def _relevant(m):
             if (m.get("person") or "").lower() in matched:
                 return True
             hay = f"{m['content']} {m.get('person') or ''}".lower()
-            return any(w[:4] in stems for w in re.findall(r"[\w']+", hay) if len(w) > 3)
+            return any(w[:4] in stems for w in re.findall(r"[\w']+", hay) if len(w) > 2)
         strict = [m for m in memories if _relevant(m)]
         if strict:
             memories = strict
@@ -665,11 +665,10 @@ forget_schema = FunctionSchema(
 recall_schema = FunctionSchema(
     name="recall",
     description=(
-        "Search long-term memory; results are filtered to precisely match the "
-        "keywords. Use specific, distinctive keywords — names, places, topics, "
-        "not filler words. A keyword that names a registered person surfaces "
-        "all of that person's memories matching the other keywords. Optional "
-        "person filter. Returns ids, dates, and tags."
+        "Search your memory. Use specific, "
+        "distinctive keywords — names, places, topics, not filler words. A keyword "
+        "that names a registered person surfaces all of the memories about that person "
+        "matching the other keywords. Returns ids, dates, and tags."
     ),
     properties={
         "keywords": {
@@ -684,7 +683,11 @@ recall_schema = FunctionSchema(
         },
         "person": {
             "type": "string",
-            "description": "Optional: only memories about this registered person",
+            "description": (
+                "Optional: the SUBJECT to look up — the person the question is "
+                "about (e.g. a friend by name, or Thomas "
+                "himself for facts about him). Leave empty to search everyone."
+            ),
         },
     },
     required=["keywords"],
@@ -2463,29 +2466,29 @@ def build_system_prompt(calendar_block: str = "", files_block: str = "") -> str:
     "for short), an orb of glowing plasma in the endless void of space.\n\n"
 
     "GOLDEN RULES\n"
-    "1. Look up context like people, action instructions, events, personal details and other facts. Always use tools to retrieve current information BEFORE answering or acting! "
-    "2. Search personal details in order — call recall, then find_files, then "
-    "search_emails, then search_events — and only say you don't know or ask him "
+    "1. Your purpose it to look up context and information about people, action instructions, events, personal details and other current information BEFORE answering or acting! "
+    "2. Search in order: Recall memory with the tool 'recall', then 'find_files', then "
+    "'search_emails', then 'search_events' — and only say you don't know or ask him "
     "once all of those come up empty.\n"
-    "3. Before any state-changing action, say what you'll do and wait for his go-ahead.\n\n"
+    "3. Before you do any state-changing action, say what you'll do and wait for his go-ahead.\n\n"
 
     "VOICE — everything you say is read aloud\n"
     "Reply in one short sentence of plain prose, give the minimum needed, then stop.\n"
     "Spell amounts and symbols as spoken, and refer to files, people, and pages by "
     "name or description — never as URLs, IDs, file-paths, or cryptic names.\n"
     "Keep tools invisible: never mention tool names or results, and don't explain how "
-    "you found something or add unrelated detail.\n"
+    "you found something or add unrelated detail. The user can't see the tool call details, but can see which ones you used.\n"
     "Dictated input may contain mis-heard words, so ask when unsure. Say your name "
     "only when asked. Be warm, with the occasional dry aside. Speak English.\n\n"
 
     "ANSWERING\n"
-    "For any question about a person, plan, or detail of his, call recall FIRST — the "
-    "'Recent context' block above is only a keyword preview, not the whole memory, so "
-    "call recall yourself with the key names or words (try likely spellings of a "
+    "For any question about a person, plan, or personal detail, quietly call the tool 'recall' FIRST "
+    "with the key names or words (try likely spellings of a "
     "mis-heard name). If recall is thin, keep climbing: find_files for documents, "
     "search_emails then read_email for mail, search_events for the calendar.\n"
-    "Never say you checked memory, files, email, or the calendar unless you actually "
-    "called that tool — recall, find_files, search_emails, or search_events — this turn.\n"
+    "Search broad first — few, general keywords and no filters — and only add words "
+    "or filters when a tool returns too many results.\n"
+    "Never say you checked something if you haven't called the tools this turn.\n"
     "Before acting on a task, recall its words too — that surfaces his preferences and "
     "any tool quirks for it.\n"
     + _lazy_toolset_hint() +
@@ -2737,11 +2740,12 @@ class NotificationAnnouncer:
                 mem_txt = ""
         system = (
             f"You are {AGENT_NAME_SHORT}, {USER_NAME_SHORT}'s voice assistant. A notification "
-            "arrived while the conversation is idle. Decide if it deserves a brief spoken "
-            "heads-up. If yes, reply with ONE short spoken sentence (max ~90 characters, "
-            "TTS-friendly: no URLs, emoji, codes or IDs; spell out symbols; you may name the app "
-            "if useful). If it is routine, an ad, a login/verification code, or not worth "
-            "interrupting for, reply with exactly: [SKIP]."
+            "arrived while the conversation is idle. Decide whether it deserves a spoken "
+            "heads-up. If it does, READ IT ALOUD VERBATIM."
+            "Optionally naming the app or sender first  Do NOT paraphrase, summarise, translate, or reword it. Only "
+            "adjust for text-to-speech: spell out symbols and drop any URLs or emoji; If it is routine, an ad, a login or verification code, or "
+            "not worth interrupting for, reply with exactly: [SKIP]. Use anything you you can recall from memory "
+            "to judge whether it's worth reading."
             + (f" Relevant things you remember: {mem_txt}" if mem_txt else "")
         )
         user = f"Notification from {app}: {text}" if app else f"Notification: {text}"
@@ -2749,7 +2753,7 @@ class NotificationAnnouncer:
             "model": self._model,
             "messages": [{"role": "system", "content": system},
                          {"role": "user", "content": user}],
-            "temperature": 0.3, "max_tokens": 80,
+            "temperature": 0.2, "max_tokens": 120,
         }
         async with aiohttp.ClientSession() as http:
             async with http.post(
@@ -2765,7 +2769,7 @@ class NotificationAnnouncer:
         out = re.sub(r"<think>.*?</think>", "", out, flags=re.S).strip()
         if not out or out.upper().lstrip("[").startswith("SKIP"):
             return None
-        return out[:200]
+        return out[:300]
 
 
 async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> None:

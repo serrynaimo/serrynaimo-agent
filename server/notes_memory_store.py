@@ -470,8 +470,9 @@ end tell'''
         # identifies the person — it must not match every memory via its person
         # tag — so it is excluded from the generic scorer below.
         secondary = [k for k in kw if k not in profile_kw]
+        # Keep tokens of 3+ chars so short names (Tan, Ben, Ian) are searchable.
         sec_stems = {t[:4] for k in secondary
-                     for t in re.findall(r"[\w']+", k.lower()) if len(t) > 3}
+                     for t in re.findall(r"[\w']+", k.lower()) if len(t) > 2}
         with self._lock:
             hits = []
             for rec in self._mem.values():
@@ -480,7 +481,7 @@ end tell'''
                 if person and (rec.get("person") or "").lower() != person.lower():
                     continue
                 hay = f"{rec['content']} {rec.get('person') or ''}".lower()
-                hay_stems = {w[:4] for w in re.findall(r"[\w']+", hay) if len(w) > 3}
+                hay_stems = {w[:4] for w in re.findall(r"[\w']+", hay) if len(w) > 2}
                 score = len(sec_stems & hay_stems)
                 # Profile match: surface this person's memory if it also hits a
                 # secondary keyword (or unconditionally when there is none).
