@@ -588,10 +588,19 @@ function onUserInterim(text) {
 }
 
 function onUserText(text) {
-  // A control command (new session / mute) is handled server-side and by the
-  // "command" server-message — suppress the normal client flow (no bubble,
-  // no filler, and crucially no gate re-open that would fight a mute).
-  if (classifyCommand(text)) { userSlot.textContent = ""; userSlot.classList.remove("qualifying"); return; }
+  // A control command (new session / mute) — act on it and suppress the normal
+  // client flow (no bubble, no filler, no gate re-open that would fight a mute).
+  // The server catches commands with a LEADING wake word and fires the "command"
+  // server-message; this path additionally covers a TRAILING wake word
+  // ("start a new session, serry"), which the server forwards rather than
+  // swallows. Server-caught commands are swallowed upstream and never reach here,
+  // so there's no double-trigger.
+  const cmd = classifyCommand(text);
+  if (cmd) {
+    userSlot.textContent = ""; userSlot.classList.remove("qualifying");
+    if (cmd === "new-session") triggerNewSession(); else triggerQuiet();
+    return;
+  }
   // A final transcript only reaches the client if it passed the speaker and
   // wake gates — the conversation is live: undim and restart the window.
   userMuted = false; // server-side, a passed wake gate lifts the mute
@@ -1226,8 +1235,16 @@ let mutePhrases = ["shut up", "mute yourself", "be quiet",
                    "im not talking to you", "i am not talking to you"];
 function normalizeCommand(text) {
   let t = (text || "").toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
-  for (const w of wakeWords) {
-    if (t.startsWith(w + " ")) { t = t.slice(w.length + 1).trim(); break; }
+  // Peel wake words off BOTH ends (repeatedly) so a command fires whether the
+  // wake word precedes or follows it. A lone wake word is left untouched.
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const w of wakeWords) {
+      if (t === w) continue;
+      if (t.startsWith(w + " ")) { t = t.slice(w.length + 1).trim(); changed = true; }
+      if (t.endsWith(" " + w)) { t = t.slice(0, -(w.length + 1)).trim(); changed = true; }
+    }
   }
   return t.replace(/^please\s+/, "").replace(/\s+(please|now|thanks|no|okay)$/, "");
 }
@@ -1254,7 +1271,10 @@ function stripWakeWords(text) {
 }
 function triggerNewSession() {
   playSubmitSound();
-  document.getElementById("newSession").click(); // reloads the page
+  setStatus("charging up", true);            // immediate feedback while the glint plays
+  // Delay the reload ~1s so the confirmation sound finishes — location.reload
+  // tears down the audio context at once and would otherwise cut it off.
+  setTimeout(() => document.getElementById("newSession").click(), 1100);
 }
 function triggerQuiet() {
   // Speaking already interrupted any bot audio; just require the wake word again.
