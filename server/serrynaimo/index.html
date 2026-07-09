@@ -7,6 +7,12 @@
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   html, body { height: 100%; background: #07080c; overflow: hidden; }
+  /* UI monospace. Leads with characterful Mac system fonts (Monaco → PT Mono →
+     Andale Mono), then the cross-platform chain. Swap the first name to retaste. */
+  :root {
+    --mono: "Monaco", "PT Mono", "Andale Mono", ui-monospace, "SF Mono",
+            Menlo, "Cascadia Mono", monospace;
+  }
 
   /* Starfield + colored mist, behind everything */
   /* Hidden from first paint; fades in when the assistant reports ready. */
@@ -30,7 +36,7 @@
     pointer-events: none;
   }
   body {
-    font-family: ui-monospace, "SF Mono", Menlo, Monaco, "Cascadia Mono", monospace;
+    font-family: var(--mono);
     color: #e8eaf0;
     -webkit-font-smoothing: antialiased;
   }
@@ -61,6 +67,45 @@
     color: rgba(232, 234, 240, 0.35);
     transition: opacity 1.2s ease;
     user-select: none;
+  }
+
+  /* Top-right clock: local time + day, tilted in 3D so it faces the orb at
+     center. Fades in with the rest once the assistant is ready. */
+  #clock {
+    position: fixed;
+    top: 26px; right: 34px;
+    text-align: right;
+    z-index: 5;
+    user-select: none;
+    pointer-events: none;
+    color: #e8eaf0;
+    opacity: 0;
+    transition: opacity 2.4s ease;
+    transform: perspective(760px) rotateX(6deg) rotateY(-24deg);
+    transform-origin: 100% 50%;   /* pivot on the right edge — left swings toward the orb */
+    text-shadow: 0 0 22px rgba(120, 170, 255, 0.22);
+  }
+  body.ready #clock { opacity: 1; }
+  #clock .time {
+    font-size: 30px;
+    font-weight: 500;
+    letter-spacing: 0.02em;
+    font-variant-numeric: tabular-nums;
+    color: rgba(233, 236, 244, 0.92);
+    line-height: 1;
+  }
+  #clock .time .ampm {
+    font-size: 13px;
+    margin-left: 5px;
+    letter-spacing: 0.12em;
+    color: rgba(233, 236, 244, 0.5);
+  }
+  #clock .day {
+    margin-top: 6px;
+    font-size: 11px;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    color: rgba(232, 234, 240, 0.42);
   }
 
   /* Conversation — floating column in the lower half */
@@ -168,6 +213,9 @@
   #mute .strike { display: none; }
   body.gated #mute .strike { display: block; }
   body.gated #mute { opacity: 0.6; }
+  /* Hover must out-specify the gated state above (body.gated #mute = higher
+     specificity than #mute:hover), or hovering while muted wouldn't brighten. */
+  body.gated #mute:hover, body.gated #mute:focus-visible { opacity: 1; }
   /* Notifications toggle above the new-session button (bottom left): the strike
      shows the OFF state — banners are neither read aloud nor shown as text. */
   #notify { left: 22px; bottom: 76px; display: flex; align-items: center; justify-content: center; }
@@ -175,6 +223,7 @@
   #notify .strike { display: none; }
   body.notify-off #notify .strike { display: block; }
   body.notify-off #notify { opacity: 0.6; }
+  body.notify-off #notify:hover, body.notify-off #notify:focus-visible { opacity: 1; }
   #plus:hover, #plus:focus-visible, #mute:hover, #mute:focus-visible,
   #notify:hover, #notify:focus-visible,
   #newSession:hover, #newSession:focus-visible { opacity: 1; }
@@ -269,6 +318,10 @@
 <div id="orbGlass"></div>
 <canvas id="orb"></canvas>
 <div id="status">connecting</div>
+<div id="clock" aria-hidden="true">
+  <div class="time"><span class="hm">--:--</span><span class="ampm"></span></div>
+  <div class="day"></div>
+</div>
 <div id="chat"><div class="spacer"></div></div>
 <button id="plus" title="Type a message" aria-label="Type a message">+</button>
 <button id="newSession" title="New session" aria-label="New session">↺</button>
@@ -2271,6 +2324,25 @@ initBG();
 resizeBG();
 requestAnimationFrame(frame);
 connect();
+/* ---- top-right clock: local time + day, refreshed each minute ---- */
+(function clock() {
+  const hm = document.querySelector("#clock .hm");
+  const ap = document.querySelector("#clock .ampm");
+  const day = document.querySelector("#clock .day");
+  if (!hm) return;
+  function tick() {
+    const d = new Date();
+    let h = d.getHours();
+    ap.textContent = h < 12 ? "AM" : "PM";
+    h = h % 12 || 12;
+    hm.textContent = h + ":" + String(d.getMinutes()).padStart(2, "0");
+    day.textContent = d.toLocaleDateString(undefined, {
+      weekday: "long", day: "numeric", month: "long",
+    });
+  }
+  tick();
+  setInterval(tick, 15000);
+})();
 </script>
 </body>
 </html>
