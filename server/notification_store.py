@@ -70,6 +70,14 @@ class NotificationStore:
             self._db.executemany(
                 "UPDATE notifications SET read = 1 WHERE id = ?", [(i,) for i in ids])
 
+    def unread_count(self) -> int:
+        """Unread ('missed') notifications captured this session — drives the
+        client's faint notify-button dot."""
+        with self._lock:
+            return int(self._db.execute(
+                "SELECT COUNT(*) FROM notifications WHERE read = 0 AND ts >= ?",
+                (self._session_start,)).fetchone()[0])
+
     def turn_digest(self) -> dict:
         """The DELTA to surface this turn: banners that arrived since the previous
         turn AND are still unread, aggregated by app and sender. Advancing the

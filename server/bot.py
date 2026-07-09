@@ -2850,8 +2850,22 @@ class NotificationAnnouncer:
 
     # ---- drain loop (asyncio) ------------------------------------------
     async def run(self):
+        last_unread = -1
         while True:
             await asyncio.sleep(self._tick)
+            # Mirror the unread count to the client's notify-button dot. Reading the
+            # store each tick covers every mutation (capture, announce, tool-reported
+            # reads); emit only on change. Runs even while muted — a captured-but-
+            # unspoken banner should still light the dot.
+            if self._store is not None:
+                try:
+                    u = self._store.unread_count()
+                    if u != last_unread:
+                        last_unread = u
+                        await self._worker.queue_frames(
+                            [RTVIServerMessageFrame(data={"event": "notifications", "unread": u})])
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug(f"Unread-count emit failed: {exc}")
             if not self.enabled:
                 self._queue.clear()   # drop banners captured while off — don't backlog
                 continue

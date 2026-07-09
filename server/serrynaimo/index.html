@@ -40,6 +40,8 @@
     color: #e8eaf0;
     -webkit-font-smoothing: antialiased;
   }
+  /* Form controls don't inherit font-family by default — pull them onto --mono too. */
+  button, input, textarea, select { font-family: inherit; }
 
   /* WebGL orb — centered in the top half */
   #orb {
@@ -202,6 +204,8 @@
     position: fixed; bottom: 22px;
     width: 44px; height: 44px;
     border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    line-height: 1;   /* so text glyphs (+) center without baseline offset */
     border: 1px solid transparent; /* reserved so :active doesn't shift layout */
     background: #23262e;
     color: rgba(232, 234, 240, 0.75);
@@ -212,10 +216,11 @@
     z-index: 5;
   }
   #plus { right: 22px; }
-  #newSession { left: 22px; font-size: 20px; }
+  #newSession { left: 22px; }
+  #newSession svg { display: block; }
   /* Mute toggle above the plus button: the strike shows the CURRENT state —
      struck-out mic while the wake word is required, open mic while live. */
-  #mute { right: 22px; bottom: 76px; display: flex; align-items: center; justify-content: center; }
+  #mute { right: 22px; bottom: 76px; }
   #mute svg { display: block; }
   #mute .strike { display: none; }
   body.gated #mute .strike { display: block; }
@@ -225,12 +230,27 @@
   body.gated #mute:hover, body.gated #mute:focus-visible { opacity: 1; }
   /* Notifications toggle above the new-session button (bottom left): the strike
      shows the OFF state — banners are neither read aloud nor shown as text. */
-  #notify { left: 22px; bottom: 76px; display: flex; align-items: center; justify-content: center; }
+  #notify { left: 22px; bottom: 76px; }
   #notify svg { display: block; }
   #notify .strike { display: none; }
   body.notify-off #notify .strike { display: block; }
   body.notify-off #notify { opacity: 0.6; }
   body.notify-off #notify:hover, body.notify-off #notify:focus-visible { opacity: 1; }
+  /* Faint unread-notification indicator, top-right of the notify button. */
+  #notify::before {
+    content: "";
+    position: absolute;
+    top: 8px; right: 8px;
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    background: rgba(150, 185, 255, 0.85);
+    box-shadow: 0 0 7px rgba(120, 170, 255, 0.55);
+    opacity: 0;
+    transform: scale(0.4);
+    transition: opacity 0.5s ease, transform 0.5s cubic-bezier(0.22, 0.61, 0.36, 1);
+    pointer-events: none;
+  }
+  #notify.has-unread::before { opacity: 0.5; transform: scale(1); }
   #plus:hover, #plus:focus-visible, #mute:hover, #mute:focus-visible,
   #notify:hover, #notify:focus-visible,
   #newSession:hover, #newSession:focus-visible { opacity: 1; }
@@ -248,6 +268,49 @@
     opacity: 0 !important; pointer-events: none;
   }
   body.composing #plus { transform: rotate(45deg); }
+
+  /* Hover labels: a button's brief function fans out in 3D on the side facing
+     the orb — left of the right-hand buttons, right of the left-hand ones —
+     angled and faded in on hover/focus. */
+  #plus::after, #mute::after, #newSession::after, #notify::after {
+    content: attr(data-label);
+    position: absolute;
+    top: 50%;
+    white-space: nowrap;
+    font-size: 10.5px;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: rgba(232, 234, 240, 0.68);
+    text-shadow: 0 0 14px rgba(120, 170, 255, 0.18);
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 0.28s ease,
+                transform 0.42s cubic-bezier(0.22, 0.61, 0.36, 1);
+  }
+  /* Right-hand buttons → label to the LEFT, angling back (far edge recedes). */
+  #plus::after, #mute::after {
+    right: 100%; margin-right: 15px;
+    text-align: right;
+    transform-origin: right center;
+    transform: translateY(-50%) perspective(520px) rotateY(-50deg);
+  }
+  #plus:hover::after, #plus:focus-visible::after,
+  #mute:hover::after, #mute:focus-visible::after {
+    opacity: 0.68;
+    transform: translateY(-50%) perspective(520px) rotateY(-13deg);
+  }
+  /* Left-hand buttons → label to the RIGHT, mirrored (also angling back). */
+  #newSession::after, #notify::after {
+    left: 100%; margin-left: 15px;
+    text-align: left;
+    transform-origin: left center;
+    transform: translateY(-50%) perspective(520px) rotateY(50deg);
+  }
+  #newSession:hover::after, #newSession:focus-visible::after,
+  #notify:hover::after, #notify:focus-visible::after {
+    opacity: 0.68;
+    transform: translateY(-50%) perspective(520px) rotateY(13deg);
+  }
 
   #composer {
     position: fixed;
@@ -331,9 +394,15 @@
   <div class="zone"></div>
 </div>
 <div id="chat"><div class="spacer"></div></div>
-<button id="plus" title="Type a message" aria-label="Type a message">+</button>
-<button id="newSession" title="New session" aria-label="New session">↺</button>
-<button id="notify" title="Toggle notification reading" aria-label="Toggle notification reading">
+<button id="plus" data-label="Type a message" aria-label="Type a message">+</button>
+<button id="newSession" data-label="New session" aria-label="New session">
+  <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor"
+       stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+    <polyline points="1 4 1 10 7 10"/>
+    <path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/>
+  </svg>
+</button>
+<button id="notify" data-label="Speak notifications" aria-label="Toggle notification reading">
   <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor"
        stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
     <path d="M6 9a6 6 0 0 1 12 0c0 5 2 6 2 6H4s2-1 2-6"/>
@@ -341,7 +410,7 @@
     <line class="strike" x1="4" y1="4" x2="20" y2="20"/>
   </svg>
 </button>
-<button id="mute" title="Toggle wake word requirement" aria-label="Toggle wake word requirement">
+<button id="mute" data-label="Stop &amp; mute" aria-label="Toggle wake word requirement">
   <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor"
        stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
     <rect x="9" y="3" width="6" height="11" rx="3"/>
@@ -1240,6 +1309,10 @@ function handleRtvi(msg) {
         // (Server already re-armed the wake gate for "mute".)
         if (data.action === "new-session") triggerNewSession();
         else if (data.action === "mute") triggerQuiet();
+      } else if (data && data.event === "notifications") {
+        // Faint dot on the notify button while unread notifications exist.
+        const n = document.getElementById("notify");
+        if (n) n.classList.toggle("has-unread", (data.unread || 0) > 0);
       } else if (data && data.event === "config") {
         if (data.tts_lead_secs > 0) ttsLeadMs = data.tts_lead_secs * 1000;
         if (data.filler_delay_secs > 0) fillerDelayMs = data.filler_delay_secs * 1000;
