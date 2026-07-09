@@ -148,26 +148,26 @@ memory = NotesMemoryStore(
     call_mcp_tool,
 )
 
-# Default action memories (kind='action'): procedures and tool quirks that
-# used to live in the system prompt. Seeded once at startup; edits by voice
-# stick — "Agent, when deleting emails, also ..." updates the note.
+# Seeded action memories (kind='action') = TOOL QUIRKS / best-practice for the
+# tools: objective, reusable facts about how a tool behaves and how to use it
+# for reliable results — NOT Thomas' personal preferences (those are ordinary
+# memories, kind='fact'). Seeded once at startup; edits by voice stick —
+# "Agent, when searching mail, also ..." updates the note.
 SEED_ACTION_MEMORIES = [
-    "Searching or finding emails, mail, messages: mailbox defaults to Inbox "
-    "only — pass mailbox 'All' to search every folder; most mail sits in "
-    "'Archive'. Who an email is FROM goes in the sender parameter (matches "
-    "name or address); subject_keywords only match words actually in the "
-    "subject line. Omit filters you don't know; body_text is one plain "
-    "phrase, not a keyword list. On zero hits retry with fewer, broader "
-    "filters before concluding it doesn't exist.",
-    "Deleting, trashing, or cleaning up emails: there is no delete tool — "
-    "use manage_trash with action 'move_to_trash', or move_email to the "
-    "Trash mailbox. manage_trash only PREVIEWS by default: after the "
-    "go-ahead call it again with dry_run=false, or nothing is deleted.",
-    "Reading one specific email in full: search and inbox listings only show a "
-    "short preview that cuts long emails off — use read_email (by sender and/or "
-    "subject) to get the whole body. If the reply has continue_offset, the email "
-    "was long: call read_email again with the same sender/subject and "
-    "offset=continue_offset to read the rest, repeating until it's all seen.",
+    "Searching or finding emails, mail, messages: mailbox 'All', all accounts "
+    "(mail's in Archive, not just Inbox). sender = a broad name ('Qantas'), not "
+    "an exact address. subject_keywords = subject only; body_text = one phrase; "
+    "dates via date_from/date_to (YYYY-MM-DD). Quirk: max_results caps results "
+    "BEFORE sorting, so a low limit returns only the newest — reach older mail "
+    "with date_from/date_to, a high max_results, or offset. Zero hits: broaden "
+    "(wider mailbox, fewer filters, wider dates, higher max_results).",
+    "Deleting, trashing, or cleaning up emails: no delete tool — use "
+    "manage_trash action 'move_to_trash' (or move_email to Trash). It only "
+    "PREVIEWS unless dry_run=false, else nothing is deleted.",
+    "Reading one specific email in full: search and inbox show only a short "
+    "preview. Use read_email (by sender and/or subject) for the full body; if "
+    "it returns continue_offset, call again with the same sender/subject and "
+    "offset=continue_offset until done.",
 ]
 
 
@@ -630,10 +630,11 @@ remember_schema = FunctionSchema(
             "type": "string",
             "enum": ["fact", "action"],
             "description": (
-                "fact (default) = something that is true. action = HOW to do "
-                "a task: procedure, tool quirks, his preferences. "
-                "Store an action memory whenever doing a task surfaced "
-                "corrections or specifics worth reusing."
+                "fact (default) = anything true, INCLUDING how he likes tasks "
+                "done (his preferences). action = a TOOL QUIRK: how a tool "
+                "behaves or the best way to use it for reliable results — "
+                "objective and reusable, not personal. Store a tool quirk you "
+                "hit as action; store a preference of his as a fact."
             ),
         },
         "person": {
@@ -2512,14 +2513,16 @@ def build_system_prompt(calendar_block: str = "", files_block: str = "") -> str:
     "correspondence), treat an empty recall as the start of the hunt: keep "
     "digging — files, then email, then calendar. say you don't know or ask "
     "only after all of those come up empty. "
-    f"Action memories hold HOW {USER_NAME_SHORT} wants tasks done and tool quirks. "
-    "Before ANY tool-driven task: check if there are any memorised Action notes; "
-    "Recall relevant memories with kind 'action' with the task words FIRST. When "
-    "doing a task surfaces corrections, quirks, or preferences, remember "
-    "them with kind 'action' — update the existing note by id rather than "
-    "adding a near-duplicate. Read every tool "
-    "result: if it says dry run, not available, or error, the action did "
-    "NOT happen — say so instead of claiming success. "
+    "Action memories are TOOL QUIRKS — how a tool behaves and the most reliable "
+    f"way to use it (objective, not personal). {USER_NAME_SHORT}'s PREFERENCES — "
+    "how he likes tasks done — are ordinary memories (facts), not action notes. "
+    "Before ANY tool-driven task, recall with the task words FIRST — one recall "
+    "surfaces both his preferences and any relevant tool quirks. When a task "
+    "reveals a tool quirk, remember it with kind 'action'; when it reveals a "
+    "preference of his, remember it as a fact — update the existing note by id "
+    "rather than adding a near-duplicate. Read every tool result: if it says dry "
+    "run, not available, or error, the action did NOT happen — say so instead of "
+    "claiming success. "
     "When an exchange surfaces something genuinely noteworthy — a discovery, "
     f"decision, or new fact about {USER_NAME} or his world — finish speaking first, "
     "then quietly remember it on your own judgement.\n"
