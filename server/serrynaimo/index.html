@@ -107,6 +107,13 @@
     text-transform: uppercase;
     color: rgba(232, 234, 240, 0.42);
   }
+  #clock .zone {
+    margin-top: 3px;
+    font-size: 10px;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    color: rgba(232, 234, 240, 0.28);
+  }
 
   /* Conversation — floating column in the lower half */
   #chat {
@@ -321,6 +328,7 @@
 <div id="clock" aria-hidden="true">
   <div class="time"><span class="hm">--:--</span><span class="ampm"></span></div>
   <div class="day"></div>
+  <div class="zone"></div>
 </div>
 <div id="chat"><div class="spacer"></div></div>
 <button id="plus" title="Type a message" aria-label="Type a message">+</button>
@@ -2329,7 +2337,11 @@ connect();
   const hm = document.querySelector("#clock .hm");
   const ap = document.querySelector("#clock .ampm");
   const day = document.querySelector("#clock .day");
+  const zone = document.querySelector("#clock .zone");
   if (!hm) return;
+  // Timezone doesn't change during a session — set it once. "Asia/Singapore, Earth"
+  const tz = (Intl.DateTimeFormat().resolvedOptions().timeZone || "Local").replace(/_/g, " ");
+  if (zone) zone.textContent = tz + ", Earth";
   function tick() {
     const d = new Date();
     let h = d.getHours();
