@@ -163,6 +163,11 @@ SEED_ACTION_MEMORIES = [
     "use manage_trash with action 'move_to_trash', or move_email to the "
     "Trash mailbox. manage_trash only PREVIEWS by default: after the "
     "go-ahead call it again with dry_run=false, or nothing is deleted.",
+    "Reading one specific email in full: search and inbox listings only show a "
+    "short preview that cuts long emails off — use read_email (by sender and/or "
+    "subject) to get the whole body. If the reply has continue_offset, the email "
+    "was long: call read_email again with the same sender/subject and "
+    "offset=continue_offset to read the rest, repeating until it's all seen.",
 ]
 
 
@@ -1571,6 +1576,141 @@ read_file_schema = FunctionSchema(
 )
 
 
+# Reading one specific email in full. The normal mail path can't: search/list
+# only expose a 150-500 char preview, and the MCP proxy caps every result at
+# 6000 chars. read_email fetches the WHOLE body server-side (search_emails with
+# max_content_length=0, which call_mcp_tool returns uncapped) and then pages it
+# out in READ_MAX_CHARS chunks, mirroring read_file's continue_from pagination.
+_email_read_cache: dict[str, dict] = {}   # locator key -> {body, subject, sender, date, mailbox, others}
+
+
+def _email_locator_key(sender: str, subject: str, mailbox: str) -> str:
+    return "\x00".join((sender.strip().lower(), subject.strip().lower(), mailbox.strip().lower()))
+
+
+async def read_email(params: FunctionCallParams):
+    """Tool handler: return the full text of one specific email, paged."""
+    a = params.arguments
+    sender = (a.get("sender") or "").strip()
+    subject = (a.get("subject") or "").strip()
+    mailbox = (a.get("mailbox") or "All").strip() or "All"
+    try:
+        offset = max(0, int(a.get("offset") or 0))
+    except (TypeError, ValueError):
+        offset = 0
+    if not sender and not subject:
+        await params.result_callback(
+            {"error": "give a sender and/or subject to identify which email to read"}
+        )
+        return
+    logger.info(
+        f"read_email: sender=[{sender}] subject=[{subject}] mailbox=[{mailbox}] offset={offset}"
+    )
+
+    key = _email_locator_key(sender, subject, mailbox)
+    # A follow-up page reuses the body fetched on the first call — no second
+    # trip through Mail — as long as the locator is unchanged.
+    cached = _email_read_cache.get(key) if offset > 0 else None
+    if cached is None:
+        search_args = {
+            "mailbox": mailbox,
+            "include_content": True,
+            "max_content_length": 0,        # 0 = full body (uncapped via call_mcp_tool)
+            "output_format": "json",
+            "limit": 5,
+            "sort": "date_desc",
+        }
+        if sender:
+            search_args["sender"] = sender
+        if subject:
+            search_args["subject_keyword"] = subject
+        try:
+            raw = await call_mcp_tool("apple-mail", "search_emails", search_args)
+        except Exception as exc:  # noqa: BLE001
+            await params.result_callback({"error": f"could not read email: {exc}"})
+            return
+        try:
+            items = (json.loads(raw) or {}).get("items", [])
+        except (ValueError, TypeError):
+            items = []
+        items = [it for it in items if (it.get("content_preview") or "").strip()]
+        if not items:
+            await params.result_callback(
+                {"error": "no matching email with readable content found — "
+                          "adjust sender/subject, or set mailbox to 'All'"}
+            )
+            return
+        chosen = items[0]  # most recent match (sort=date_desc)
+        cached = {
+            "body": (chosen.get("content_preview") or "").strip(),
+            "subject": chosen.get("subject", ""),
+            "sender": chosen.get("sender", ""),
+            "date": chosen.get("received_date", ""),
+            "mailbox": chosen.get("mailbox", mailbox),
+            "others": max(0, len(items) - 1),
+        }
+        _email_read_cache.clear()   # only the currently-open email is ever cached
+        _email_read_cache[key] = cached
+
+    body = cached["body"]
+    total = len(body)
+    if offset >= total:
+        await params.result_callback(
+            {"error": f"offset {offset} is past the end of this email ({total} chars)"}
+        )
+        return
+    chunk = body[offset:offset + READ_MAX_CHARS]
+    end = offset + len(chunk)
+    result = {
+        "subject": cached["subject"],
+        "from": cached["sender"],
+        "date": cached["date"],
+        "mailbox": cached["mailbox"],
+        "content": chunk,
+        "chars": f"{offset}–{end} of {total}",
+    }
+    if end < total:
+        result["continue_offset"] = end
+        result["note"] = (
+            f"{total - end} more characters remain — call read_email again with the "
+            f"same sender/subject and offset={end} to read the next part."
+        )
+    if offset == 0 and cached.get("others"):
+        result["also_matched"] = (
+            f"{cached['others']} other email(s) matched; showing the most recent. "
+            "Narrow by subject/sender/date to pick a different one."
+        )
+    await params.result_callback(result)
+
+
+read_email_schema = FunctionSchema(
+    name="read_email",
+    description=(
+        "Read the FULL text of one specific email. Use this whenever you need an "
+        "email's complete body — searching or listing mail only shows a short "
+        "preview that cuts long emails off. Identify the email by sender and/or "
+        "subject (mailbox defaults to 'All'). Long emails are paged: if the "
+        "response has continue_offset, call read_email again with the same "
+        "sender/subject and offset=continue_offset to get the next part."
+    ),
+    properties={
+        "sender": {"type": "string", "description": "Sender email or name identifying the email"},
+        "subject": {"type": "string", "description": "Subject keyword identifying the email"},
+        "mailbox": {
+            "type": "string",
+            "description": "Where to look: 'All' (default), 'INBOX', 'Archive', or a folder name",
+        },
+        "offset": {
+            "type": "integer",
+            "description": "Character offset to resume from (the continue_offset from a "
+                           "previous read_email); omit to start at the beginning",
+        },
+    },
+    required=[],
+    handler=read_email,
+)
+
+
 find_files_schema = FunctionSchema(
     name="find_files",
     description=(
@@ -1740,7 +1880,7 @@ for _schema in (
     google_search_schema, x_web_search_schema, x_search_schema,
     escalate_to_grok_schema,
     open_in_safari_schema, find_files_schema, open_file_schema,
-    read_file_schema, run_javascript_schema, get_weather_schema,
+    read_file_schema, read_email_schema, run_javascript_schema, get_weather_schema,
     remember_schema, recall_schema, forget_schema,
     add_person_schema, edit_person_schema, list_people_schema,
 ):
@@ -1754,7 +1894,7 @@ for _schema in (
     google_search_schema, x_web_search_schema, x_search_schema,
     escalate_to_grok_schema,
     get_current_time_schema, open_in_safari_schema, find_files_schema,
-    open_file_schema, read_file_schema, run_javascript_schema,
+    open_file_schema, read_file_schema, read_email_schema, run_javascript_schema,
     get_weather_schema, get_financial_info_schema, remember_schema,
     recall_schema, forget_schema, add_person_schema, edit_person_schema,
     list_people_schema,
@@ -1768,7 +1908,7 @@ NATIVE_TOOL_SCHEMAS = (
     google_search_schema, x_web_search_schema, x_search_schema,
     escalate_to_grok_schema,
     get_current_time_schema, open_in_safari_schema, find_files_schema,
-    open_file_schema, read_file_schema, run_javascript_schema,
+    open_file_schema, read_file_schema, read_email_schema, run_javascript_schema,
     get_weather_schema, get_financial_info_schema, remember_schema,
     recall_schema, forget_schema, add_person_schema, edit_person_schema,
     list_people_schema,
@@ -1789,7 +1929,7 @@ _INJECT_STOPWORDS = {
 
 # Spoken before slow tool calls; pre-synthesized into the TTS phrase cache at
 # startup so they play instantly even while the LLM saturates the GPU.
-FILLER_LINES = ["Give me a moment", "Just a second", "Hang in there for a sec", "Orbiting on that", "On it"]
+FILLER_LINES = ["Give me a moment", "Just a second", "Hang in there a sec", "One moment", "Orbiting on that", "On it"]
 
 # Spoken when the context hits the token limit and gets compressed into a
 # summary (a slow, full-reprefill operation). Primed like the fillers, but
@@ -1821,7 +1961,7 @@ class LMStudioLLMService(OpenAILLMService):
     TTS-side sentence stream (blank lines become spaces, etc.); the exact
     copy lets run_bot store what the model actually generated, which keeps
     the next prompt a byte-exact continuation — required for LM Studio's
-    cache to survive a turn on hybrid models like qwen3-coder-next.
+    cache to survive a turn on hybrid models like qwen3.5-122b-a10b.
     """
 
     supports_developer_role = False
@@ -1871,8 +2011,8 @@ NEW_SESSION_PHRASES = _parse_phrase_list(
 )
 MUTE_PHRASES = _parse_phrase_list(
     "COMMAND_MUTE_PHRASES",
-    ["shut up", "mute yourself", "be quiet",
-     "i'm not talking to you", "i am not talking to you"],
+    ["shut up", "mute yourself", "be quiet", "stop", "stop talking",
+     "i'm not talking to you", "i am not talking to you", "that's it", "got it"],
 )
 
 
@@ -2035,7 +2175,7 @@ class MemoryInjector(FrameProcessor):
         # Lands in the context just before the user message that triggered it.
         # USER role, not system: LM Studio reprocesses the whole prompt when a
         # system message appears mid-conversation (measured: ~9s vs 0.2s on
-        # qwen3-coder-next), while user/assistant/tool blocks continue the
+        # qwen3.5-122b-a10b), while user/assistant/tool blocks continue the
         # prompt cache cleanly. User role also keeps provenance unambiguous.
         await self.push_frame(
             LLMMessagesAppendFrame(
@@ -2441,7 +2581,7 @@ async def run_text_chat(prompt: str, history: list, max_tool_rounds: int = 6) ->
     "messages" back as "history" for multi-turn conversations.
     """
     base_url = os.getenv("LMSTUDIO_BASE_URL", "http://localhost:1234/v1")
-    model = os.getenv("LMSTUDIO_MODEL") or await detect_lmstudio_model(base_url) or "qwen3-coder-next"
+    model = os.getenv("LMSTUDIO_MODEL") or await detect_lmstudio_model(base_url) or "qwen3.5-122b-a10b"
     calendar_block, files_block = await asyncio.gather(
         _calendar_outlook_block(), _recent_files_block()
     )
@@ -2654,7 +2794,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
     base_url = os.getenv("LMSTUDIO_BASE_URL", "http://localhost:1234/v1")
     llm_model = os.getenv("LMSTUDIO_MODEL") or await detect_lmstudio_model(base_url)
     if not llm_model:
-        llm_model = "qwen3-coder-next"
+        llm_model = "qwen3.5-122b-a10b"
         logger.warning(f"No model detected in LM Studio; falling back to {llm_model}")
     logger.info(f"LLM model for this session: {llm_model}")
 
@@ -2842,6 +2982,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
         find_files_schema,
         open_file_schema,
         read_file_schema,
+        read_email_schema,
         run_javascript_schema,
         get_weather_schema,
         get_financial_info_schema,
