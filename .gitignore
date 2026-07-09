@@ -226,6 +226,8 @@ __marimo__/
 server/memories.db
 # Notes-backed memory stats/cache sidecar (recall counts — local runtime state)
 server/notes_memory.db
+# Captured macOS notification banners (personal — local runtime cache)
+server/notifications.db
 # Voice recordings of the enrolled user + speaker-gate captures
 server/enroll_samples/
 server/gate_samples/
