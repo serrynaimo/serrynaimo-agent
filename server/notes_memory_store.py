@@ -21,7 +21,7 @@ A paragraph may optionally start with an "@Location:" prefix:
 
     @Singapore: Gregor Gregersen founded Silver Bullion Group.
 
-Profile notes carry an optional header (Aliases: / About:) before the memories.
+Profile notes carry an optional header (Aliases:) before the memories.
 
 Reads are synchronous (pure RAM). Writes update RAM + SQLite synchronously and
 enqueue an async Notes rewrite (the affected note is regenerated wholesale from
@@ -38,9 +38,6 @@ import threading
 from datetime import datetime, timedelta
 
 from loguru import logger
-
-# Optional "@Location: text" prefix on a memory paragraph (multi-word location).
-_LOC_PREFIX = re.compile(r"^@([^:@\n]{1,60}):\s+(.*)$", re.S)
 
 
 def _now() -> str:
@@ -109,8 +106,8 @@ class NotesMemoryStore:
 
         # RAM index
         self._lock = threading.RLock()
-        self._mem: dict[str, dict] = {}      # id -> {id, content, kind, person, location, note_path, order, created_at}
-        self._people: dict[str, dict] = {}   # lower-name -> {name, aliases, description}
+        self._mem: dict[str, dict] = {}      # id -> {id, content, kind, person, note_path, order, created_at}
+        self._people: dict[str, dict] = {}   # lower-name -> {name, aliases}
         # Cheap change-detector for the poll: (note count, newest "YYYYMMDDhhmmss"
         # modification stamp) across the agent's folders as of the last load.
         self._last_fp: tuple[int, str] = (0, "0")
@@ -218,7 +215,7 @@ end tell'''
 
         get_note returns the body as HTML (<div>line</div>...). Normalize tags
         to newlines, then group the lines into paragraphs (blank line = break);
-        each paragraph is one memory. Header lines (title echo, Aliases:, About:)
+        each paragraph is one memory. Header lines (title echo, Aliases:)
         are recognized before the first memory.
         """
         import html
@@ -228,7 +225,6 @@ end tell'''
 
         note_key = self._note_key(folder, title)
         aliases: list[str] = []
-        description = ""
         memories: list[dict] = []
         seen_content = False
         para: list[str] = []
@@ -241,16 +237,10 @@ end tell'''
             para.clear()
             if not content:
                 return
-            location = None
-            m = _LOC_PREFIX.match(content)
-            if m:
-                location, content = m.group(1).strip(), m.group(2).strip()
-            if not content:
-                return
             seen_content = True
             memories.append({
                 "id": _mem_id(note_key, content), "content": content, "kind": kind,
-                "person": person, "location": location, "note_path": note_key,
+                "person": person, "note_path": note_key,
                 "order": len(memories),
             })
 
@@ -260,19 +250,16 @@ end tell'''
                 flush_para()
                 continue
             if not seen_content and not para:
-                # header region: title echo + Aliases:/About: (profiles)
+                # header region: title echo + Aliases: (profiles)
                 if line == title:
                     continue
                 low = line.lower()
                 if low.startswith("aliases:"):
                     aliases = [a.strip() for a in line[8:].split(",") if a.strip()]
                     continue
-                if low.startswith("about:"):
-                    description = line[6:].strip()
-                    continue
             para.append(line)
         flush_para()
-        return memories, aliases, description
+        return memories, aliases
 
     def _render_note(self, folder: str, title: str, include_title: bool) -> str:
         """Rebuild a note's HTML body from the current RAM records.
@@ -295,8 +282,6 @@ end tell'''
             if person:
                 if person.get("aliases"):
                     parts.append(f"<div>Aliases: {_esc(', '.join(person['aliases']))}</div>")
-                if person.get("description"):
-                    parts.append(f"<div>About: {_esc(person['description'])}</div>")
         blank = "<div><br></div>"
         recs = sorted((r for r in self._mem.values() if r["note_path"] == key),
                       key=lambda r: (r.get("order", 0), r["id"]))
@@ -304,9 +289,7 @@ end tell'''
             # A title always precedes the memories (included here, or prepended
             # by create_note), so every memory gets a blank line above it.
             parts.append(blank)
-            loc = rec.get("location")
-            content = f"@{loc}: {rec['content']}" if loc else rec["content"]
-            parts.append(f"<div>{_esc(content)}</div>")
+            parts.append(f"<div>{_esc(rec['content'])}</div>")
         return "\n".join(parts)
 
     # ---- stats ----------------------------------------------------------
@@ -345,9 +328,9 @@ end tell'''
                 if meta["modificationDate"] > max_stamp:
                     max_stamp = meta["modificationDate"]
                 person = title if person_from_title and title.lower() != "you" else None
-                mems, aliases, desc = self._parse_note(folder, title, meta["body"], kind, person)
+                mems, aliases = self._parse_note(folder, title, meta["body"], kind, person)
                 if person_from_title:
-                    people[title.lower()] = {"name": title, "aliases": aliases, "description": desc}
+                    people[title.lower()] = {"name": title, "aliases": aliases}
                 for rec in mems:
                     mem[rec["id"]] = rec
 
@@ -471,10 +454,24 @@ end tell'''
 
     # ---- read API (sync, from RAM) -------------------------------------
 
-    def recall(self, keywords, person=None, location=None, limit=8, kind=None) -> dict:
+    def recall(self, keywords, person=None, limit=8, kind=None) -> dict:
         kw = [str(k) for k in (keywords or [])]
-        terms = [w.lower() for kwd in kw for w in re.findall(r"[\w']+", kwd)]
-        stems = {t[:4] for t in terms if len(t) > 3}
+        # A keyword that names a registered profile scopes the search to that
+        # person: any of THEIR memories matching a secondary keyword surface —
+        # and all of them when no secondary keyword is given.
+        matched_people = set()
+        profile_kw = set()
+        for k in kw:
+            r = self.resolve_person(k)
+            if "person" in r:
+                matched_people.add(r["person"].lower())
+                profile_kw.add(k)
+        # Non-profile keywords drive the generic match. A profile keyword only
+        # identifies the person — it must not match every memory via its person
+        # tag — so it is excluded from the generic scorer below.
+        secondary = [k for k in kw if k not in profile_kw]
+        sec_stems = {t[:4] for k in secondary
+                     for t in re.findall(r"[\w']+", k.lower()) if len(t) > 3}
         with self._lock:
             hits = []
             for rec in self._mem.values():
@@ -482,11 +479,14 @@ end tell'''
                     continue
                 if person and (rec.get("person") or "").lower() != person.lower():
                     continue
-                if location and (rec.get("location") or "").lower() != location.lower():
-                    continue
-                hay = f"{rec['content']} {rec.get('person') or ''} {rec.get('location') or ''}".lower()
+                hay = f"{rec['content']} {rec.get('person') or ''}".lower()
                 hay_stems = {w[:4] for w in re.findall(r"[\w']+", hay) if len(w) > 3}
-                score = len(stems & hay_stems)
+                score = len(sec_stems & hay_stems)
+                # Profile match: surface this person's memory if it also hits a
+                # secondary keyword (or unconditionally when there is none).
+                if matched_people and (rec.get("person") or "").lower() in matched_people:
+                    if not sec_stems or (sec_stems & hay_stems):
+                        score = max(score, 1) + 10
                 if score:
                     hits.append((score, rec))
             hits.sort(key=lambda p: (p[0], p[1].get("created_at", "")), reverse=True)
@@ -504,12 +504,13 @@ end tell'''
                     [(m["id"], now) for m in out],
                 )
                 self._db.commit()
-        return {"memories": out, **({"person": person} if person else {})}
+        return {"memories": out, "matched_people": sorted(matched_people),
+                **({"person": person} if person else {})}
 
     def _public(self, rec: dict) -> dict:
         return {
             "id": rec["id"], "content": rec["content"], "context": "",
-            "person": rec.get("person"), "location": rec.get("location"),
+            "person": rec.get("person"),
             "kind": rec["kind"], "created_at": rec.get("created_at") or _now(),
         }
 
@@ -544,8 +545,8 @@ end tell'''
                 if p["name"].lower() == "you":
                     continue
                 count = sum(1 for r in self._mem.values() if (r.get("person") or "").lower() == p["name"].lower())
-                people.append({"name": p["name"], "description": p.get("description", ""),
-                               "aliases": p.get("aliases", []), "since": _now()[:10], "memories": count})
+                people.append({"name": p["name"], "aliases": p.get("aliases", []),
+                               "since": _now()[:10], "memories": count})
         return people
 
     def resolve_person(self, name: str) -> dict:
@@ -569,7 +570,7 @@ end tell'''
 
     # ---- write API (sync: RAM + SQLite now, Notes async) ---------------
 
-    def add_person(self, name: str, description: str = "", aliases=None) -> dict:
+    def add_person(self, name: str, aliases=None) -> dict:
         name = name.strip()
         if not name:
             return {"error": "person needs a name"}
@@ -579,10 +580,10 @@ end tell'''
             existing = self._people.get(key)
             if existing:
                 merged = list(dict.fromkeys(existing.get("aliases", []) + aliases))
-                existing.update({"description": description or existing.get("description", ""), "aliases": merged})
+                existing.update({"aliases": merged})
                 self._mark_dirty(self._note_key(self._profiles, existing["name"]))
                 return {"person": existing["name"], "updated": True, "aliases": merged}
-            self._people[key] = {"name": name, "aliases": aliases, "description": description}
+            self._people[key] = {"name": name, "aliases": aliases}
             self._mark_dirty(self._note_key(self._profiles, name))
         return {"person": name, "registered": True, "aliases": aliases}
 
@@ -602,7 +603,7 @@ end tell'''
         self._ensure_stats(rec["id"], rec.get("created_at") or _now())
         self._db.commit()
 
-    def remember(self, content, context="", memory_id=None, location=None, person=None,
+    def remember(self, content, context="", memory_id=None, person=None,
                  kind=None, created_at=None, skip_dedup=False) -> dict:
         content = str(content).strip()
         if not content:
@@ -637,8 +638,6 @@ end tell'''
                 new_id = _mem_id(new_note, content)
                 rec = {**rec, "id": new_id, "content": content, "kind": new_kind,
                        "person": new_person, "note_path": new_note}
-                if location is not None:
-                    rec["location"] = location or None
                 if new_note != old_note:
                     rec["order"] = self._next_order(new_note)
                 # re-key RAM + carry stats across the id change
@@ -650,7 +649,7 @@ end tell'''
                 if old_note != new_note:
                     self._mark_dirty(old_note)
                 return {"id": new_id, "edited": True, "person": rec.get("person"),
-                        "location": rec.get("location"), "created_at": rec.get("created_at")}
+                        "created_at": rec.get("created_at")}
             # dedup guard
             if not skip_dedup:
                 dup = self._find_similar(content, kind or "fact")
@@ -664,11 +663,11 @@ end tell'''
             note_key = self._note_key(folder, title)
             mid = _mem_id(note_key, content)
             rec = {"id": mid, "content": content, "kind": k, "person": resolved,
-                   "location": (location or None), "note_path": note_key,
+                   "note_path": note_key,
                    "order": self._next_order(note_key), "created_at": created_at or _now()}
             self._put(rec)
             self._mark_dirty(note_key)
-        return {"id": mid, "created_at": rec["created_at"], "person": resolved, "location": location or None}
+        return {"id": mid, "created_at": rec["created_at"], "person": resolved}
 
     def _migrate_stats(self, old_id: str, new_id: str):
         """Carry recall stats from an old (pre-edit) id to the new one."""
@@ -721,7 +720,7 @@ end tell'''
             added += 1
         return added
 
-    def edit_person(self, person, new_name=None, description=None, aliases=None) -> dict:
+    def edit_person(self, person, new_name=None, aliases=None) -> dict:
         r = self.resolve_person(person)
         if "person" not in r:
             return {"error": f"person {person!r} is not uniquely known",
@@ -731,8 +730,6 @@ end tell'''
             old_name = rec["name"]
             if aliases:
                 rec["aliases"] = list(dict.fromkeys(rec.get("aliases", []) + [a.strip() for a in aliases]))
-            if description is not None:
-                rec["description"] = description
             if new_name and new_name.strip() and new_name.strip().lower() != old_name.lower():
                 new = new_name.strip()
                 rec["aliases"] = list(dict.fromkeys(rec.get("aliases", []) + [old_name]))

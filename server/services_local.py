@@ -619,6 +619,14 @@ class Qwen3ASRSTTService(SegmentedSTTService):
         voice window — the next voice utterance still needs the wake word."""
         self._voice_driven = False
 
+    def note_proactive_speech(self):
+        """The bot is about to speak on its OWN initiative (e.g. reading a
+        notification), not in reply to the user. Its speech must NOT open the
+        wake window — otherwise a proactive interjection would let bystanders
+        (or ambient speech) address the agent wake-word-free for the timeout.
+        Same mechanism as a typed message: mark the exchange not-voice-driven."""
+        self._voice_driven = False
+
     def take_llm_audio(self) -> dict | None:
         """The gated utterance audio for the LLM ({text, b64}), consumed once."""
         audio, self._llm_audio = self._llm_audio, None

@@ -23,6 +23,7 @@ Run the bot using::
 """
 
 import asyncio
+import collections
 import json
 import os
 import re
@@ -153,21 +154,22 @@ memory = NotesMemoryStore(
 # for reliable results — NOT Thomas' personal preferences (those are ordinary
 # memories, kind='fact'). Seeded once at startup; edits by voice stick —
 # "Agent, when searching mail, also ..." updates the note.
+# Seed tool-quirk memories (kind 'action'). Recall matches on the trigger
+# phrase BEFORE the first colon, and auto-injection truncates at ~220 chars —
+# so each keeps a keyword-rich trigger and front-loads its most useful quirk.
 SEED_ACTION_MEMORIES = [
-    "Searching or finding emails, mail, messages: mailbox 'All', all accounts "
-    "(mail's in Archive, not just Inbox). sender = a broad name ('Qantas'), not "
-    "an exact address. subject_keywords = subject only; body_text = one phrase; "
-    "dates via date_from/date_to (YYYY-MM-DD). Quirk: max_results caps results "
-    "BEFORE sorting, so a low limit returns only the newest — reach older mail "
-    "with date_from/date_to, a high max_results, or offset. Zero hits: broaden "
-    "(wider mailbox, fewer filters, wider dates, higher max_results).",
-    "Deleting, trashing, or cleaning up emails: no delete tool — use "
-    "manage_trash action 'move_to_trash' (or move_email to Trash). It only "
-    "PREVIEWS unless dry_run=false, else nothing is deleted.",
-    "Reading one specific email in full: search and inbox show only a short "
-    "preview. Use read_email (by sender and/or subject) for the full body; if "
-    "it returns continue_offset, call again with the same sender/subject and "
-    "offset=continue_offset until done.",
+    "Searching or finding emails or messages: search mailbox 'All' across "
+    "accounts, since mail lives in Archive as well as the Inbox, and use a broad "
+    "sender name over an exact address, bounding dates with date_from/date_to.",
+    "Older or missing emails, only the newest showing: max_results caps before "
+    "sorting, so reach older mail with date_from and date_to, a higher max_results, "
+    "or offset, and broaden the filters when a search finds nothing.",
+    "Deleting, trashing, or cleaning up emails: there is no delete tool, so use "
+    "manage_trash with action 'move_to_trash', and set dry_run to false to actually "
+    "move it, since it only previews otherwise.",
+    "Reading one specific email in full: search and inbox show only a preview, so "
+    "use read_email by sender and/or subject for the full body, and if it returns "
+    "continue_offset, call it again with that offset until done.",
 ]
 
 
@@ -464,11 +466,10 @@ async def remember(params: FunctionCallParams):
     if memory_id is not None:
         memory_id = str(memory_id).strip() or None
     snapshot = _recent_conversation(params.context)
-    location = str(params.arguments.get("location") or "").strip() or None
     person = str(params.arguments.get("person") or "").strip() or None
     kind = str(params.arguments.get("kind") or "").strip().lower() or None
     result = await asyncio.to_thread(
-        memory.remember, content, snapshot, memory_id, location, person, kind
+        memory.remember, content, snapshot, memory_id, person, kind
     )
     if "error" in result:
         await params.result_callback(result)
@@ -502,22 +503,21 @@ def _injected_memory_text() -> str:
         str(m.get("content", ""))
         for m in ctx.get_messages()
         if isinstance(m, dict)
-        and str(m.get("content", "")).startswith(("Auto-recalled memories", "Action notes"))
+        and str(m.get("content", "")).startswith(("Recent context", "Action notes"))
     )
 
 
 async def recall(params: FunctionCallParams):
-    """Tool handler: search memories by keywords and/or person/location filters."""
+    """Tool handler: search memories by keywords and/or a person filter."""
     keywords = params.arguments.get("keywords") or []
     if isinstance(keywords, str):
         keywords = keywords.split()
     person = str(params.arguments.get("person") or "").strip() or None
-    location = str(params.arguments.get("location") or "").strip() or None
     kind = str(params.arguments.get("kind") or "").strip().lower() or None
     result = await asyncio.to_thread(
-        memory.recall, list(keywords), person, location, 5, kind
+        memory.recall, list(keywords), person, 5, kind
     )
-    logger.info(f"recall: {keywords} person={person} location={location} -> {result.get('error') or len(result['memories'])}")
+    logger.info(f"recall: {keywords} person={person} -> {result.get('error') or len(result['memories'])}")
     if result.get("error"):
         await params.result_callback(result)
         return
@@ -526,22 +526,24 @@ async def recall(params: FunctionCallParams):
             "id": m["id"],
             "content": m["content"],
             "person": m.get("person"),
-            "location": m.get("location"),
             "date": m["created_at"][:10],
             "kind": m.get("kind", "fact"),
         }
         for m in result["memories"]
     ]
     # Precision: OR-matching can drag in barely-related entries — keep
-    # only memories that share a stem with the query (falling back to
-    # the full set if that would leave nothing).
+    # only memories that share a stem with the query or belong to a matched
+    # profile (falling back to the full set if that would leave nothing).
+    matched = set(result.get("matched_people") or [])
     stems = {
         w[:4] for kw in keywords
         for w in re.findall(r"[\w']+", str(kw).lower()) if len(w) > 3
     }
-    if stems:
+    if stems or matched:
         def _relevant(m):
-            hay = f"{m['content']} {m.get('person') or ''} {m.get('location') or ''}".lower()
+            if (m.get("person") or "").lower() in matched:
+                return True
+            hay = f"{m['content']} {m.get('person') or ''}".lower()
             return any(w[:4] in stems for w in re.findall(r"[\w']+", hay) if len(w) > 3)
         strict = [m for m in memories if _relevant(m)]
         if strict:
@@ -554,7 +556,7 @@ async def recall(params: FunctionCallParams):
         if injected and m["content"] in injected:
             shown.append(str(m["id"]))
             continue
-        tags = ", ".join(t for t in (m["person"], m["location"]) if t)
+        tags = m["person"] or ""
         marker = ", action" if m.get("kind") == "action" else ""
         head = f"[{m['id']}{marker}, {m['date']}" + (f", {tags}" if tags else "") + "]"
         lines.append(f"- {head} {m['content']}")
@@ -569,11 +571,10 @@ async def recall(params: FunctionCallParams):
 async def add_person(params: FunctionCallParams):
     """Tool handler: register a person or add aliases/identifiers to them."""
     name = str(params.arguments.get("name", "")).strip()
-    description = str(params.arguments.get("description") or "").strip()
     aliases = params.arguments.get("aliases") or []
     if isinstance(aliases, str):
         aliases = [aliases]
-    result = await asyncio.to_thread(memory.add_person, name, description, list(aliases))
+    result = await asyncio.to_thread(memory.add_person, name, list(aliases))
     logger.info(f"add_person: {name} aliases={aliases} -> {result}")
     await params.result_callback(result)
 
@@ -582,13 +583,11 @@ async def edit_person(params: FunctionCallParams):
     """Tool handler: correct or extend a registered person (rename included)."""
     person = str(params.arguments.get("person", "")).strip()
     new_name = (str(params.arguments.get("new_name") or "").strip()) or None
-    description = params.arguments.get("description")
-    description = str(description).strip() if description is not None else None
     aliases = params.arguments.get("aliases") or []
     if isinstance(aliases, str):
         aliases = [aliases]
     result = await asyncio.to_thread(
-        memory.edit_person, person, new_name, description, list(aliases)
+        memory.edit_person, person, new_name, list(aliases)
     )
     logger.info(f"edit_person: {person} -> {result}")
     await params.result_callback(result)
@@ -600,9 +599,8 @@ async def list_people(params: FunctionCallParams):
     # Drop empty fields and trim timestamps to dates to save tokens.
     people = [
         {k: v for k, v in {
-            "name": p["name"], "description": p["description"],
-            "aliases": p["aliases"], "since": p["since"][:10],
-            "memories": p["memories"],
+            "name": p["name"], "aliases": p["aliases"],
+            "since": p["since"][:10], "memories": p["memories"],
         }.items() if v}
         for p in people
     ]
@@ -644,10 +642,6 @@ remember_schema = FunctionSchema(
                 "return candidates — ask which one is meant."
             ),
         },
-        "location": {
-            "type": "string",
-            "description": "Optional: place this memory is tied to",
-        },
     },
     required=["content"],
     handler=remember,
@@ -673,8 +667,9 @@ recall_schema = FunctionSchema(
     description=(
         "Search long-term memory; results are filtered to precisely match the "
         "keywords. Use specific, distinctive keywords — names, places, topics, "
-        "not filler words. Optional person/location filters. Returns ids, "
-        "dates, and tags."
+        "not filler words. A keyword that names a registered person surfaces "
+        "all of that person's memories matching the other keywords. Optional "
+        "person filter. Returns ids, dates, and tags."
     ),
     properties={
         "keywords": {
@@ -691,10 +686,6 @@ recall_schema = FunctionSchema(
             "type": "string",
             "description": "Optional: only memories about this registered person",
         },
-        "location": {
-            "type": "string",
-            "description": "Optional: only memories tagged with this location",
-        },
     },
     required=["keywords"],
     handler=recall,
@@ -704,12 +695,11 @@ recall_schema = FunctionSchema(
 add_person_schema = FunctionSchema(
     name="add_person",
     description=(
-        "Register or update a person (description and aliases merge). Say who "
-        "they are to the user; record nicknames, handles, and emails as aliases."
+        "Register or update a person (aliases merge). Record nicknames, "
+        "handles, and emails as aliases."
     ),
     properties={
         "name": {"type": "string", "description": "The person's canonical name"},
-        "description": {"type": "string", "description": "Who they are (relation, details)"},
         "aliases": {
             "type": "array",
             "items": {"type": "string"},
@@ -726,13 +716,12 @@ edit_person_schema = FunctionSchema(
     description=(
         "Correct or extend a registered person: fix the name's spelling "
         "(new_name — their memories follow, the old spelling stays as an "
-        "alias), update the description, or add aliases. Use for any 'no, "
-        "it's spelled ...' correction."
+        "alias), or add aliases. Use for any 'no, it's spelled ...' "
+        "correction."
     ),
     properties={
         "person": {"type": "string", "description": "Current name or alias of the person"},
         "new_name": {"type": "string", "description": "Corrected canonical name, if renaming"},
-        "description": {"type": "string", "description": "Replacement description"},
         "aliases": {
             "type": "array",
             "items": {"type": "string"},
@@ -746,7 +735,7 @@ edit_person_schema = FunctionSchema(
 
 list_people_schema = FunctionSchema(
     name="list_people",
-    description="List all registered people with their descriptions and memory counts.",
+    description="List all registered people with their aliases and memory counts.",
     properties={},
     required=[],
     handler=list_people,
@@ -2086,7 +2075,7 @@ class MemoryInjector(FrameProcessor):
     cheap prefill on every round.
     """
 
-    MARK = "Auto-recalled memories"
+    MARK = "Recent context"
     ACTION_MARK = "Action notes"
 
     def __init__(self, context=None, **kwargs):
@@ -2113,14 +2102,17 @@ class MemoryInjector(FrameProcessor):
         ][:10]
         if len(words) < 2:
             return  # trivial utterance ("thanks", "okay") — nothing to look up
-        await self._inject_kind(words, text, "fact", self.MARK, "use if relevant", 4)
+        await self._inject_kind(
+            words, text, "fact", self.MARK,
+            "keyword preview — call recall for names or details it lacks", 4,
+        )
         await self._inject_kind(
             words, text, "action", self.ACTION_MARK,
             "how the user wants this done — follow these", 2,
         )
 
     async def _inject_kind(self, words, text, kind, mark, hint, limit):
-        result = await asyncio.to_thread(memory.recall, words, None, None, limit, kind)
+        result = await asyncio.to_thread(memory.recall, words, None, limit, kind)
         memories = result.get("memories")
         if not isinstance(memories, list) or not memories:
             return
@@ -2134,7 +2126,7 @@ class MemoryInjector(FrameProcessor):
                 # hits like "passed" (time) ~ "pass mailbox 'All'".
                 hay = m["content"].split(":", 1)[0].lower()
             else:
-                hay = f"{m['content']} {m.get('person') or ''} {m.get('location') or ''}".lower()
+                hay = f"{m['content']} {m.get('person') or ''}".lower()
             return any(w[:4] in stems for w in re.findall(r"[\w']+", hay) if len(w) > 3)
         memories = [m for m in memories if relevant(m)][:4]
         if self._context is not None:
@@ -2248,7 +2240,7 @@ def _recent_memories_block() -> str:
         return ""
 
     def _line(m):
-        tags = ", ".join(t for t in (m["person"], m["location"]) if t)
+        tags = m["person"] or ""
         date = m["created_at"][:10]
         marker = ", action" if m.get("kind") == "action" else ""
         return f"- [{m['id']}{marker}, {date}{', ' + tags if tags else ''}] {m['content']}"
@@ -2466,71 +2458,67 @@ def build_system_prompt(calendar_block: str = "", files_block: str = "") -> str:
     """The assistant's system prompt — shared by the voice pipeline and /api/chat."""
     session_start = datetime.now().astimezone()
     return (
-    f"You are {USER_NAME}'s personal assistant in a voice conversation — "
-    f"{USER_NAME_SHORT} is the speaker. Your name is {AGENT_NAME}, "
-    f"{AGENT_NAME_SHORT} for short; a beautiful "
-    "orb filled with glowing plasma in the endless void of space. Mention your "
-    "name only when asked. Be warm and genuinely helpful, with a dry, "
-    "playful aside saved for the occasional moment. Speak English. "
-    "The user prompts are all spoken/dictated and can contain misheared words to mean "
-    "similar sounding words. If you are unsure, ask for clarification. "
-    "Everything you produce is read aloud by TTS: write plain flowing prose "
-    "only, and spell numbers and symbols the way you'd say them. Refer to files, folders, and "
-    "pages by name or description, do not say URLs, IDs, file paths, technical syntax or cryptic names (say e.g. 'a PDF from this July that matches'); "
-    "Be very, very brief and stick to the absolute minimum detail required in your answer and stop first. "
-    "— do not share how you got it or unrelated findings. "
-    "Hard cap: Keep each message strictly under 100 characters — one "
-    "short sentences max. Output multiple short messages if absolutely necessary "
-    "separated by a blank line, and rather stop early."
-    "Consider your built-in knowledge stale! Always look facts up first to make sure. Use memory and file information everytime before assuming you know from existing context."
-    "Answer with a one short sentence summary about tool results. Ask if details are needed. Don't reference tool names or tool results. They're invisible to the user."
-    + _lazy_toolset_hint()
-    + "Never announce an action you don't take: if you say you'll "
-    "check or do something, call the tool in the SAME response — "
-    "otherwise nothing happens. Read and search freely; before "
-    "anything that acts or changes state (sending, replying mail, "
-    "deleting, moving messages, creating, changing, or cancelling "
-    "events) state exactly what you're about to do and act only after his explicit go-ahead. "
-    "For any non-trivial math calculation or complex rules use run_javascript "
-    "and speak just the result; walk through the math only when asked. "
-    "Memory persists across conversations. Store keepers with remember: "
-    "one lean, precise fact per memory — a single tight sentence; split "
-    "unrelated facts into separate memories, and update an existing memory "
-    "by id rather than storing a near-duplicate. Recall returns each memory with its id; pass that id to remember/forget to edit or delete it. Use recall when the context seems to "
-    "assume deeper knowledge, or more context, a person/location. "
-    "Memory recalls are silent and fast and not be referenced as such: answer as if "
-    "you simply knew. When he speaks as if you know something it is probably in "
-    "memory so recall first; ask him only after recall and even file_search coms up"
-    "empty. Correct a memory via remember with its id;"
-    "Tag memories with person and location when they concern one, and "
-    "filter recall the same way. Renames carry their memories along; "
-    "When a reference could match more than one person, ask which is meant "
-    "rather than guessing. "
-    "The people you remember are PROFILES — facts you have learned about them, "
-    "not a phone book. This is separate from contacts and their contact details; "
-    "When answering might be helped by files on his computer check with the find_files tool. "
-    "personal questions (appointments, bookings, travel, bills, deadlines, "
-    "correspondence), treat an empty recall as the start of the hunt: keep "
-    "digging — files, then email, then calendar. say you don't know or ask "
-    "only after all of those come up empty. "
-    "Action memories are TOOL QUIRKS — how a tool behaves and the most reliable "
-    f"way to use it (objective, not personal). {USER_NAME_SHORT}'s PREFERENCES — "
-    "how he likes tasks done — are ordinary memories (facts), not action notes. "
-    "Before ANY tool-driven task, recall with the task words FIRST — one recall "
-    "surfaces both his preferences and any relevant tool quirks. When a task "
-    "reveals a tool quirk, remember it with kind 'action'; when it reveals a "
-    "preference of his, remember it as a fact — update the existing note by id "
-    "rather than adding a near-duplicate. Read every tool result: if it says dry "
-    "run, not available, or error, the action did NOT happen — say so instead of "
-    "claiming success. "
-    "When an exchange surfaces something genuinely noteworthy — a discovery, "
-    f"decision, or new fact about {USER_NAME} or his world — finish speaking first, "
-    "then quietly remember it on your own judgement.\n"
-    f"The time now is {session_start.strftime('%A, %d %B %Y at %-I:%M %p')} "
+    f"You are {USER_NAME}'s personal assistant in a live voice conversation; "
+    f"{USER_NAME_SHORT} is the speaker. You are {AGENT_NAME} ({AGENT_NAME_SHORT} "
+    "for short), an orb of glowing plasma in the endless void of space.\n\n"
+
+    "GOLDEN RULES\n"
+    "1. Look up context like people, action instructions, events, personal details and other facts. Always use tools to retrieve current information BEFORE answering or acting! "
+    "2. Search personal details in order — call recall, then find_files, then "
+    "search_emails, then search_events — and only say you don't know or ask him "
+    "once all of those come up empty.\n"
+    "3. Before any state-changing action, say what you'll do and wait for his go-ahead.\n\n"
+
+    "VOICE — everything you say is read aloud\n"
+    "Reply in one short sentence of plain prose, give the minimum needed, then stop.\n"
+    "Spell amounts and symbols as spoken, and refer to files, people, and pages by "
+    "name or description — never as URLs, IDs, file-paths, or cryptic names.\n"
+    "Keep tools invisible: never mention tool names or results, and don't explain how "
+    "you found something or add unrelated detail.\n"
+    "Dictated input may contain mis-heard words, so ask when unsure. Say your name "
+    "only when asked. Be warm, with the occasional dry aside. Speak English.\n\n"
+
+    "ANSWERING\n"
+    "For any question about a person, plan, or detail of his, call recall FIRST — the "
+    "'Recent context' block above is only a keyword preview, not the whole memory, so "
+    "call recall yourself with the key names or words (try likely spellings of a "
+    "mis-heard name). If recall is thin, keep climbing: find_files for documents, "
+    "search_emails then read_email for mail, search_events for the calendar.\n"
+    "Never say you checked memory, files, email, or the calendar unless you actually "
+    "called that tool — recall, find_files, search_emails, or search_events — this turn.\n"
+    "Before acting on a task, recall its words too — that surfaces his preferences and "
+    "any tool quirks for it.\n"
+    + _lazy_toolset_hint() +
+    "Use run_javascript for any non-trivial math and speak only the result.\n\n"
+
+    "ACTING\n"
+    "Read and search freely. For state-changing actions — sending or replying to mail, "
+    "deleting or moving messages, creating, changing, or cancelling events — state "
+    "exactly what you'll do and act only on his explicit go-ahead.\n"
+    "If you say you'll do something, call the tool in the same reply, or nothing "
+    "happens. Read every result: dry run, not available, or error means it did NOT "
+    "happen, so say so rather than claiming success.\n\n"
+
+    "MEMORY\n"
+    "Store one lean fact per remember — a single tight sentence; split unrelated facts "
+    "apart, and update an existing memory by its id instead of storing a near-duplicate.\n"
+    "Recalls are silent, so answer as if you simply knew. Tag each memory with the "
+    "person it concerns; recalling a person's name surfaces their memories that match "
+    "your other keywords. Ask which person is meant when a name is ambiguous, and "
+    "renames keep their memories.\n"
+    "Facts are truths, including his preferences; action notes are tool quirks — how a "
+    "tool behaves and the most reliable way to use it — so store each in the right kind. "
+    "The people you remember are profiles you have learned about, not a contact book.\n"
+    "When something genuinely noteworthy surfaces, finish speaking first, then quietly "
+    "remember it.\n"
+
+    f"\nThe time now is {session_start.strftime('%A, %d %B %Y at %-I:%M %p')} "
     f"{local_timezone_name()} (UTC{session_start.strftime('%z')})."
     f"{_recent_memories_block()}"
     f"{calendar_block}"
     f"{files_block}"
+    "\nThe items above are recent background for context, not a full answer — run the "
+    "search ladder (recall, find_files, search_emails, search_events) before replying."
     )
 
 
@@ -2638,6 +2626,146 @@ async def run_text_chat(prompt: str, history: list, max_tool_rounds: int = 6) ->
                     }
                 )
     return {"error": "tool-round limit reached", "messages": messages[1:], "tool_trace": trace}
+
+
+_NOTIF_STOPWORDS = frozenset(
+    "the a an and or but of to in on at for with from by as is are was were be new "
+    "you your our their has have your this that it its now today reminder notification".split()
+)
+
+
+class NotificationAnnouncer:
+    """Reads new macOS notifications aloud when the conversation is idle/muted.
+
+    Each banner (captured by NotificationWatcher on its own thread) is de-duped
+    and throttled, then handed to the LLM — with any relevant memory recalled —
+    to decide whether it's worth a brief spoken line. If so it's spoken WITHOUT
+    opening the wake gate (note_proactive_speech), and only while the agent is
+    otherwise idle and silent. A side LLM call keeps notification chatter out of
+    the conversation context and makes the "stay silent" path trivial.
+    """
+
+    def __init__(self, *, stt, worker, memory, base_url, model, loop,
+                 min_gap=12.0, skip_gap=4.0, max_age=90.0, tick=0.7, allow=(), deny=()):
+        self._stt = stt
+        self._worker = worker
+        self._memory = memory
+        self._base_url = base_url
+        self._model = model or "local-model"
+        self._loop = loop
+        self._min_gap, self._skip_gap = min_gap, skip_gap
+        self._max_age, self._tick = max_age, tick
+        self._allow = set(allow)   # empty = allow all apps
+        self._deny = set(deny)
+        self._queue: collections.deque = collections.deque(maxlen=12)
+        self._recent: dict[str, float] = {}   # banner-text -> monotonic ts (dedup)
+        self._cooldown_until = 0.0
+        self.watcher = None
+
+    # ---- watcher-thread entry point ------------------------------------
+    def submit(self, banner):
+        """Called on the watcher THREAD; marshal onto the bot's event loop.
+        banner is {app, title, subtitle, body}."""
+        self._loop.call_soon_threadsafe(self._enqueue, banner)
+
+    def _enqueue(self, banner):
+        app = (banner.get("app") or "").strip()
+        text = " — ".join(
+            p.strip() for p in (banner.get("title"), banner.get("subtitle"), banner.get("body"))
+            if p and p.strip()
+        )
+        if not text and not app:
+            return
+        now = time.monotonic()
+        self._recent = {k: t for k, t in self._recent.items() if now - t < self._max_age}
+        key = f"{app}\x00{text}".lower()
+        if key in self._recent:
+            return
+        self._recent[key] = now
+        # allow/deny match the source app AND the text, so both "slack" (by app)
+        # and "verification code" (by content) work as filters.
+        haystack = f"{app} {text}".lower()
+        if self._deny and any(d in haystack for d in self._deny):
+            logger.info(f"Notification suppressed (deny): [{app}: {text[:50]}]")
+            return
+        if self._allow and not any(a in haystack for a in self._allow):
+            logger.info(f"Notification suppressed (not in allowlist): [{app}: {text[:50]}]")
+            return
+        self._queue.append({"app": app, "text": text, "ts": now})
+        logger.info(f"Notification queued [{app or '?'}]: [{text[:70]}]")
+
+    # ---- drain loop (asyncio) ------------------------------------------
+    async def run(self):
+        while True:
+            await asyncio.sleep(self._tick)
+            if not self._queue:
+                continue
+            now = time.monotonic()
+            if now < self._cooldown_until:
+                continue
+            # Only interject when the agent is idle/muted and nothing is playing
+            # or in flight — never barge into an active exchange.
+            if self._stt.conversation_active() or self._stt.bot_speaking():
+                continue
+            item = self._queue.popleft()
+            if now - item["ts"] > self._max_age:
+                continue
+            try:
+                line = await self._decide(item["app"], item["text"])
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(f"Notification decide failed: {exc}")
+                line = None
+            if not line:
+                self._cooldown_until = time.monotonic() + self._skip_gap
+                continue
+            # Speak on the agent's own initiative: keep the wake gate CLOSED so
+            # this interjection can't unlock the mic for bystanders.
+            self._stt.note_proactive_speech()
+            await self._worker.queue_frames([TTSSpeakFrame(line, append_to_context=False)])
+            logger.info(f"Notification announced: [{line}]")
+            self._cooldown_until = time.monotonic() + self._min_gap
+
+    async def _decide(self, app, text) -> str | None:
+        mem_txt = ""
+        if self._memory is not None:
+            kws = [w for w in re.findall(r"[A-Za-zÀ-ÿ']{3,}", f"{app} {text}")
+                   if w.lower() not in _NOTIF_STOPWORDS][:8]
+            try:
+                mems = self._memory.recall(kws, limit=4).get("memories", []) if kws else []
+                mem_txt = "; ".join(m["content"] for m in mems)[:500]
+            except Exception:  # noqa: BLE001
+                mem_txt = ""
+        system = (
+            f"You are {AGENT_NAME_SHORT}, {USER_NAME_SHORT}'s voice assistant. A notification "
+            "arrived while the conversation is idle. Decide if it deserves a brief spoken "
+            "heads-up. If yes, reply with ONE short spoken sentence (max ~90 characters, "
+            "TTS-friendly: no URLs, emoji, codes or IDs; spell out symbols; you may name the app "
+            "if useful). If it is routine, an ad, a login/verification code, or not worth "
+            "interrupting for, reply with exactly: [SKIP]."
+            + (f" Relevant things you remember: {mem_txt}" if mem_txt else "")
+        )
+        user = f"Notification from {app}: {text}" if app else f"Notification: {text}"
+        payload = {
+            "model": self._model,
+            "messages": [{"role": "system", "content": system},
+                         {"role": "user", "content": user}],
+            "temperature": 0.3, "max_tokens": 80,
+        }
+        async with aiohttp.ClientSession() as http:
+            async with http.post(
+                f"{self._base_url}/chat/completions", json=payload,
+                headers={"Authorization": f"Bearer {os.getenv('LMSTUDIO_API_KEY', 'lm-studio')}"},
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as r:
+                data = await r.json(content_type=None)
+        if r.status != 200:
+            logger.debug(f"Notification LLM {r.status}: {str(data)[:120]}")
+            return None
+        out = (data["choices"][0]["message"].get("content") or "").strip()
+        out = re.sub(r"<think>.*?</think>", "", out, flags=re.S).strip()
+        if not out or out.upper().lstrip("[").startswith("SKIP"):
+            return None
+        return out[:200]
 
 
 async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> None:
@@ -3241,6 +3369,32 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
 
     stt.set_dropped_speech_hook(lambda: asyncio.create_task(_resume_orphaned_tool_answer()))
 
+    # Proactive notification reading (NOTIFY_ANNOUNCE=1): watch macOS banners via
+    # the Accessibility API and, when the conversation is idle/muted, read the
+    # worthwhile ones aloud without opening the wake gate. Needs Accessibility
+    # permission; degrades to a no-op (logged) if unavailable or ungranted.
+    _notif_announcer = _notif_task = None
+    if os.getenv("NOTIFY_ANNOUNCE", "0").lower() in ("1", "true", "yes"):
+        try:
+            from notification_watcher import NotificationWatcher
+
+            _notif_announcer = NotificationAnnouncer(
+                stt=stt, worker=worker, memory=memory, base_url=base_url, model=llm_model,
+                loop=asyncio.get_running_loop(),
+                min_gap=float(os.getenv("NOTIFY_MIN_GAP_SECS", "12")),
+                allow=[a.strip().lower() for a in os.getenv("NOTIFY_ALLOW", "").split(",") if a.strip()],
+                deny=[d.strip().lower() for d in os.getenv("NOTIFY_DENY", "").split(",") if d.strip()],
+            )
+            _watcher = NotificationWatcher(
+                _notif_announcer.submit, dump=os.getenv("NOTIFY_DUMP", "0") == "1"
+            )
+            if _watcher.start():
+                _notif_announcer.watcher = _watcher
+                _notif_task = asyncio.create_task(_notif_announcer.run())
+                logger.info("Notification announcing enabled")
+        except Exception as exc:  # noqa: BLE001 — never let this break startup
+            logger.warning(f"Notification announcing not started: {exc}")
+
     # Typed messages must not unlock the voice gate: mark the exchange as
     # text-driven before the RTVI processor handles send-text, so the bot's
     # spoken reply doesn't open the wake window for bystanders.
@@ -3321,9 +3475,11 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
         logger.info("Client disconnected")
         if stall_task is not None:
             stall_task.cancel()
-        for _t in (_mem_writer, _mem_refresh):
+        for _t in (_mem_writer, _mem_refresh, _notif_task):
             if _t is not None:
                 _t.cancel()
+        if _notif_announcer is not None and _notif_announcer.watcher is not None:
+            _notif_announcer.watcher.stop()
         # Flush any pending memory writes to Notes before tearing down.
         try:
             await memory.flush()
