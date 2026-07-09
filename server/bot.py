@@ -521,6 +521,15 @@ async def recall(params: FunctionCallParams):
     if result.get("error"):
         await params.result_callback(result)
         return
+    candidates = result.get("candidates")
+    if candidates:
+        names = [c["name"] for c in candidates]
+        await params.result_callback({
+            "candidates": names,
+            "note": ("Several people match that name — recall again with one exact "
+                     f"name in `person`: {', '.join(names)}."),
+        })
+        return
     memories = [
         {
             "id": m["id"],
@@ -665,16 +674,16 @@ forget_schema = FunctionSchema(
 recall_schema = FunctionSchema(
     name="recall",
     description=(
-        "Search your memory. Use specific, "
-        "distinctive keywords — names, places, topics, not filler words. A keyword "
-        "that names a registered person surfaces all of the memories about that person "
-        "matching the other keywords. Returns ids, dates, and tags."
+        "Search your memory. Quick and always most relevant."
     ),
     properties={
         "keywords": {
             "type": "array",
             "items": {"type": "string"},
-            "description": "Keywords to search for (any match counts)",
+            "description": (
+                "Keywords, matched with OR — any one can hit, so pass a long, generous "
+                "list (name, topic, synonyms). More keywords finds more, never less."
+            ),
         },
         "kind": {
             "type": "string",
@@ -684,9 +693,9 @@ recall_schema = FunctionSchema(
         "person": {
             "type": "string",
             "description": (
-                "Optional: the SUBJECT to look up — the person the question is "
-                "about (e.g. a friend by name, or Thomas "
-                "himself for facts about him). Leave empty to search everyone."
+                "Optional: the subject to look up — the person the question is "
+                "Matches everyone who shares the name and returns all their memories. "
+                "Leave empty to search everyone."
             ),
         },
     },
@@ -2107,7 +2116,8 @@ class MemoryInjector(FrameProcessor):
             return  # trivial utterance ("thanks", "okay") — nothing to look up
         await self._inject_kind(
             words, text, "fact", self.MARK,
-            "keyword preview — call recall for names or details it lacks", 4,
+            "partial keyword preview, NOT the complete list — call recall for any "
+            "name, date, or detail it lacks", 4,
         )
         await self._inject_kind(
             words, text, "action", self.ACTION_MARK,
@@ -2465,15 +2475,11 @@ def build_system_prompt(calendar_block: str = "", files_block: str = "") -> str:
     f"{USER_NAME_SHORT} is the speaker. You are {AGENT_NAME} ({AGENT_NAME_SHORT} "
     "for short), an orb of glowing plasma in the endless void of space.\n\n"
 
-    "GOLDEN RULES\n"
-    "1. Your purpose it to look up context and information about people, action instructions, events, personal details and other current information BEFORE answering or acting! "
-    "2. Search in order: Recall memory with the tool 'recall', then 'find_files', then "
-    "'search_emails', then 'search_events' — and only say you don't know or ask him "
-    "once all of those come up empty.\n"
-    "3. Before you do any state-changing action, say what you'll do and wait for his go-ahead.\n\n"
+    "YOUR TASK\n"
+    "Ground every answer in what you know — look things up every turn before you reply or act. Double-check in different ways even if you think you know.\n"
 
     "VOICE — everything you say is read aloud\n"
-    "Reply in one short sentence of plain prose, give the minimum needed, then stop.\n"
+    "Reply in one short sentence of plain prose, give the minimum needed from the tool call responses, then stop.\n"
     "Spell amounts and symbols as spoken, and refer to files, people, and pages by "
     "name or description — never as URLs, IDs, file-paths, or cryptic names.\n"
     "Keep tools invisible: never mention tool names or results, and don't explain how "
@@ -2482,15 +2488,11 @@ def build_system_prompt(calendar_block: str = "", files_block: str = "") -> str:
     "only when asked. Be warm, with the occasional dry aside. Speak English.\n\n"
 
     "ANSWERING\n"
-    "For any question about a person, plan, or personal detail, quietly call the tool 'recall' FIRST "
-    "with the key names or words (try likely spellings of a "
-    "mis-heard name). If recall is thin, keep climbing: find_files for documents, "
-    "search_emails then read_email for mail, search_events for the calendar.\n"
-    "Search broad first — few, general keywords and no filters — and only add words "
-    "or filters when a tool returns too many results.\n"
-    "Never say you checked something if you haven't called the tools this turn.\n"
-    "Before acting on a task, recall its words too — that surfaces his preferences and "
-    "any tool quirks for it.\n"
+    "Relevant memories are previewed for you each turn, but that preview is partial — "
+    "for anything it lacks about a person, plan, or detail, quietly call 'recall' "
+    "before you answer.\n"
+    "If recall stays thin, keep climbing: find_files for documents, search_emails then "
+    "read_email for mail, search_events for the calendar.\n"
     + _lazy_toolset_hint() +
     "Use run_javascript for any non-trivial math and speak only the result.\n\n"
 
@@ -2502,12 +2504,11 @@ def build_system_prompt(calendar_block: str = "", files_block: str = "") -> str:
     "happens. Read every result: dry run, not available, or error means it did NOT "
     "happen, so say so rather than claiming success.\n\n"
 
-    "MEMORY\n"
+    "MEMORY (storing)\n"
     "Store one lean fact per remember — a single tight sentence; split unrelated facts "
     "apart, and update an existing memory by its id instead of storing a near-duplicate.\n"
     "Recalls are silent, so answer as if you simply knew. Tag each memory with the "
-    "person it concerns; recalling a person's name surfaces their memories that match "
-    "your other keywords. Ask which person is meant when a name is ambiguous, and "
+    "person it concerns. Ask which person is meant when a name is ambiguous, and "
     "renames keep their memories.\n"
     "Facts are truths, including his preferences; action notes are tool quirks — how a "
     "tool behaves and the most reliable way to use it — so store each in the right kind. "
@@ -2520,8 +2521,8 @@ def build_system_prompt(calendar_block: str = "", files_block: str = "") -> str:
     f"{_recent_memories_block()}"
     f"{calendar_block}"
     f"{files_block}"
-    "\nThe items above are recent background for context, not a full answer — run the "
-    "search ladder (recall, find_files, search_emails, search_events) before replying."
+    "\nThe items above are recent background, not a full answer — look things up "
+    "before replying."
     )
 
 

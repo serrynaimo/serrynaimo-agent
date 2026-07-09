@@ -454,44 +454,106 @@ end tell'''
 
     # ---- read API (sync, from RAM) -------------------------------------
 
+    def _people_matching(self, name: str) -> list:
+        """Every person on file matching `name` — exact name, else alias, else
+        substring. Broad by design: a first name pulls in everyone who shares it,
+        so recall can return all of their memories."""
+        n = name.strip().lower().lstrip("@")
+        if len(n) < 2:
+            return []
+        with self._lock:
+            exact = [p["name"] for p in self._people.values() if p["name"].lower() == n]
+            if exact:
+                return exact
+            alias = [p["name"] for p in self._people.values()
+                     if n in [a.lower().lstrip("@") for a in p.get("aliases", [])]]
+            if alias:
+                return alias
+            if len(n) < 3:
+                return []  # substring on a 2-char token would match too much
+            return [p["name"] for p in self._people.values() if n in p["name"].lower()]
+
     def recall(self, keywords, person=None, limit=8, kind=None) -> dict:
         kw = [str(k) for k in (keywords or [])]
-        # A keyword that names a registered profile scopes the search to that
-        # person: any of THEIR memories matching a secondary keyword surface —
-        # and all of them when no secondary keyword is given.
-        matched_people = set()
+        # Any keyword (or the `person` arg) that names people on file scopes the
+        # search to ALL of them — matched broadly on name/alias/substring, not a
+        # single exact hit — and EVERY memory of each matched person is returned.
+        # The remaining keywords independently pull in other significant memories.
+        # An explicit `person` arg is authoritative — it is how the caller answers
+        # a disambiguation. If it names exactly one person, lock the search to them
+        # and treat EVERY keyword as a ranking term: keywords must not re-expand to
+        # other people or re-trigger disambiguation (else recall(person="Alicia
+        # Tan", keywords=["Tan"]) hands back the Tan menu forever).
+        forced_person = None
+        matched_names = {}  # lower -> canonical, deduped across all name terms
+        if person:
+            pnames = self._people_matching(person)
+            if len(pnames) > 1:
+                return {"candidates": [{"name": n} for n in sorted(pnames)],
+                        "memories": []}
+            if len(pnames) == 1:
+                forced_person = pnames[0].lower()
+            else:
+                kw = kw + [person]  # matched nobody -> just another keyword
         profile_kw = set()
-        for k in kw:
-            r = self.resolve_person(k)
-            if "person" in r:
-                matched_people.add(r["person"].lower())
-                profile_kw.add(k)
+        if forced_person is None:
+            # No locked person: keywords may name people (possibly ambiguously).
+            for k in kw:
+                names = self._people_matching(k)
+                if names:
+                    profile_kw.add(k)
+                    for n in names:
+                        matched_names[n.lower()] = n
+            matched_people = set(matched_names)
+        else:
+            matched_people = {forced_person}
         # Non-profile keywords drive the generic match. A profile keyword only
-        # identifies the person — it must not match every memory via its person
-        # tag — so it is excluded from the generic scorer below.
+        # identifies people — it must not match every memory via its person tag
+        # — so it is excluded from the generic scorer below.
         secondary = [k for k in kw if k not in profile_kw]
         # Keep tokens of 3+ chars so short names (Tan, Ben, Ian) are searchable.
         sec_stems = {t[:4] for k in secondary
                      for t in re.findall(r"[\w']+", k.lower()) if len(t) > 2}
         with self._lock:
-            hits = []
+            person_hits, other_hits = [], []
+            kw_people = set()  # matched people with >=1 keyword-matching memory
             for rec in self._mem.values():
                 if kind and rec["kind"] != kind:
                     continue
-                if person and (rec.get("person") or "").lower() != person.lower():
-                    continue
+                rec_person = (rec.get("person") or "").lower()
                 hay = f"{rec['content']} {rec.get('person') or ''}".lower()
                 hay_stems = {w[:4] for w in re.findall(r"[\w']+", hay) if len(w) > 2}
                 score = len(sec_stems & hay_stems)
-                # Profile match: surface this person's memory if it also hits a
-                # secondary keyword (or unconditionally when there is none).
-                if matched_people and (rec.get("person") or "").lower() in matched_people:
-                    if not sec_stems or (sec_stems & hay_stems):
-                        score = max(score, 1) + 10
-                if score:
-                    hits.append((score, rec))
-            hits.sort(key=lambda p: (p[0], p[1].get("created_at", "")), reverse=True)
-            out = [self._public(r) for _s, r in hits[:limit]]
+                if matched_people and rec_person in matched_people:
+                    # A matched person's memory ALWAYS surfaces; a keyword hit
+                    # only ranks it higher within that person's own set.
+                    person_hits.append((score, rec_person, rec))
+                    if score:
+                        kw_people.add(rec_person)
+                elif score:
+                    # A significant memory found purely by keyword.
+                    other_hits.append((score, rec))
+            # Disambiguate only AFTER keyword matching: when a name spans several
+            # people, let the keywords try to single one out. If exactly one has
+            # a keyword-matching memory, that person wins; otherwise — nobody, or
+            # several (e.g. both Christians are "visiting") — return the options
+            # so the caller recalls again with one exact name.
+            if forced_person is None and len(matched_people) > 1:
+                if len(kw_people) == 1:
+                    matched_people = kw_people
+                    person_hits = [t for t in person_hits if t[1] in kw_people]
+                else:
+                    names = sorted(matched_names.values())
+                    return {"candidates": [{"name": n} for n in names], "memories": []}
+            person_hits.sort(key=lambda p: (p[0], p[2].get("created_at", "")), reverse=True)
+            other_hits.sort(key=lambda p: (p[0], p[1].get("created_at", "")), reverse=True)
+            # Every matched person's memories first, then fill the rest of `limit`
+            # with the strongest keyword-only hits — but when locked to one person,
+            # return only their memories (no unrelated keyword padding).
+            recs = [r for _s, _p, r in person_hits]
+            if forced_person is None:
+                recs += [r for _s, r in other_hits[:max(0, limit - len(recs))]]
+            out = [self._public(r) for r in recs]
             if out:
                 now = _now()
                 self._db.executemany(
