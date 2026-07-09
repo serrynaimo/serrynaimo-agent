@@ -216,8 +216,9 @@
     z-index: 5;
   }
   #plus { right: 22px; }
+  #plus svg { display: block; transition: transform 0.28s cubic-bezier(0.22, 0.61, 0.36, 1); }
   #newSession { left: 22px; }
-  #newSession svg { display: block; }
+  #newSession svg { display: block; width: 16px; height: 16px; }
   /* Mute toggle above the plus button: the strike shows the CURRENT state —
      struck-out mic while the wake word is required, open mic while live. */
   #mute { right: 22px; bottom: 76px; }
@@ -240,7 +241,7 @@
   #notify::before {
     content: "";
     position: absolute;
-    top: 8px; right: 8px;
+    top: 4px; right: 4px;
     width: 6px; height: 6px;
     border-radius: 50%;
     background: rgba(150, 185, 255, 0.85);
@@ -267,7 +268,9 @@
   body:not(.ready) #notify {
     opacity: 0 !important; pointer-events: none;
   }
-  body.composing #plus { transform: rotate(45deg); }
+  /* Rotate the icon, not the button — otherwise the ::after hover label
+     (a child of the button) would rotate along with it. */
+  body.composing #plus svg { transform: rotate(45deg); }
 
   /* Hover labels: a button's brief function fans out in 3D on the side facing
      the orb — left of the right-hand buttons, right of the left-hand ones —
@@ -394,7 +397,13 @@
   <div class="zone"></div>
 </div>
 <div id="chat"><div class="spacer"></div></div>
-<button id="plus" data-label="Type a message" aria-label="Type a message">+</button>
+<button id="plus" data-label="Type a message" aria-label="Type a message">
+  <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor"
+       stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+    <line x1="12" y1="5" x2="12" y2="19"/>
+    <line x1="5" y1="12" x2="19" y2="12"/>
+  </svg>
+</button>
 <button id="newSession" data-label="New session" aria-label="New session">
   <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor"
        stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
