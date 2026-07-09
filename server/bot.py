@@ -168,7 +168,7 @@ SEED_ACTION_MEMORIES = [
     "manage_trash with action 'move_to_trash', and set dry_run to false to actually "
     "move it, since it only previews otherwise.",
     "Reading one specific email in full: search and inbox show only a preview, so "
-    "use read_email by sender and/or subject for the full body, and if it returns "
+    "use read_full_email_content by sender and/or subject for the full body, and if it returns "
     "continue_offset, call it again with that offset until done.",
 ]
 
@@ -1580,7 +1580,7 @@ read_file_schema = FunctionSchema(
 
 # Reading one specific email in full. The normal mail path can't: search/list
 # only expose a 150-500 char preview, and the MCP proxy caps every result at
-# 6000 chars. read_email fetches the WHOLE body server-side (search_emails with
+# 6000 chars. read_full_email_content fetches the WHOLE body server-side (search_emails with
 # max_content_length=0, which call_mcp_tool returns uncapped) and then pages it
 # out in READ_MAX_CHARS chunks, mirroring read_file's continue_from pagination.
 _email_read_cache: dict[str, dict] = {}   # locator key -> {body, subject, sender, date, mailbox, others}
@@ -1590,7 +1590,7 @@ def _email_locator_key(sender: str, subject: str, mailbox: str) -> str:
     return "\x00".join((sender.strip().lower(), subject.strip().lower(), mailbox.strip().lower()))
 
 
-async def read_email(params: FunctionCallParams):
+async def read_full_email_content(params: FunctionCallParams):
     """Tool handler: return the full text of one specific email, paged."""
     a = params.arguments
     sender = (a.get("sender") or "").strip()
@@ -1606,7 +1606,7 @@ async def read_email(params: FunctionCallParams):
         )
         return
     logger.info(
-        f"read_email: sender=[{sender}] subject=[{subject}] mailbox=[{mailbox}] offset={offset}"
+        f"read_full_email_content: sender=[{sender}] subject=[{subject}] mailbox=[{mailbox}] offset={offset}"
     )
 
     key = _email_locator_key(sender, subject, mailbox)
@@ -1674,7 +1674,7 @@ async def read_email(params: FunctionCallParams):
     if end < total:
         result["continue_offset"] = end
         result["note"] = (
-            f"{total - end} more characters remain — call read_email again with the "
+            f"{total - end} more characters remain — call read_full_email_content again with the "
             f"same sender/subject and offset={end} to read the next part."
         )
     if offset == 0 and cached.get("others"):
@@ -1685,14 +1685,14 @@ async def read_email(params: FunctionCallParams):
     await params.result_callback(result)
 
 
-read_email_schema = FunctionSchema(
-    name="read_email",
+read_full_email_content_schema = FunctionSchema(
+    name="read_full_email_content",
     description=(
         "Read the FULL text of one specific email. Use this whenever you need an "
         "email's complete body — searching or listing mail only shows a short "
         "preview that cuts long emails off. Identify the email by sender and/or "
         "subject (mailbox defaults to 'All'). Long emails are paged: if the "
-        "response has continue_offset, call read_email again with the same "
+        "response has continue_offset, call read_full_email_content again with the same "
         "sender/subject and offset=continue_offset to get the next part."
     ),
     properties={
@@ -1705,11 +1705,11 @@ read_email_schema = FunctionSchema(
         "offset": {
             "type": "integer",
             "description": "Character offset to resume from (the continue_offset from a "
-                           "previous read_email); omit to start at the beginning",
+                           "previous read_full_email_content); omit to start at the beginning",
         },
     },
     required=[],
-    handler=read_email,
+    handler=read_full_email_content,
 )
 
 
@@ -1882,7 +1882,7 @@ for _schema in (
     google_search_schema, x_web_search_schema, x_search_schema,
     escalate_to_grok_schema,
     open_in_safari_schema, find_files_schema, open_file_schema,
-    read_file_schema, read_email_schema, run_javascript_schema, get_weather_schema,
+    read_file_schema, read_full_email_content_schema, run_javascript_schema, get_weather_schema,
     remember_schema, recall_schema, forget_schema,
     add_person_schema, edit_person_schema, list_people_schema,
 ):
@@ -1896,7 +1896,7 @@ for _schema in (
     google_search_schema, x_web_search_schema, x_search_schema,
     escalate_to_grok_schema,
     get_current_time_schema, open_in_safari_schema, find_files_schema,
-    open_file_schema, read_file_schema, read_email_schema, run_javascript_schema,
+    open_file_schema, read_file_schema, read_full_email_content_schema, run_javascript_schema,
     get_weather_schema, get_financial_info_schema, remember_schema,
     recall_schema, forget_schema, add_person_schema, edit_person_schema,
     list_people_schema,
@@ -1910,7 +1910,7 @@ NATIVE_TOOL_SCHEMAS = (
     google_search_schema, x_web_search_schema, x_search_schema,
     escalate_to_grok_schema,
     get_current_time_schema, open_in_safari_schema, find_files_schema,
-    open_file_schema, read_file_schema, read_email_schema, run_javascript_schema,
+    open_file_schema, read_file_schema, read_full_email_content_schema, run_javascript_schema,
     get_weather_schema, get_financial_info_schema, remember_schema,
     recall_schema, forget_schema, add_person_schema, edit_person_schema,
     list_people_schema,
@@ -2492,7 +2492,8 @@ def build_system_prompt(calendar_block: str = "", files_block: str = "") -> str:
     "for anything it lacks about a person, plan, or detail, quietly call 'recall' "
     "before you answer.\n"
     "If recall stays thin, keep climbing: find_files for documents, search_emails then "
-    "read_email for mail, search_events for the calendar.\n"
+    "read_full_email_content for mail, search_events for the calendar.\n"
+    "Should you not find a person in memory, ask if you misheard the name or if it's someone you haven't heard about before, then add_person to store them with the context.\n"
     + _lazy_toolset_hint() +
     "Use run_javascript for any non-trivial math and speak only the result.\n\n"
 
@@ -3118,7 +3119,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
         find_files_schema,
         open_file_schema,
         read_file_schema,
-        read_email_schema,
+        read_full_email_content_schema,
         run_javascript_schema,
         get_weather_schema,
         get_financial_info_schema,
