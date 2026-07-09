@@ -146,7 +146,7 @@
   }
 
   /* Corner buttons: typed-message entry (right), new session (left) */
-  #plus, #newSession, #mute {
+  #plus, #newSession, #mute, #notify {
     position: fixed; bottom: 22px;
     width: 44px; height: 44px;
     border-radius: 50%;
@@ -168,7 +168,15 @@
   #mute .strike { display: none; }
   body.gated #mute .strike { display: block; }
   body.gated #mute { opacity: 0.6; }
+  /* Notifications toggle above the new-session button (bottom left): the strike
+     shows the OFF state — banners are neither read aloud nor shown as text. */
+  #notify { left: 22px; bottom: 76px; display: flex; align-items: center; justify-content: center; }
+  #notify svg { display: block; }
+  #notify .strike { display: none; }
+  body.notify-off #notify .strike { display: block; }
+  body.notify-off #notify { opacity: 0.6; }
   #plus:hover, #plus:focus-visible, #mute:hover, #mute:focus-visible,
+  #notify:hover, #notify:focus-visible,
   #newSession:hover, #newSession:focus-visible { opacity: 1; }
   /* Engaged (plus while the composer is open, mute while live): the input's
      hairline border, just under hover brightness. Hover still tops it. */
@@ -179,7 +187,8 @@
   body.composing #plus:hover, body:not(.gated) #mute:hover { opacity: 1; }
   /* Controls stay hidden until the assistant reports ready ("getting
      ready" fades out); then they ease in with their usual transition. */
-  body:not(.ready) #plus, body:not(.ready) #newSession, body:not(.ready) #mute {
+  body:not(.ready) #plus, body:not(.ready) #newSession, body:not(.ready) #mute,
+  body:not(.ready) #notify {
     opacity: 0 !important; pointer-events: none;
   }
   body.composing #plus { transform: rotate(45deg); }
@@ -263,6 +272,14 @@
 <div id="chat"><div class="spacer"></div></div>
 <button id="plus" title="Type a message" aria-label="Type a message">+</button>
 <button id="newSession" title="New session" aria-label="New session">↺</button>
+<button id="notify" title="Toggle notification reading" aria-label="Toggle notification reading">
+  <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor"
+       stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+    <path d="M6 9a6 6 0 0 1 12 0c0 5 2 6 2 6H4s2-1 2-6"/>
+    <path d="M10.5 20a1.8 1.8 0 0 0 3 0"/>
+    <line class="strike" x1="4" y1="4" x2="20" y2="20"/>
+  </svg>
+</button>
 <button id="mute" title="Toggle wake word requirement" aria-label="Toggle wake word requirement">
   <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor"
        stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -1355,6 +1372,20 @@ document.getElementById("mute").addEventListener("click", () => {
     clearTimeout(gateTimer);
     document.body.classList.add("gated");
   }
+});
+
+// Notifications toggle (bottom left, above new session). Default ON; when OFF,
+// the server neither reads macOS banners aloud nor renders them as text.
+let notificationsOn = true;
+document.getElementById("notify").addEventListener("click", () => {
+  notificationsOn = !notificationsOn;
+  document.body.classList.toggle("notify-off", !notificationsOn);
+  sendRtvi({
+    label: "rtvi-ai",
+    type: "client-message",
+    id: "nt-" + Math.random().toString(36).slice(2),
+    data: { t: notificationsOn ? "notifications-on" : "notifications-off" },
+  });
 });
 
 composer.addEventListener("submit", (ev) => {

@@ -124,6 +124,7 @@ from mcp_toolsets import (
     toolset_catalog,
 )
 from notes_memory_store import NotesMemoryStore
+from notification_store import NotificationStore
 from pipecat.turns.user_start import TranscriptionUserTurnStartStrategy
 from pipecat.turns.user_turn_strategies import UserTurnStrategies
 from services_local import (
@@ -148,6 +149,12 @@ memory = NotesMemoryStore(
     _SIDECAR_DB,
     call_mcp_tool,
 )
+
+# Durable cache of captured macOS notification banners. The Accessibility watcher
+# only sees live banners (no history API), so every one is logged here — read
+# aloud or not — letting the agent summarise and read back the ones it missed.
+_NOTIF_DB = os.path.join(os.path.dirname(__file__), "notifications.db")
+notif_store = NotificationStore(_NOTIF_DB)
 
 # Seeded action memories (kind='action') = TOOL QUIRKS / best-practice for the
 # tools: objective, reusable facts about how a tool behaves and how to use it
@@ -1713,6 +1720,77 @@ read_full_email_content_schema = FunctionSchema(
 )
 
 
+def _ago(seconds: float) -> str:
+    """Human 'when' for a notification timestamp, spoken-friendly."""
+    s = int(max(0, seconds))
+    if s < 45:
+        return "just now"
+    m = s // 60
+    if m < 1:
+        return "under a minute ago"
+    if m < 60:
+        return f"{m} minute{'s' if m != 1 else ''} ago"
+    h = m // 60
+    if h < 24:
+        return f"{h} hour{'s' if h != 1 else ''} ago"
+    d = h // 24
+    return f"{d} day{'s' if d != 1 else ''} ago"
+
+
+async def recent_notifications(params: FunctionCallParams):
+    """Tool handler: read back recently captured notifications, most recent first,
+    marking the returned ones as reported so they stop counting as missed."""
+    a = params.arguments
+    try:
+        limit = int(a.get("limit") or 10)
+    except (TypeError, ValueError):
+        limit = 10
+    unread_only = bool(a.get("unread_only") or False)
+    app = str(a.get("app") or "").strip() or None
+    items = await asyncio.to_thread(notif_store.recent, limit, unread_only, app, True)
+    logger.info(f"recent_notifications: limit={limit} unread_only={unread_only} "
+                f"app={app or '-'} -> {len(items)}")
+    if not items:
+        await params.result_callback(
+            {"notifications": [], "note": "no captured notifications match"}
+        )
+        return
+    now = time.time()
+    await params.result_callback({
+        "notifications": [
+            {
+                "app": it["app"] or "?",
+                "from": it["title"] or None,
+                "text": it["text"],
+                "when": _ago(now - it["ts"]),
+                "already_read": bool(it["read"]),
+            }
+            for it in items
+        ]
+    })
+
+
+recent_notifications_schema = FunctionSchema(
+    name="recent_notifications",
+    description=(
+        "Read back recently captured macOS notifications, most recent first. Use when "
+        "the user wants to hear the notifications he missed while you were quiet, or to "
+        "look up notifications from a particular app or person. Returned notifications "
+        "are marked as reported so they no longer count as missed."
+    ),
+    properties={
+        "limit": {"type": "integer",
+                  "description": "How many to return (default 10, max 50)"},
+        "unread_only": {"type": "boolean",
+                        "description": "Only the ones not yet read out (the missed ones)"},
+        "app": {"type": "string",
+                "description": "Filter to a source app, e.g. 'Slack', 'Messages', 'Mail'"},
+    },
+    required=[],
+    handler=recent_notifications,
+)
+
+
 find_files_schema = FunctionSchema(
     name="find_files",
     description=(
@@ -1882,7 +1960,8 @@ for _schema in (
     google_search_schema, x_web_search_schema, x_search_schema,
     escalate_to_grok_schema,
     open_in_safari_schema, find_files_schema, open_file_schema,
-    read_file_schema, read_full_email_content_schema, run_javascript_schema, get_weather_schema,
+    read_file_schema, read_full_email_content_schema, recent_notifications_schema,
+    run_javascript_schema, get_weather_schema,
     remember_schema, recall_schema, forget_schema,
     add_person_schema, edit_person_schema, list_people_schema,
 ):
@@ -1896,7 +1975,8 @@ for _schema in (
     google_search_schema, x_web_search_schema, x_search_schema,
     escalate_to_grok_schema,
     get_current_time_schema, open_in_safari_schema, find_files_schema,
-    open_file_schema, read_file_schema, read_full_email_content_schema, run_javascript_schema,
+    open_file_schema, read_file_schema, read_full_email_content_schema,
+    recent_notifications_schema, run_javascript_schema,
     get_weather_schema, get_financial_info_schema, remember_schema,
     recall_schema, forget_schema, add_person_schema, edit_person_schema,
     list_people_schema,
@@ -1910,7 +1990,8 @@ NATIVE_TOOL_SCHEMAS = (
     google_search_schema, x_web_search_schema, x_search_schema,
     escalate_to_grok_schema,
     get_current_time_schema, open_in_safari_schema, find_files_schema,
-    open_file_schema, read_file_schema, read_full_email_content_schema, run_javascript_schema,
+    open_file_schema, read_file_schema, read_full_email_content_schema,
+    recent_notifications_schema, run_javascript_schema,
     get_weather_schema, get_financial_info_schema, remember_schema,
     recall_schema, forget_schema, add_person_schema, edit_person_schema,
     list_people_schema,
@@ -2105,6 +2186,10 @@ class MemoryInjector(FrameProcessor):
                 await self._inject_for(frame.text)
             except Exception as exc:  # noqa: BLE001 — never block the utterance
                 logger.warning(f"Memory injection failed: {exc}")
+            try:
+                await self._inject_notifications()
+            except Exception as exc:  # noqa: BLE001 — never block the utterance
+                logger.warning(f"Notification injection failed: {exc}")
         await self.push_frame(frame, direction)
 
     async def _inject_for(self, text: str):
@@ -2192,6 +2277,58 @@ class MemoryInjector(FrameProcessor):
                 run_llm=False,
             )
         )
+
+    async def _inject_notifications(self):
+        """Prepend a one-line digest of notifications that arrived while the agent
+        was quiet, so it can offer to read the missed ones. Fires only when
+        something NEW arrived since the last turn (so it stays off most turns).
+
+        Delivered as a USER-role message (like the memory injections above) but
+        wrapped in a <system-note> tag so the model reads it as injected status,
+        not something the user spoke. Rationale (see Qwen3 chat-template research):
+        user role keeps LM Studio's prompt cache warm — a mid-conversation SYSTEM
+        message forces a full reprefill, and Qwen3's stock template outright rejects
+        one; a plain angle-tag is collision-safe (Qwen's real special tokens are the
+        <|…|> control tokens) and Qwen3 follows clearly-delimited context reliably.
+        Appended, never rewritten, so history stays cache-stable."""
+        digest = await asyncio.to_thread(notif_store.turn_digest)
+        if digest["new"] <= 0:
+            return  # nothing arrived since the last turn — no note (not every turn)
+        new, missed = digest["new"], digest["missed"]
+        breakdown = _format_notif_digest(digest["by_app"]) or f"{new} notification(s)"
+        total = f" ({missed} unread in total)" if missed > new else ""
+        note = (
+            f"<system-note>{new} new notification{'s' if new != 1 else ''} arrived "
+            f"while you were away — {breakdown}{total}. Injected status, NOT something "
+            f"{USER_NAME_SHORT} said. If it's worth interrupting for, tell him how many "
+            f"and from where; read them out with recent_notifications only if he "
+            f"wants.</system-note>"
+        )
+        logger.info(f"Notification injection: new={new} missed={missed}")
+        await self.push_frame(
+            LLMMessagesAppendFrame(
+                messages=[{"role": "user", "content": note}],
+                run_llm=False,
+            )
+        )
+
+
+def _format_notif_digest(by_app: list[dict]) -> str:
+    """'Slack: 2 (Alice, Bob); Messages: 1 (Mom)' from the aggregated digest."""
+    parts = []
+    for a in by_app:
+        senders = a.get("senders") or []
+        if senders:
+            who = ", ".join(
+                s["name"] + (f" ×{s['count']}" if s["count"] > 1 else "")
+                for s in senders[:4]
+            )
+            if len(senders) > 4:
+                who += ", …"
+            parts.append(f"{a['app']}: {a['count']} ({who})")
+        else:
+            parts.append(f"{a['app']}: {a['count']}")
+    return "; ".join(parts)
 
 
 class AudioToLLMAttach(FrameProcessor):
@@ -2651,7 +2788,8 @@ class NotificationAnnouncer:
     """
 
     def __init__(self, *, stt, worker, memory, base_url, model, loop,
-                 min_gap=12.0, skip_gap=4.0, max_age=90.0, tick=0.7, allow=(), deny=()):
+                 min_gap=12.0, skip_gap=4.0, max_age=90.0, tick=0.7, allow=(), deny=(),
+                 store=None):
         self._stt = stt
         self._worker = worker
         self._memory = memory
@@ -2666,6 +2804,8 @@ class NotificationAnnouncer:
         self._recent: dict[str, float] = {}   # banner-text -> monotonic ts (dedup)
         self._cooldown_until = 0.0
         self.watcher = None
+        self.enabled = True   # client toggle: when False, no banner is spoken/shown
+        self._store = store   # NotificationStore: cache every captured banner
 
     # ---- watcher-thread entry point ------------------------------------
     def submit(self, banner):
@@ -2696,13 +2836,25 @@ class NotificationAnnouncer:
         if self._allow and not any(a in haystack for a in self._allow):
             logger.info(f"Notification suppressed (not in allowlist): [{app}: {text[:50]}]")
             return
-        self._queue.append({"app": app, "text": text, "ts": now})
+        # Cache every captured banner (read aloud or not) so it can be summarised
+        # and read back later. The banner title is the sender/source within the app.
+        title = (banner.get("title") or "").strip()
+        db_id = None
+        if self._store is not None:
+            try:
+                db_id = self._store.record(app, title, text)
+            except Exception as exc:  # noqa: BLE001 — caching must never drop a banner
+                logger.debug(f"Notification cache write failed: {exc}")
+        self._queue.append({"app": app, "text": text, "ts": now, "db_id": db_id})
         logger.info(f"Notification queued [{app or '?'}]: [{text[:70]}]")
 
     # ---- drain loop (asyncio) ------------------------------------------
     async def run(self):
         while True:
             await asyncio.sleep(self._tick)
+            if not self.enabled:
+                self._queue.clear()   # drop banners captured while off — don't backlog
+                continue
             if not self._queue:
                 continue
             now = time.monotonic()
@@ -2727,6 +2879,11 @@ class NotificationAnnouncer:
             # this interjection can't unlock the mic for bystanders.
             self._stt.note_proactive_speech()
             await self._worker.queue_frames([TTSSpeakFrame(line, append_to_context=False)])
+            if self._store is not None and item.get("db_id"):
+                try:
+                    self._store.mark_read(item["db_id"])   # spoken aloud = read
+                except Exception:  # noqa: BLE001
+                    pass
             logger.info(f"Notification announced: [{line}]")
             self._cooldown_until = time.monotonic() + self._min_gap
 
@@ -3120,6 +3277,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
         open_file_schema,
         read_file_schema,
         read_full_email_content_schema,
+        recent_notifications_schema,
         run_javascript_schema,
         get_weather_schema,
         get_financial_info_schema,
@@ -3379,6 +3537,9 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
     # the Accessibility API and, when the conversation is idle/muted, read the
     # worthwhile ones aloud without opening the wake gate. Needs Accessibility
     # permission; degrades to a no-op (logged) if unavailable or ungranted.
+    # Reset the per-session notification counters (missed-this-session / new-since-
+    # last-turn) for this connection, independent of whether announcing is enabled.
+    notif_store.begin_session()
     _notif_announcer = _notif_task = None
     if os.getenv("NOTIFY_ANNOUNCE", "0").lower() in ("1", "true", "yes"):
         try:
@@ -3390,6 +3551,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
                 min_gap=float(os.getenv("NOTIFY_MIN_GAP_SECS", "12")),
                 allow=[a.strip().lower() for a in os.getenv("NOTIFY_ALLOW", "").split(",") if a.strip()],
                 deny=[d.strip().lower() for d in os.getenv("NOTIFY_DENY", "").split(",") if d.strip()],
+                store=notif_store,
             )
             _watcher = NotificationWatcher(
                 _notif_announcer.submit, dump=os.getenv("NOTIFY_DUMP", "0") == "1"
@@ -3432,6 +3594,13 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
             # exactly like a verified-speaker voice interruption.
             logger.info("Stop voice requested from client UI (Esc)")
             await voice_gate.stop_voice()
+        elif msg.type in ("notifications-on", "notifications-off"):
+            # Client notifications toggle (bottom-left, above new-session): when
+            # off, macOS banners are neither read aloud nor shown as text.
+            on = msg.type == "notifications-on"
+            if _notif_announcer is not None:
+                _notif_announcer.enabled = on
+            logger.info(f"Notifications {'on' if on else 'off'} (client UI)")
 
     @worker.rtvi.event_handler("on_client_ready")
     async def on_client_ready(rtvi):
