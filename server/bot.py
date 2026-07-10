@@ -4,7 +4,7 @@
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
-"""pipecat-quickstart - Fully local Pipecat Voice Agent (Apple Silicon / MLX)
+"""serry-voiceassistant - Fully local Pipecat Voice Agent (Apple Silicon / MLX)
 
 This bot uses a cascade pipeline: Speech-to-Text → LLM → Text-to-Speech,
 running entirely on-device:
@@ -1959,8 +1959,9 @@ def _with_current_time(handler):
     return wrapped
 
 
-# Apply to all native tools (MCP tools get the same stamp in their proxy —
-# see mcp_toolsets._proxy; get_current_time would be redundant).
+# Apply to native tools that lack their own timestamp (MCP tools get the same
+# stamp in their proxy — see mcp_toolsets._proxy). get_current_time and
+# get_financial_info are excluded.
 for _schema in (
     google_search_schema, x_web_search_schema, x_search_schema,
     escalate_to_grok_schema,
@@ -2859,7 +2860,7 @@ class NotificationAnnouncer:
     # ---- watcher-thread entry point ------------------------------------
     def submit(self, banner):
         """Called on the watcher THREAD; marshal onto the bot's event loop.
-        banner is {app, title, subtitle, body}."""
+        banner is {app, title, subtitle, body, uuid, time_sensitive}."""
         self._loop.call_soon_threadsafe(self._enqueue, banner)
 
     def _enqueue(self, banner):
@@ -3080,7 +3081,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
     except Exception as exc:  # noqa: BLE001
         logger.warning(f"Could not load people for ASR vocabulary: {exc}")
     # Keep the list tight — an overlong biasing list dilutes and skews ASR.
-    # Dedupe at the word level too: one "Gorissen" biases as well as six.
+    # Dedupe at the word level too: one copy of a word biases as well as six.
     seen_words: set[str] = set()
     deduped: list[str] = []
     for term in dict.fromkeys(vocabulary):
@@ -3355,7 +3356,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
         context.add_message(
             {
                 "role": "user",
-                "content": note + "\n\nGreet the user with a very short, casual hello. Sometimes mention a personal detail.",
+                "content": note + "\n\nGreet the user with a very short, casual hello. No introduction. Sometimes mention a personal detail.",
             }
         )
         await worker.queue_frames([LLMRunFrame()])

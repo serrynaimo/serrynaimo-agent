@@ -1,7 +1,11 @@
-# pipecat-quickstart
+# serry-voiceassistant
 
-A **fully local** Pipecat AI voice agent (cascade pipeline: STT → LLM → TTS),
-running entirely on-device on Apple Silicon via MLX.
+A **fully local** AI voice agent (cascade pipeline: STT → LLM → TTS), running
+entirely on-device on Apple Silicon via MLX.
+
+Built on [Pipecat](https://github.com/pipecat-ai/pipecat) — the open-source
+framework for real-time voice and multimodal AI agents — as its pipeline
+foundation.
 
 ## Configuration
 
@@ -57,7 +61,7 @@ Model choices and voice are overridable via `.env` (`QWEN3_ASR_MODEL`,
 ## Project Structure
 
 ```
-pipecat-quickstart/
+serry-voiceassistant/
 ├── server/              # Python bot server
 │   ├── bot.py           # Main bot implementation
 │   ├── services_local.py # Local Qwen3-ASR & Qwen3-TTS Pipecat services (mlx-audio)

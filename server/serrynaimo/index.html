@@ -125,7 +125,7 @@
     left: 50%; margin-left: calc(min(640px, 92vw) / -2);
     /* Very subtle Star Wars lean: the top recedes on z, pivoting from the
        bottom (where new messages appear) so they tilt into depth. */
-    transform: perspective(1700px) rotateX(5deg);
+    transform: perspective(1700px) rotateX(18deg);
     transform-origin: center bottom;
     top: 52vh; bottom: 5vh;
     width: min(640px, 92vw);
@@ -152,7 +152,7 @@
   body.gated.chatReady #chat {
     opacity: 0.3;
     /* Recede into the background and sink a few px — stays centered. */
-    transform: perspective(1700px) rotateX(6deg) translateZ(-55px) translateY(6px);
+    transform: perspective(1700px) rotateX(22deg) translateZ(-55px) translateY(10px);
   }
 
   .msg {

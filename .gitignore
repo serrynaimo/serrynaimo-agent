@@ -236,3 +236,5 @@ server/thomas_enroll.wav
 server/thomas_pipeline_enroll.wav
 # Cloned/designed TTS reference voices (recreate with design_voice.py)
 server/voice_*.wav
+# ...except Serry's own bundled voice, which ships with the project.
+!server/voice_serry.wav
