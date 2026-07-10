@@ -1738,21 +1738,19 @@ def _ago(seconds: float) -> str:
 
 
 async def recent_notifications(params: FunctionCallParams):
-    """Tool handler: read back recently captured notifications, most recent first,
-    marking the returned ones as reported so they stop counting as missed."""
+    """Tool handler: look up captured notifications by keyword and/or date range
+    (most recent first), marking the returned ones as reported."""
     a = params.arguments
-    try:
-        limit = int(a.get("limit") or 10)
-    except (TypeError, ValueError):
-        limit = 10
-    unread_only = bool(a.get("unread_only") or False)
-    app = str(a.get("app") or "").strip() or None
-    items = await asyncio.to_thread(notif_store.recent, limit, unread_only, app, True)
-    logger.info(f"recent_notifications: limit={limit} unread_only={unread_only} "
-                f"app={app or '-'} -> {len(items)}")
+    keywords = str(a.get("keywords") or "").strip()
+    date_from = str(a.get("date_from") or "").strip() or None
+    date_to = str(a.get("date_to") or "").strip() or None
+    items = await asyncio.to_thread(
+        notif_store.search, keywords, date_from, date_to, True)
+    logger.info(f"recent_notifications: keywords=[{keywords}] "
+                f"from={date_from or '-'} to={date_to or '-'} -> {len(items)}")
     if not items:
         await params.result_callback(
-            {"notifications": [], "note": "no captured notifications match"}
+            {"notifications": [], "note": "no matching notifications"}
         )
         return
     now = time.time()
@@ -1773,18 +1771,26 @@ async def recent_notifications(params: FunctionCallParams):
 recent_notifications_schema = FunctionSchema(
     name="recent_notifications",
     description=(
-        "Read back recently captured macOS notifications, most recent first. Use when "
-        "the user wants to hear the notifications he missed while you were quiet, or to "
-        "look up notifications from a particular app or person. Returned notifications "
-        "are marked as reported so they no longer count as missed."
+        "Look up recently captured macOS notifications, most recent first. All "
+        "arguments are optional: pass keywords to keep only notifications where any "
+        "keyword appears anywhere (app, sender, or text), and/or date_from/date_to to "
+        "bound the time range. With no date range given, only the LAST 6 HOURS are "
+        "returned. Returned notifications are marked as reported so they no longer "
+        "count as missed."
     ),
     properties={
-        "limit": {"type": "integer",
-                  "description": "How many to return (default 10, max 50)"},
-        "unread_only": {"type": "boolean",
-                        "description": "Only the ones not yet read out (the missed ones)"},
-        "app": {"type": "string",
-                "description": "Filter to a source app, e.g. 'Slack', 'Messages', 'Mail'"},
+        "keywords": {
+            "type": "string",
+            "description": "Optional space-separated words to look for anywhere in a notification",
+        },
+        "date_from": {
+            "type": "string",
+            "description": "Optional start of range, ISO date or date-time, e.g. '2026-07-10' or '2026-07-10T09:00'",
+        },
+        "date_to": {
+            "type": "string",
+            "description": "Optional end of range, ISO date or date-time (a bare date includes the whole day)",
+        },
     },
     required=[],
     handler=recent_notifications,

@@ -19,6 +19,26 @@ from __future__ import annotations
 import sqlite3
 import threading
 import time
+from datetime import datetime, timedelta
+
+
+def _parse_ts(value, end_of_day: bool = False):
+    """ISO date or date-time string (local time) → unix epoch, or None. A bare
+    date used as an upper bound is bumped to end-of-day so the whole day counts."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    s = str(value).strip()
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if end_of_day and len(s) == 10:   # date-only upper bound → include the whole day
+        dt = dt + timedelta(days=1)
+    return dt.timestamp()
 
 
 class NotificationStore:
@@ -115,23 +135,37 @@ class NotificationStore:
             by_app.append({"app": a["app"], "count": a["count"], "senders": senders})
         return {"new": len(rows), "missed": missed, "by_app": by_app}
 
-    def recent(self, limit: int = 10, unread_only: bool = False,
-               app: str | None = None, mark_reported: bool = True) -> list[dict]:
-        """Most-recent-first captured notifications. Marks the returned ones as
-        reported (read) by default so they stop counting as missed."""
-        limit = max(1, min(int(limit or 10), 50))
-        clauses, args = [], []
-        if unread_only:
-            clauses.append("read = 0")
-        if app and app.strip():
-            clauses.append("LOWER(app) LIKE ?")
-            args.append(f"%{app.strip().lower()}%")
-        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    def search(self, keywords: str = "", date_from=None, date_to=None,
+               mark_reported: bool = True, limit: int = 40) -> list[dict]:
+        """Most-recent-first captured notifications where ANY keyword matches ANY
+        attribute (source app, sender, or text), within a time window. With neither
+        date_from nor date_to given the window defaults to the LAST 6 HOURS; else it
+        is [date_from or the beginning, date_to or now]. Empty keywords → no keyword
+        filter. Marks the returned ones as reported so they stop counting as missed.
+        (Keyword-only by design — callers can't target individual fields.)"""
+        terms = str(keywords or "").lower().split()
+        limit = max(1, min(int(limit or 40), 100))
+        lo, hi = _parse_ts(date_from), _parse_ts(date_to, end_of_day=True)
+        if lo is None and hi is None:
+            hi = time.time()
+            lo = hi - 6 * 3600            # default: last 6 hours
+        else:
+            hi = time.time() if hi is None else hi
+            lo = 0.0 if lo is None else lo
         with self._lock:
             rows = self._db.execute(
-                f"SELECT id, ts, app, title, text, read FROM notifications {where} "
-                f"ORDER BY id DESC LIMIT ?", (*args, limit)).fetchall()
-        items = [dict(r) for r in rows]
+                "SELECT id, ts, app, title, text, read FROM notifications "
+                "WHERE ts >= ? AND ts <= ? ORDER BY id DESC LIMIT 300",
+                (lo, hi)).fetchall()
+        items = []
+        for r in rows:
+            if terms:
+                hay = f"{r['app']} {r['title']} {r['text']}".lower()
+                if not any(t in hay for t in terms):
+                    continue
+            items.append(dict(r))
+            if len(items) >= limit:
+                break
         if mark_reported and items:
             self.mark_read([r["id"] for r in items])
         return items
