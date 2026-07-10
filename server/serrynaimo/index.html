@@ -152,7 +152,7 @@
   body.gated.chatReady #chat {
     opacity: 0.3;
     /* Recede into the background and sink a few px — stays centered. */
-    transform: perspective(1700px) rotateX(22deg) translateZ(-55px) translateY(10px);
+    transform: perspective(1700px) rotateX(22deg) translateZ(-55px) translateY(-15px);
   }
 
   .msg {
@@ -226,6 +226,8 @@
   #mute .strike { display: none; }
   body.gated #mute .strike { display: block; }
   body.gated #mute { opacity: 0.6; }
+  /* Gated/muted: the button's job flips from "stop & mute" to inviting speech. */
+  body.gated #mute::after { content: "Speak now"; }
   /* Hover must out-specify the gated state above (body.gated #mute = higher
      specificity than #mute:hover), or hovering while muted wouldn't brighten. */
   body.gated #mute:hover, body.gated #mute:focus-visible { opacity: 1; }
