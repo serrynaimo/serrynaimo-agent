@@ -2439,6 +2439,12 @@ resize();
 initBG();
 resizeBG();
 requestAnimationFrame(frame);
+// requestAnimationFrame pauses when the display sleeps or the tab is occluded,
+// which freezes the filler timing even though the audio pipeline keeps running —
+// so acknowledgement clips never fire with the screen off. Drive the filler check
+// from an interval too, independent of rAF. (Background-tab throttling caps this
+// near 1s, which is still fine for the multi-second filler delay.)
+setInterval(() => fillerTick(performance.now()), 250);
 connect();
 /* ---- top-right clock: local time + day, refreshed each minute ---- */
 (function clock() {
