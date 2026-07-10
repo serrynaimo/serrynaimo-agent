@@ -2105,15 +2105,19 @@ MUTE_PHRASES = _parse_phrase_list(
 
 
 def _normalize_command(text: str, wake_words: list[str]) -> str:
-    """Lowercase, strip punctuation, drop a leading wake word and please/now."""
+    """Lowercase, strip punctuation, normalize 'ok'→'okay', drop a leading wake
+    word and a trailing please/now. 'thanks' is deliberately NOT stripped — it is
+    meaningful in dismissive mute phrases like 'okay thanks', which would otherwise
+    collapse to a bare 'okay' (fragile, and a false trigger on its own)."""
     t = re.sub(r"[^a-z0-9\s]", " ", str(text).lower())
     t = re.sub(r"\s+", " ", t).strip()
+    t = re.sub(r"\bok\b", "okay", t)   # ASR writes it "ok" or "okay"
     for w in (wake_words):
         if t.startswith(w + " "):
             t = t[len(w) + 1:].strip()
             break
     t = re.sub(r"^please\s+", "", t)
-    t = re.sub(r"\s+(please|now|thanks)$", "", t)
+    t = re.sub(r"\s+(please|now)$", "", t)
     return t
 
 

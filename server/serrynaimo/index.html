@@ -1417,6 +1417,7 @@ let mutePhrases = ["shut up", "mute yourself", "be quiet",
                    "im not talking to you", "i am not talking to you"];
 function normalizeCommand(text) {
   let t = (text || "").toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
+  t = t.replace(/\bok\b/g, "okay");   // ASR writes it "ok" or "okay"
   // Peel wake words off BOTH ends (repeatedly) so a command fires whether the
   // wake word precedes or follows it. A lone wake word is left untouched.
   let changed = true;
@@ -1428,7 +1429,7 @@ function normalizeCommand(text) {
       if (t.endsWith(" " + w)) { t = t.slice(0, -(w.length + 1)).trim(); changed = true; }
     }
   }
-  return t.replace(/^please\s+/, "").replace(/\s+(please|now|thanks|no|okay)$/, "");
+  return t.replace(/^please\s+/, "").replace(/\s+(please|now)$/, "");
 }
 function classifyCommand(text) {
   const t = normalizeCommand(text);
