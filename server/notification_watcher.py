@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import sys
 import threading
+import time
 
 try:
     from loguru import logger
@@ -51,14 +52,24 @@ _ATTR_CHILDREN = "AXChildren"
 _ATTR_VALUE = "AXValue"
 _ATTR_TITLE = "AXTitle"
 _ATTR_DESC = "AXDescription"
+# Sequoia+ renders notifications in SwiftUI and exposes the text as an
+# NSAttributedString here rather than in AXValue/AXDescription — read it too.
+_ATTR_ATTR_DESC = "AXAttributedDescription"
 _ATTR_IDENTIFIER = "AXIdentifier"
 _TEXT_ROLES = {"AXStaticText"}
-# Each banner is an AXGroup with this subrole; its AXDescription reads
-# "App Name, title, subtitle, body" and its static texts are tagged with
-# AXIdentifier "title" / "subtitle" / "body".
-_BANNER_SUBROLE = "AXNotificationCenterBanner"
+# Each notification is an AXGroup whose AXDescription reads "App, title, subtitle,
+# body" and whose static texts are tagged with AXIdentifier "title"/"subtitle"/
+# "body". Transient banners use subrole AXNotificationCenterBanner; alert-style and
+# TIME-SENSITIVE ones (e.g. Apple Reminders alarms) use AXNotificationCenterAlert
+# and carry an extra 'header' text ("TIME SENSITIVE") we ignore. Match both.
+_BANNER_SUBROLES = frozenset({"AXNotificationCenterBanner", "AXNotificationCenterAlert"})
+_ALERT_SUBROLE = "AXNotificationCenterAlert"
 _FIELD_IDS = ("title", "subtitle", "body")
-_BANNER_NOTIFS = ("AXWindowCreated",)  # each banner is a new NotificationCenter window
+# The first banner spawns a new window, but stacked / grouped / alert-style /
+# time-sensitive notifications are added into the existing notification scroll
+# area instead — firing element-creation and layout events, not a new window.
+# Observe all of them and re-sweep the whole NC app on each (dedup is upstream).
+_BANNER_NOTIFS = ("AXWindowCreated", "AXCreated", "AXLayoutChanged")
 _MAX_DEPTH = 16
 
 
@@ -79,15 +90,31 @@ def _copy(el, attr):
         return None
 
 
+def _text_val(el, attr):
+    """Copy a text attribute as a plain str, coercing an NSAttributedString (which
+    SwiftUI notifications use for AXAttributedDescription) via its .string()."""
+    v = _copy(el, attr)
+    if isinstance(v, str):
+        return v
+    getter = getattr(v, "string", None)   # NSAttributedString -> plain text
+    if callable(getter):
+        try:
+            s = getter()
+            return str(s) if s is not None else None
+        except Exception:  # noqa: BLE001
+            return None
+    return None
+
+
 def _collect_texts(el, out: list[str], depth: int = 0) -> None:
     """Depth-first gather of every static-text string under an element, in
     order, de-duplicated. (Fallback for banners without tagged fields.)"""
     if el is None or depth > _MAX_DEPTH:
         return
     if _copy(el, _ATTR_ROLE) in _TEXT_ROLES:
-        for attr in (_ATTR_VALUE, _ATTR_TITLE, _ATTR_DESC):
-            v = _copy(el, attr)
-            if isinstance(v, str) and v.strip():
+        for attr in (_ATTR_VALUE, _ATTR_TITLE, _ATTR_DESC, _ATTR_ATTR_DESC):
+            v = _text_val(el, attr)
+            if v and v.strip():
                 s = " ".join(v.split())
                 if s not in out:
                     out.append(s)
@@ -102,8 +129,8 @@ def _collect_fields(el, fields: dict, depth: int = 0) -> None:
         return
     if _copy(el, _ATTR_ROLE) in _TEXT_ROLES:
         ident = _copy(el, _ATTR_IDENTIFIER)
-        val = _copy(el, _ATTR_VALUE)
-        if ident in _FIELD_IDS and isinstance(val, str) and val.strip():
+        val = _text_val(el, _ATTR_VALUE) or _text_val(el, _ATTR_ATTR_DESC)
+        if ident in _FIELD_IDS and val and val.strip():
             fields.setdefault(ident, " ".join(val.split()))
     for child in (_copy(el, _ATTR_CHILDREN) or []):
         _collect_fields(child, fields, depth + 1)
@@ -115,16 +142,18 @@ def _extract_banners(el, out: list[dict], depth: int = 0) -> None:
     the banner group's AXDescription ("App, title, subtitle, body")."""
     if el is None or depth > _MAX_DEPTH:
         return
-    if _copy(el, _ATTR_SUBROLE) == _BANNER_SUBROLE:
+    subrole = _copy(el, _ATTR_SUBROLE)
+    if subrole in _BANNER_SUBROLES:
         fields: dict = {}
         _collect_fields(el, fields)
-        desc = _copy(el, _ATTR_DESC) or ""
+        desc = _text_val(el, _ATTR_DESC) or _text_val(el, _ATTR_ATTR_DESC) or ""
         app = desc.split(", ", 1)[0].strip() if desc else ""
         # If the app name coincides with the title, there was no app prefix.
         if app and app == fields.get("title"):
             app = ""
         banner = {"app": app, "title": fields.get("title", ""),
-                  "subtitle": fields.get("subtitle", ""), "body": fields.get("body", "")}
+                  "subtitle": fields.get("subtitle", ""), "body": fields.get("body", ""),
+                  "time_sensitive": subrole == _ALERT_SUBROLE}
         if not (banner["title"] or banner["body"]):
             # Untagged banner: fall back to positional static texts.
             texts: list[str] = []
@@ -163,6 +192,7 @@ class NotificationWatcher:
         self._app_el = None
         self._pid = None
         self._stop = False
+        self._last_scan = 0.0   # coalesce rapid create/layout event bursts
 
     def start(self) -> bool:
         if not _AVAILABLE:
@@ -193,10 +223,18 @@ class NotificationWatcher:
     def _handle(self, observer, element, notification, refcon):
         # Runs on the watcher thread's run loop. Keep it quick.
         try:
+            # Create/layout events can fire in bursts as a banner animates in;
+            # coalesce them. Each pass re-sweeps the whole NC app, so one scan
+            # captures every banner currently on screen.
+            now = time.monotonic()
+            if now - self._last_scan < 0.25:
+                return
+            self._last_scan = now
+            root = self._app_el or element
             if self._dump:
-                logger.info("AX banner subtree:\n" + "\n".join(_dump_tree(element)))
+                logger.info("AX NC subtree:\n" + "\n".join(_dump_tree(root)))
             banners: list[dict] = []
-            _extract_banners(element, banners)
+            _extract_banners(root, banners)
             for banner in banners:
                 self._cb(banner)
         except Exception as exc:  # noqa: BLE001

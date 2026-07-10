@@ -2854,7 +2854,8 @@ class NotificationAnnouncer:
                 db_id = self._store.record(app, title, text)
             except Exception as exc:  # noqa: BLE001 — caching must never drop a banner
                 logger.debug(f"Notification cache write failed: {exc}")
-        self._queue.append({"app": app, "text": text, "ts": now, "db_id": db_id})
+        self._queue.append({"app": app, "text": text, "ts": now, "db_id": db_id,
+                            "time_sensitive": bool(banner.get("time_sensitive"))})
         logger.info(f"Notification queued [{app or '?'}]: [{text[:70]}]")
 
     # ---- drain loop (asyncio) ------------------------------------------
@@ -2888,10 +2889,13 @@ class NotificationAnnouncer:
             if self._stt.conversation_active() or self._stt.bot_speaking():
                 continue
             item = self._queue.popleft()
-            if now - item["ts"] > self._max_age:
+            # Time-sensitive banners (Apple Reminders alarms etc.) are never aged
+            # out — read them whenever the conversation next goes idle.
+            if not item.get("time_sensitive") and now - item["ts"] > self._max_age:
                 continue
             try:
-                line = await self._decide(item["app"], item["text"])
+                line = await self._decide(item["app"], item["text"],
+                                          force=item.get("time_sensitive", False))
             except Exception as exc:  # noqa: BLE001
                 logger.debug(f"Notification decide failed: {exc}")
                 line = None
@@ -2910,7 +2914,11 @@ class NotificationAnnouncer:
             logger.info(f"Notification announced: [{line}]")
             self._cooldown_until = time.monotonic() + self._min_gap
 
-    async def _decide(self, app, text) -> str | None:
+    async def _decide(self, app, text, force=False) -> str | None:
+        # force=True (time-sensitive, e.g. a Reminders alarm): always produce a
+        # spoken line — never [SKIP], and fall back to a plain read if the LLM
+        # can't be reached, so the alarm is never silently swallowed.
+        fallback = (f"{app}: {text}" if app else text).strip()[:300] or None
         mem_txt = ""
         if self._memory is not None:
             kws = [w for w in re.findall(r"[A-Za-zÀ-ÿ']{3,}", f"{app} {text}")
@@ -2920,14 +2928,20 @@ class NotificationAnnouncer:
                 mem_txt = "; ".join(m["content"] for m in mems)[:500]
             except Exception:  # noqa: BLE001
                 mem_txt = ""
+        if force:
+            judge = ("This notification is TIME-SENSITIVE — you MUST read it aloud; never reply "
+                     "[SKIP].")
+        else:
+            judge = ("Decide whether it deserves a spoken heads-up. If it is routine, an ad, a "
+                     "login or verification code, or not worth interrupting for, reply with "
+                     "exactly: [SKIP].")
         system = (
             f"You are {AGENT_NAME_SHORT}, {USER_NAME_SHORT}'s voice assistant. A notification "
-            "arrived while the conversation is idle. Decide whether it deserves a spoken "
-            "heads-up. If it does and is just one sentance, read the message verbatim. Otherwise summarize."
-            "Optionally naming the app (source of the notification) or sender first. Only "
-            "adjust for text-to-speech: spell out symbols and drop any URLs or emoji; If it is routine, an ad, a login or verification code, or "
-            "not worth interrupting for, reply with exactly: [SKIP]. Use anything you you can recall from memory "
-            "to judge whether it's worth reading."
+            f"arrived while the conversation is idle. {judge} When you do read it, reply with AT "
+            "MOST ONE short sentence — no preamble, no extra detail; summarize if the message is "
+            "longer. Optionally name the app (source of the notification) or sender first. Adjust "
+            "for text-to-speech: spell out symbols and drop any URLs or emoji. Use anything you "
+            "can recall from memory to judge whether it's worth reading."
             + (f" Relevant things you remember: {mem_txt}" if mem_txt else "")
         )
         user = f"Notification from {app}: {text}" if app else f"Notification: {text}"
@@ -2937,20 +2951,24 @@ class NotificationAnnouncer:
                          {"role": "user", "content": user}],
             "temperature": 0.2, "max_tokens": 120,
         }
-        async with aiohttp.ClientSession() as http:
-            async with http.post(
-                f"{self._base_url}/chat/completions", json=payload,
-                headers={"Authorization": f"Bearer {os.getenv('LMSTUDIO_API_KEY', 'lm-studio')}"},
-                timeout=aiohttp.ClientTimeout(total=30),
-            ) as r:
-                data = await r.json(content_type=None)
-        if r.status != 200:
-            logger.debug(f"Notification LLM {r.status}: {str(data)[:120]}")
-            return None
-        out = (data["choices"][0]["message"].get("content") or "").strip()
-        out = re.sub(r"<think>.*?</think>", "", out, flags=re.S).strip()
+        try:
+            async with aiohttp.ClientSession() as http:
+                async with http.post(
+                    f"{self._base_url}/chat/completions", json=payload,
+                    headers={"Authorization": f"Bearer {os.getenv('LMSTUDIO_API_KEY', 'lm-studio')}"},
+                    timeout=aiohttp.ClientTimeout(total=30),
+                ) as r:
+                    data = await r.json(content_type=None)
+            if r.status != 200:
+                logger.debug(f"Notification LLM {r.status}: {str(data)[:120]}")
+                return fallback if force else None
+            out = (data["choices"][0]["message"].get("content") or "").strip()
+            out = re.sub(r"<think>.*?</think>", "", out, flags=re.S).strip()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"Notification LLM error: {exc}")
+            return fallback if force else None
         if not out or out.upper().lstrip("[").startswith("SKIP"):
-            return None
+            return fallback if force else None
         return out[:300]
 
 
