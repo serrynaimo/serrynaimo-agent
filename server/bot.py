@@ -2245,7 +2245,8 @@ class MemoryInjector(FrameProcessor):
                 for m in self._context.get_messages()
                 if isinstance(m, dict)
                 and (m.get("role") == "system"
-                     or str(m.get("content", "")).startswith(mark))
+                     or str(m.get("content", "")).startswith(mark)
+                     or "<system-note>" in str(m.get("content", "")))
             )
             memories = [m for m in memories if m["content"][:100] not in existing]
         if not memories:
@@ -2613,9 +2614,11 @@ def _lazy_toolset_hint() -> str:
     )
 
 
-def build_system_prompt(calendar_block: str = "", files_block: str = "") -> str:
-    """The assistant's system prompt — shared by the voice pipeline and /api/chat."""
-    session_start = datetime.now().astimezone()
+def build_system_prompt() -> str:
+    """The assistant's STATIC system prompt (persona + instructions) — shared by the
+    voice pipeline and /api/chat. Dynamic session context (time, memories, calendar,
+    files) rides in the first user turn via build_context_note(), so this prefix
+    stays constant and keeps LM Studio's prompt cache warm."""
     return (
     f"You are {USER_NAME}'s personal assistant in a live voice conversation; "
     f"{USER_NAME_SHORT} is the speaker. You are {AGENT_NAME} ({AGENT_NAME_SHORT} "
@@ -2662,14 +2665,25 @@ def build_system_prompt(calendar_block: str = "", files_block: str = "") -> str:
     "The people you remember are profiles you have learned about, not a contact book.\n"
     "When something genuinely noteworthy surfaces, finish speaking first, then quietly "
     "remember it.\n"
+    )
 
-    f"\nThe time now is {session_start.strftime('%A, %d %B %Y at %-I:%M %p')} "
-    f"{local_timezone_name()} (UTC{session_start.strftime('%z')})."
-    f"{_recent_memories_block()}"
-    f"{calendar_block}"
-    f"{files_block}"
-    "\nThe items above are recent background, not a full answer — look things up "
-    "before replying."
+
+def build_context_note(calendar_block: str = "", files_block: str = "") -> str:
+    """Dynamic session context — time, recent memories, calendar, recent files —
+    wrapped in a <system-note> for the FIRST user turn. Kept out of the system
+    prompt so the prompt prefix stays static (cache-stable), while the model still
+    reads it as injected background rather than something the user said."""
+    session_start = datetime.now().astimezone()
+    return (
+        "<system-note>"
+        f"\nThe time now is {session_start.strftime('%A, %d %B %Y at %-I:%M %p')} "
+        f"{local_timezone_name()} (UTC{session_start.strftime('%z')})."
+        f"{_recent_memories_block()}"
+        f"{calendar_block}"
+        f"{files_block}"
+        "\nThe items above are recent background, not a full answer — look things up "
+        "before replying."
+        "\n</system-note>"
     )
 
 
@@ -2728,9 +2742,13 @@ async def run_text_chat(prompt: str, history: list, max_tool_rounds: int = 6) ->
         _calendar_outlook_block(), _recent_files_block()
     )
     tools, handlers = await _api_toolset()
-    messages: list = [{"role": "system", "content": build_system_prompt(calendar_block, files_block)}]
+    messages: list = [{"role": "system", "content": build_system_prompt()}]
     messages += [m for m in history if isinstance(m, dict) and m.get("role") != "system"]
-    messages.append({"role": "user", "content": str(prompt)})
+    content = str(prompt)
+    if not any(isinstance(m, dict) and m.get("role") == "user" for m in messages):
+        # First user turn: prepend the session context as a <system-note>.
+        content = build_context_note(calendar_block, files_block) + "\n\n" + content
+    messages.append({"role": "user", "content": content})
     trace: list = []
 
     async with aiohttp.ClientSession() as http:
@@ -3211,9 +3229,10 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
     recent_files = {"block": ""}
 
     def _system_prompt() -> str:
-        """(Re)build the system prompt — called again on session resets so the
-        time, memories, calendar, and files blocks stay fresh."""
-        return build_system_prompt(calendar_outlook["block"], recent_files["block"])
+        """The static system prompt. Dynamic context (time, memories, calendar,
+        files) is refreshed separately into the first user turn (build_context_note)
+        on each greeting / session reset."""
+        return build_system_prompt()
 
     calendar_outlook["block"], recent_files["block"] = await asyncio.gather(
         _calendar_outlook_block(), _recent_files_block()
@@ -3296,13 +3315,14 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
         await _queue_greeting()
 
     async def _queue_greeting():
-        # A "user" role message: LM Studio's Qwen chat template doesn't
-        # understand OpenAI's "developer" role and errors with
-        # "No user query found in messages."
+        # A "user" role message carrying the session context as a <system-note>
+        # (Qwen's template doesn't understand the "developer" role and errors with
+        # "No user query found in messages", so the context rides in a user turn).
+        note = build_context_note(calendar_outlook["block"], recent_files["block"])
         context.add_message(
             {
                 "role": "user",
-                "content": "Greet the user with a short, casual hello — no introduction.",
+                "content": note + "\n\nGreet the user with a short, casual hello — no introduction.",
             }
         )
         await worker.queue_frames([LLMRunFrame()])
