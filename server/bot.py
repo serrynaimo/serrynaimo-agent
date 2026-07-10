@@ -2192,6 +2192,10 @@ class MemoryInjector(FrameProcessor):
         await super().process_frame(frame, direction)
         if isinstance(frame, TranscriptionFrame) and frame.text.strip():
             try:
+                await self._inject_time()
+            except Exception as exc:  # noqa: BLE001 — never block the utterance
+                logger.warning(f"Time injection failed: {exc}")
+            try:
                 await self._inject_for(frame.text)
             except Exception as exc:  # noqa: BLE001 — never block the utterance
                 logger.warning(f"Memory injection failed: {exc}")
@@ -2200,6 +2204,24 @@ class MemoryInjector(FrameProcessor):
             except Exception as exc:  # noqa: BLE001 — never block the utterance
                 logger.warning(f"Notification injection failed: {exc}")
         await self.push_frame(frame, direction)
+
+    async def _inject_time(self):
+        """Prepend the CURRENT time as a <system-note> on every user turn, so a live
+        voice conversation always has the live time — the session-start time in the
+        system prompt would otherwise go stale as minutes pass. Appended (never
+        rewritten), so the prompt cache stays warm."""
+        now = datetime.now().astimezone()
+        note = (
+            "<system-note>The time now is "
+            f"{now.strftime('%A, %d %B %Y at %-I:%M %p')} {local_timezone_name()} "
+            f"(UTC{now.strftime('%z')}).</system-note>"
+        )
+        await self.push_frame(
+            LLMMessagesAppendFrame(
+                messages=[{"role": "user", "content": note}],
+                run_llm=False,
+            )
+        )
 
     async def _inject_for(self, text: str):
         words = [
