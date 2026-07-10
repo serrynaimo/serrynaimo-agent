@@ -2095,7 +2095,7 @@ def _parse_phrase_list(env_name: str, default: list[str]) -> list[str]:
 
 
 NEW_SESSION_PHRASES = _parse_phrase_list(
-    "COMMAND_NEW_SESSION_PHRASES", ["start a new session", "start new session", "start new chat". "start a new chat"]
+    "COMMAND_NEW_SESSION_PHRASES", ["start a new session", "start new session", "start new chat", "start a new chat"]
 )
 MUTE_PHRASES = _parse_phrase_list(
     "COMMAND_MUTE_PHRASES",
