@@ -858,6 +858,28 @@ async function playSubmitSound() {
   src.start();
 }
 
+// Mute acknowledgement: two quick chimes of the submit sound, the second a touch
+// lower — clearly derived from it, but a descending "received, going quiet" cue.
+async function playMuteSound() {
+  const ctx = wsOutCtx || audioCtx;
+  if (!ctx || !submitData) return;
+  try {
+    if (!submitBuf) submitBuf = await ctx.decodeAudioData(submitData.slice(0));
+  } catch (e) { return; }
+  const g = ctx.createGain();
+  g.gain.value = 0.5;
+  g.connect(ctx.destination);
+  const t0 = ctx.currentTime;
+  // [delay seconds, playback rate] — a descending two-note "di-dum".
+  [[0, 0.74], [0.14, 0.58]].forEach(([delay, rate]) => {
+    const src = ctx.createBufferSource();
+    src.buffer = submitBuf;
+    src.playbackRate.value = rate;
+    src.connect(g);
+    src.start(t0 + delay);
+  });
+}
+
 function armFiller() {
   clearTimeout(deadTurnTimer); // a fresh turn must not inherit a stand-down
   filler.armed = true;
@@ -1437,6 +1459,9 @@ function triggerNewSession() {
   setTimeout(() => document.getElementById("newSession").click(), 1100);
 }
 function triggerQuiet() {
+  // Confirm the mute word was heard with a soft, pitched-down cue — every time,
+  // even if already muted, so a repeated mute word still acknowledges.
+  playMuteSound();
   // Speaking already interrupted any bot audio; just require the wake word again.
   if (!document.body.classList.contains("gated")) {
     document.getElementById("mute").click();

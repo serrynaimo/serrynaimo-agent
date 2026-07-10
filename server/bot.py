@@ -177,6 +177,7 @@ SEED_ACTION_MEMORIES = [
     "Reading one specific email in full: search and inbox show only a preview, so "
     "use read_full_email_content by sender and/or subject for the full body, and if it returns "
     "continue_offset, call it again with that offset until done.",
+    "When creating reminders they require the date in full, e.g. 'July 10, 2026 at 9:20 AM'"
 ]
 
 
@@ -1771,10 +1772,8 @@ async def recent_notifications(params: FunctionCallParams):
 recent_notifications_schema = FunctionSchema(
     name="recent_notifications",
     description=(
-        "Look up recently captured macOS notifications, most recent first. All "
-        "arguments are optional: pass keywords to keep only notifications where any "
-        "keyword appears anywhere (app, sender, or text), and/or date_from/date_to to "
-        "bound the time range. With no date range given, only the LAST 6 HOURS are "
+        "Look up recently captured macOS notifications, most recent first."
+        "With no date range given, only the LAST 6 HOURS are "
         "returned. Returned notifications are marked as reported so they no longer "
         "count as missed."
     ),
@@ -2101,7 +2100,7 @@ NEW_SESSION_PHRASES = _parse_phrase_list(
 MUTE_PHRASES = _parse_phrase_list(
     "COMMAND_MUTE_PHRASES",
     ["shut up", "mute yourself", "be quiet", "stop", "stop talking",
-     "i'm not talking to you", "i am not talking to you", "that's it", "got it", "okay thanks"],
+     "i'm not talking to you", "i am not talking to you", "that's it", "got it", "okay, thanks"],
 )
 
 
@@ -2634,8 +2633,8 @@ def build_system_prompt(calendar_block: str = "", files_block: str = "") -> str:
     "Relevant memories are previewed for you each turn, but that preview is partial — "
     "for anything it lacks about a person, plan, or detail, quietly call 'recall' "
     "before you answer.\n"
-    "If recall stays thin, keep climbing: find_files for documents, search_emails then "
-    "read_full_email_content for mail, search_events for the calendar.\n"
+    "If recall stays thin, keep climbing: recent_notifications, find_files for documents, search_emails then "
+    "search_events for the calendar.\n"
     "Should you not find a person in memory, ask if you misheard the name or if it's someone you haven't heard about before, then add_person to store them with the context.\n"
     + _lazy_toolset_hint() +
     "Use run_javascript for any non-trivial math and speak only the result.\n\n"
