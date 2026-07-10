@@ -2460,8 +2460,16 @@ connect();
       weekday: "long", day: "numeric", month: "long",
     });
   }
+  // Update once per minute, aligned to the minute boundary via the second/ms
+  // offset — a self-correcting setTimeout, so it never drifts and does no
+  // per-second work.
+  function scheduleNext() {
+    const now = new Date();
+    const ms = (60 - now.getSeconds()) * 1000 - now.getMilliseconds();
+    setTimeout(() => { tick(); scheduleNext(); }, ms);
+  }
   tick();
-  setInterval(tick, 15000);
+  scheduleNext();
 })();
 </script>
 </body>
