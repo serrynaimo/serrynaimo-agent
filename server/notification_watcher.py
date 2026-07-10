@@ -153,7 +153,11 @@ def _extract_banners(el, out: list[dict], depth: int = 0) -> None:
             app = ""
         banner = {"app": app, "title": fields.get("title", ""),
                   "subtitle": fields.get("subtitle", ""), "body": fields.get("body", ""),
-                  "time_sensitive": subrole == _ALERT_SUBROLE}
+                  "time_sensitive": subrole == _ALERT_SUBROLE,
+                  # Stable per-notification UUID — identical whether shown as a live
+                  # banner or re-listed when the user opens Notification Center, so
+                  # it dedupes the tray re-display.
+                  "uuid": str(_copy(el, _ATTR_IDENTIFIER) or "").strip()}
         if not (banner["title"] or banner["body"]):
             # Untagged banner: fall back to positional static texts.
             texts: list[str] = []

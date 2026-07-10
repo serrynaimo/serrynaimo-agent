@@ -60,10 +60,18 @@ class NotificationStore:
                        app   TEXT    NOT NULL DEFAULT '',
                        title TEXT    NOT NULL DEFAULT '',   -- banner title ≈ sender
                        text  TEXT    NOT NULL DEFAULT '',   -- full line, for reading out
-                       read  INTEGER NOT NULL DEFAULT 0     -- 1 = read aloud / reported
+                       read  INTEGER NOT NULL DEFAULT 0,    -- 1 = read aloud / reported
+                       uuid  TEXT    NOT NULL DEFAULT ''    -- stable per-notification id
                    )"""
             )
+            # Migrate older DBs that predate the uuid column.
+            try:
+                self._db.execute(
+                    "ALTER TABLE notifications ADD COLUMN uuid TEXT NOT NULL DEFAULT ''")
+            except sqlite3.OperationalError:
+                pass  # column already exists
             self._db.execute("CREATE INDEX IF NOT EXISTS idx_notif_ts ON notifications(ts)")
+            self._db.execute("CREATE INDEX IF NOT EXISTS idx_notif_uuid ON notifications(uuid)")
         # Trim the cache to the retention window on startup so it can't grow forever.
         self._prune(retention_days)
         # Per-session counters, reset by begin_session() on each client connection.
@@ -92,14 +100,29 @@ class NotificationStore:
         self._session_start = time.time()
         self._last_turn_id = self._max_id()
 
-    def record(self, app: str, title: str, text: str, ts: float | None = None) -> int:
+    def record(self, app: str, title: str, text: str, uuid: str = "",
+               ts: float | None = None) -> int:
         ts = time.time() if ts is None else ts
         with self._lock, self._db:
             cur = self._db.execute(
-                "INSERT INTO notifications (ts, app, title, text) VALUES (?, ?, ?, ?)",
-                (ts, (app or "").strip(), (title or "").strip(), (text or "").strip()),
+                "INSERT INTO notifications (ts, app, title, text, uuid) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (ts, (app or "").strip(), (title or "").strip(),
+                 (text or "").strip(), (uuid or "").strip()),
             )
         return int(cur.lastrowid)
+
+    def has_uuid(self, uuid: str) -> bool:
+        """True if a notification with this stable UUID is already recorded — used
+        to skip re-announcing the same notification (e.g. when it's re-listed as the
+        user opens Notification Center)."""
+        uuid = (uuid or "").strip()
+        if not uuid:
+            return False
+        with self._lock:
+            row = self._db.execute(
+                "SELECT 1 FROM notifications WHERE uuid = ? LIMIT 1", (uuid,)).fetchone()
+        return row is not None
 
     def mark_read(self, ids) -> None:
         ids = [ids] if isinstance(ids, int) else [int(i) for i in ids if i is not None]

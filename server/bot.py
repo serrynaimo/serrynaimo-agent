@@ -2870,6 +2870,17 @@ class NotificationAnnouncer:
         )
         if not text and not app:
             return
+        # Persistent dedup by the notification's stable UUID: if we've recorded it
+        # before (even in an earlier session), skip. This is what stops the whole
+        # history from re-announcing when the user opens Notification Center — the
+        # re-listed notifications carry the same UUIDs we already have.
+        uuid = str(banner.get("uuid") or "").strip()
+        if uuid and self._store is not None:
+            try:
+                if self._store.has_uuid(uuid):
+                    return
+            except Exception:  # noqa: BLE001
+                pass
         now = time.monotonic()
         self._recent = {k: t for k, t in self._recent.items() if now - t < self._max_age}
         key = f"{app}\x00{text}".lower()
@@ -2891,7 +2902,7 @@ class NotificationAnnouncer:
         db_id = None
         if self._store is not None:
             try:
-                db_id = self._store.record(app, title, text)
+                db_id = self._store.record(app, title, text, uuid=uuid)
             except Exception as exc:  # noqa: BLE001 — caching must never drop a banner
                 logger.debug(f"Notification cache write failed: {exc}")
         self._queue.append({"app": app, "text": text, "ts": now, "db_id": db_id,
