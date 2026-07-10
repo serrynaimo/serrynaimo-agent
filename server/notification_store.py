@@ -21,6 +21,12 @@ import threading
 import time
 from datetime import datetime, timedelta
 
+try:
+    from loguru import logger
+except ModuleNotFoundError:  # bare Python (e.g. standalone tests)
+    import logging
+    logger = logging.getLogger("notification_store")
+
 
 def _parse_ts(value, end_of_day: bool = False):
     """ISO date or date-time string (local time) → unix epoch, or None. A bare
@@ -42,7 +48,7 @@ def _parse_ts(value, end_of_day: bool = False):
 
 
 class NotificationStore:
-    def __init__(self, db_path: str):
+    def __init__(self, db_path: str, retention_days: int = 30):
         self._lock = threading.Lock()
         self._db = sqlite3.connect(db_path, check_same_thread=False)
         self._db.row_factory = sqlite3.Row
@@ -58,9 +64,22 @@ class NotificationStore:
                    )"""
             )
             self._db.execute("CREATE INDEX IF NOT EXISTS idx_notif_ts ON notifications(ts)")
+        # Trim the cache to the retention window on startup so it can't grow forever.
+        self._prune(retention_days)
         # Per-session counters, reset by begin_session() on each client connection.
         self._session_start = time.time()
         self._last_turn_id = self._max_id()
+
+    def _prune(self, max_age_days: int) -> None:
+        """Delete notifications older than max_age_days. Called once at startup."""
+        if not max_age_days or max_age_days <= 0:
+            return
+        cutoff = time.time() - max_age_days * 86400
+        with self._lock, self._db:
+            cur = self._db.execute("DELETE FROM notifications WHERE ts < ?", (cutoff,))
+        if cur.rowcount:
+            logger.info(
+                f"Notification cache: pruned {cur.rowcount} row(s) older than {max_age_days}d")
 
     def _max_id(self) -> int:
         with self._lock:
