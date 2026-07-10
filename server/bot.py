@@ -173,7 +173,7 @@ SEED_ACTION_MEMORIES = [
     "or offset, and broaden the filters when a search finds nothing.",
     "Deleting, trashing, or cleaning up emails: there is no delete tool, so use "
     "manage_trash with action 'move_to_trash', and set dry_run to false to actually "
-    "move it, since it only previews otherwise.",
+    "move it, since it only previews otherwise. Look up and specify the correct account to delete correctly. ‘All’ doesn’t work for deleting.",
     "Reading one specific email in full: search and inbox show only a preview, so "
     "use read_full_email_content by sender and/or subject for the full body, and if it returns "
     "continue_offset, call it again with that offset until done.",
@@ -3355,7 +3355,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
         context.add_message(
             {
                 "role": "user",
-                "content": note + "\n\nGreet the user with a very short, casual hello — no introduction. Sometimes mention a personal detail.",
+                "content": note + "\n\nGreet the user with a very short, casual hello. Sometimes mention a personal detail.",
             }
         )
         await worker.queue_frames([LLMRunFrame()])
