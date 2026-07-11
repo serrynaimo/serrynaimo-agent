@@ -95,7 +95,7 @@ So Serry answers only you, open the **calibration** page at **[http://localhost:
 
 ### 6. Open her in your browser
 
-Point a browser at **[http://localhost:7860/serrynaimo](http://localhost:7860/serrynaimo)** to meet her — the glowing orb and her controls. This is the address to open in Chrome's fullscreen mode on a dedicated monitor. (If your browser warns about the local certificate the first time, it's safe to continue past it.)
+Point a browser at **[http://localhost:7860/serrynaimo](http://localhost:7860/serrynaimo)** to meet her — the glowing orb and her controls. This is the address to open in Chrome's fullscreen mode on a dedicated monitor.
 
 ---
 
