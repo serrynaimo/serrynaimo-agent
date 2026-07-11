@@ -177,10 +177,11 @@ SEED_ACTION_MEMORIES = [
     "Email — reading, replying, archiving, trashing, or flagging a message: first "
     "search_email with one or two broad keywords (OR-matched across sender and "
     "subject), then use the short id it returns (like 'm3') with read_email, "
-    "draft_reply_email, archive_email, trash_email, or mark_email. Sending is two "
-    "steps: draft_new_email or draft_reply_email opens the draft on screen and "
-    "returns a draft id like 'd1'; only after the user confirms, send_email with "
-    "that draft id. No account name is ever needed, and 'done' means archive_email.",
+    "draft_email, save_attachment, archive_email, trash_email, or mark_email. "
+    "Sending is two steps: draft_email opens the draft on screen (pass "
+    "reply_to_email_id to reply, attachment_path to attach a file) and returns a "
+    "draft id like 'd1'; only after the user confirms, send_email with that draft "
+    "id. No account name is ever needed, and 'done' means archive_email.",
     "Finding older or missing emails: search_email is newest-first and capped at 40, "
     "so widen with fewer keywords, page with offset from the 'more' hint, and for a "
     "specific period pass date_from/date_to as YYYY-MM-DD — never years or dates as "
@@ -1652,26 +1653,26 @@ async def read_email(params: FunctionCallParams):
     await params.result_callback(result)
 
 
-async def draft_new_email(params: FunctionCallParams):
-    """Tool handler: open a new-email draft on screen (or edit one by draft id)."""
+async def draft_email(params: FunctionCallParams):
+    """Tool handler: open a draft on screen — new email, reply, or edit by draft id."""
     a = params.arguments
-    result = await mail.draft_new(
+    result = await mail.draft_email(
         to=str(a.get("to") or ""), subject=str(a.get("subject") or ""),
         body=str(a.get("body") or ""), cc=str(a.get("cc") or ""),
         bcc=str(a.get("bcc") or ""), from_id=str(a.get("from_id") or ""),
+        reply_to_email_id=str(a.get("reply_to_email_id") or ""),
+        reply_all=bool(a.get("reply_all")),
+        attachment_path=str(a.get("attachment_path") or ""),
         draft_id=str(a.get("draft_id") or ""),
     )
     await params.result_callback(result)
 
 
-async def draft_reply_email(params: FunctionCallParams):
-    """Tool handler: open a reply draft on screen (or edit one by draft id)."""
+async def save_attachment(params: FunctionCallParams):
+    """Tool handler: save an email's attachment(s) to ~/Downloads."""
     a = params.arguments
-    result = await mail.draft_reply(
-        str(a.get("id") or ""), body=str(a.get("body") or ""),
-        reply_all=bool(a.get("reply_all")),
-        draft_id=str(a.get("draft_id") or ""),
-    )
+    result = await mail.save_attachment(
+        str(a.get("id") or ""), name=str(a.get("name") or ""))
     await params.result_callback(result)
 
 
@@ -1745,7 +1746,9 @@ read_email_schema = FunctionSchema(
     description=(
         "Read the full text of one email, identified by the 'id' from a previous "
         "search_email (e.g. 'm3'). Long emails are paged: if the result has "
-        "continue_offset, call again with the same id and offset=continue_offset."
+        "continue_offset, call again with the same id and offset=continue_offset. "
+        "Any attachments are listed by name in 'attachments' — save one to disk "
+        "with save_attachment."
     ),
     properties={
         "id": {"type": "string", "description": "The email id from search_email, e.g. 'm3'"},
@@ -1756,59 +1759,66 @@ read_email_schema = FunctionSchema(
     handler=read_email,
 )
 
-draft_new_email_schema = FunctionSchema(
-    name="draft_new_email",
+draft_email_schema = FunctionSchema(
+    name="draft_email",
     description=(
-        "Open a NEW email as an on-screen draft in Mail for the user to review — "
-        "nothing is sent. Returns a draft id like 'd1'. Call this again with "
-        "that draft_id and the field(s) to update the draft; "
-        "Optionally pass from_id (an email id like 'm3') to send from the account "
-        "that received that email."
+        "Open an email as an on-screen draft in Mail for the user to review — "
+        "nothing is sent. Returns a draft id like 'd1'. Three modes: a NEW email "
+        "(pass to/subject/body), a REPLY (pass reply_to_email_id with an email id "
+        "like 'm3' — recipients, subject, and account are set automatically), or "
+        "an EDIT (pass an existing draft_id plus only the field(s) to change). "
     ),
     properties={
-        "to": {"type": "string", "description": "Recipient address(es), comma-separated"},
-        "subject": {"type": "string", "description": "Subject line"},
-        "body": {"type": "string", "description": "Plain-text body"},
+        "to": {"type": "string", "description": "Recipient address(es), comma-separated "
+                                                "(new emails only)"},
+        "subject": {"type": "string", "description": "Subject line (new emails only)"},
+        "body": {"type": "string", "description": "Plain-text body (or reply text)"},
         "cc": {"type": "string", "description": "Optional CC address(es), comma-separated"},
         "bcc": {"type": "string", "description": "Optional BCC address(es), comma-separated"},
         "from_id": {"type": "string",
                     "description": "Optional email id (e.g. 'm3') — send from the account "
-                                   "that received that email"},
+                                   "that received that email (new emails only)"},
+        "reply_to_email_id": {"type": "string",
+                              "description": "Reply to this email (an id from search_email, "
+                                             "e.g. 'm3') instead of starting a new one"},
+        "reply_all": {"type": "boolean",
+                      "description": "With reply_to_email_id: reply to all recipients, "
+                                     "not just the sender"},
+        "attachment_path": {"type": "string",
+                            "description": "Optional path of a file to attach, e.g. "
+                                           "'~/Downloads/report.pdf'"},
         "draft_id": {"type": "string",
                      "description": "Pass an existing draft id (e.g. 'd1') to EDIT that "
                                     "draft instead of creating a new one; only the fields "
                                     "you pass change"},
     },
     required=[],
-    handler=draft_new_email,
+    handler=draft_email,
 )
 
-draft_reply_email_schema = FunctionSchema(
-    name="draft_reply_email",
+save_attachment_schema = FunctionSchema(
+    name="save_attachment",
     description=(
-        "Open a REPLY to an email (by its search id, e.g. 'm3') as an on-screen "
-        "draft in Mail for the user to review — nothing is sent. Replies from the "
-        "right account automatically; set reply_all to include everyone. Returns a "
-        "draft id like 'd1'."
+        "Save an email's attachment to the Downloads folder, by the email's search "
+        "id (e.g. 'm3'). read_email lists the attachment names. Pass 'name' to save "
+        "one attachment; omit it to save them all. Existing files are never "
+        "overwritten. Returns the saved file path(s)."
     ),
     properties={
-        "id": {"type": "string", "description": "The email id from search_email to reply to"},
-        "body": {"type": "string", "description": "Your reply text"},
-        "reply_all": {"type": "boolean", "description": "Reply to all recipients, not just the sender"},
-        "draft_id": {"type": "string",
-                     "description": "Pass an existing draft id (e.g. 'd1') to update that "
-                                    "reply draft's text instead of creating a new one"},
+        "id": {"type": "string", "description": "The email id from search_email, e.g. 'm3'"},
+        "name": {"type": "string",
+                 "description": "Attachment filename (from read_email's attachments "
+                                "list). Omit to save every attachment."},
     },
-    required=[],
-    handler=draft_reply_email,
+    required=["id"],
+    handler=save_attachment,
 )
 
 send_email_schema = FunctionSchema(
     name="send_email",
     description=(
-        "Send a draft created by draft_new_email or draft_reply_email, by its "
-        "draft id (e.g. 'd1'). This is the step that actually sends — only call it "
-        "on the user's explicit go-ahead."
+        "Send a draft created by draft_email, by its draft id (e.g. 'd1'). This is "
+        "the step that actually sends — only call it on the user's explicit go-ahead."
     ),
     properties={
         "draft_id": {"type": "string", "description": "The draft id, e.g. 'd1'"},
@@ -2119,7 +2129,7 @@ for _schema in (
     google_search_schema, x_web_search_schema, x_search_schema,
     escalate_to_grok_schema,
     open_in_browser_schema, find_files_schema, open_file_schema,
-    read_file_schema, search_email_schema, read_email_schema, draft_new_email_schema, draft_reply_email_schema, send_email_schema, discard_draft_schema, archive_email_schema, trash_email_schema, mark_email_schema, recent_notifications_schema,
+    read_file_schema, search_email_schema, read_email_schema, save_attachment_schema, draft_email_schema, send_email_schema, discard_draft_schema, archive_email_schema, trash_email_schema, mark_email_schema, recent_notifications_schema,
     run_javascript_schema, get_weather_schema,
     remember_schema, recall_schema, forget_schema,
     add_person_schema, edit_person_schema, list_people_schema,
@@ -2134,7 +2144,7 @@ for _schema in (
     google_search_schema, x_web_search_schema, x_search_schema,
     escalate_to_grok_schema,
     get_current_time_schema, open_in_browser_schema, find_files_schema,
-    open_file_schema, read_file_schema, search_email_schema, read_email_schema, draft_new_email_schema, draft_reply_email_schema, send_email_schema, discard_draft_schema, archive_email_schema, trash_email_schema, mark_email_schema,
+    open_file_schema, read_file_schema, search_email_schema, read_email_schema, save_attachment_schema, draft_email_schema, send_email_schema, discard_draft_schema, archive_email_schema, trash_email_schema, mark_email_schema,
     recent_notifications_schema, run_javascript_schema,
     get_weather_schema, get_financial_info_schema, remember_schema,
     recall_schema, forget_schema, add_person_schema, edit_person_schema,
@@ -2149,7 +2159,7 @@ NATIVE_TOOL_SCHEMAS = (
     google_search_schema, x_web_search_schema, x_search_schema,
     escalate_to_grok_schema,
     get_current_time_schema, open_in_browser_schema, find_files_schema,
-    open_file_schema, read_file_schema, search_email_schema, read_email_schema, draft_new_email_schema, draft_reply_email_schema, send_email_schema, discard_draft_schema, archive_email_schema, trash_email_schema, mark_email_schema,
+    open_file_schema, read_file_schema, search_email_schema, read_email_schema, save_attachment_schema, draft_email_schema, send_email_schema, discard_draft_schema, archive_email_schema, trash_email_schema, mark_email_schema,
     recent_notifications_schema, run_javascript_schema,
     get_weather_schema, get_financial_info_schema, remember_schema,
     recall_schema, forget_schema, add_person_schema, edit_person_schema,
@@ -3545,7 +3555,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
         find_files_schema,
         open_file_schema,
         read_file_schema,
-        search_email_schema, read_email_schema, draft_new_email_schema, draft_reply_email_schema, send_email_schema, discard_draft_schema, archive_email_schema, trash_email_schema, mark_email_schema,
+        search_email_schema, read_email_schema, save_attachment_schema, draft_email_schema, send_email_schema, discard_draft_schema, archive_email_schema, trash_email_schema, mark_email_schema,
         recent_notifications_schema,
         run_javascript_schema,
         get_weather_schema,

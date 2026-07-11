@@ -26,6 +26,7 @@ be corrupted by a subject or address.
 import asyncio
 from collections import OrderedDict
 from datetime import datetime
+from pathlib import Path
 
 from loguru import logger
 
@@ -491,6 +492,7 @@ end tell'''
         logger.info(f"read_email id={sid} offset={offset}")
         script = f'''{_PRELUDE}{_find_handler(entry["clause"], entry["account"])}
 set US to "{_US}"
+set RS to "{_RS}"
 tell application "Mail"
 	set m to my findMsg()
 	if m is missing value then return "NOTFOUND"
@@ -503,7 +505,7 @@ tell application "Mail"
 	set att to ""
 	try
 		repeat with x in (mail attachments of m)
-			set att to att & (name of x) & ", "
+			set att to att & (my clean(name of x)) & RS
 		end repeat
 	end try
 	return (my clean(subject of m)) & US & (my clean(sender of m)) & US & (my clean(toList)) & US & (my isoDate(date received of m)) & US & (my clean(att)) & US & (content of m)
@@ -535,12 +537,132 @@ end tell'''
         }
         if to.strip():
             result["to"] = to.strip().rstrip(",")
-        if att.strip():
-            result["attachments"] = att.strip().rstrip(",")
+        att_names = [n.strip() for n in att.split(_RS) if n.strip()]
+        if att_names:
+            result["attachments"] = att_names
         if end < total:
             result["continue_offset"] = end
             result["note"] = (f"{total - end} more characters — call read_email again "
                               f"with the same id and offset={end}")
+        return result
+
+    # ---- attachments -------------------------------------------------------
+
+    @staticmethod
+    def _unique_target(directory: Path, name: str, taken: set[str]) -> Path:
+        """A collision-free path in `directory` for `name` (never overwrites)."""
+        name = name.strip().replace("/", "-").replace("\x00", "") or "attachment"
+        stem, dot, ext = name.rpartition(".")
+        if not dot or not stem:
+            stem, ext = name, ""
+        n = 1
+        candidate = name
+        while candidate.lower() in taken or (directory / candidate).exists():
+            n += 1
+            candidate = f"{stem}-{n}.{ext}" if ext else f"{name}-{n}"
+        taken.add(candidate.lower())
+        return directory / candidate
+
+    async def save_attachment(self, sid: str, name: str = "") -> dict:
+        """Save one attachment (by name) — or all of them — to ~/Downloads.
+
+        Never overwrites: an existing file gets a `-2` style suffix. Two
+        osascript passes: list the attachment names first so Python can pick
+        collision-free targets, then save each by exact (cleaned) name.
+        """
+        entry = self._resolve(sid)
+        if not entry:
+            return self._unknown_handle(sid)
+        name = str(name or "").strip()
+        logger.info(f"save_attachment id={sid} name={name!r}")
+        list_script = f'''{_PRELUDE}{_find_handler(entry["clause"], entry["account"])}
+set RS to "{_RS}"
+tell application "Mail"
+	set m to my findMsg()
+	if m is missing value then return "NOTFOUND"
+	set out to ""
+	repeat with x in (mail attachments of m)
+		try
+			set out to out & (my clean(name of x)) & RS
+		end try
+	end repeat
+	return out
+end tell'''
+        try:
+            raw = await self._run(list_script)
+        except RuntimeError as exc:
+            return {"error": f"could not read the email's attachments: {exc}"}
+        if raw.strip() == "NOTFOUND":
+            return {"error": "that email is no longer where it was found (moved or "
+                             "deleted) — search again"}
+        names = [n.strip() for n in raw.split(_RS) if n.strip()]
+        if not names:
+            return {"error": "that email has no attachments"}
+        if name:
+            wanted = [n for n in names if n.lower() == name.lower()]
+            if not wanted:
+                wanted = [n for n in names if name.lower() in n.lower()]
+            if not wanted:
+                return {"error": f"no attachment named {name!r} — this email has: "
+                                 + ", ".join(names)}
+            wanted = wanted[:1]
+        else:
+            wanted = list(dict.fromkeys(names))  # all of them, deduped by name
+
+        downloads = Path.home() / "Downloads"
+        taken: set[str] = set()
+        targets = {n: self._unique_target(downloads, n, taken) for n in wanted}
+        saves = "\n".join(
+            f'''		if (not isDone) and nm is "{_osa(n)}" then
+			set isDone to true
+			try
+				save x in (POSIX file "{_osa(str(p))}")
+				set out to out & "OK" & US & nm & RS
+			on error errMsg
+				set out to out & "ERR" & US & nm & US & (my clean(errMsg)) & RS
+			end try
+		end if'''
+            for n, p in targets.items())
+        save_script = f'''{_PRELUDE}{_find_handler(entry["clause"], entry["account"])}
+set US to "{_US}"
+set RS to "{_RS}"
+tell application "Mail"
+	set m to my findMsg()
+	if m is missing value then return "NOTFOUND"
+	set out to ""
+	repeat with x in (mail attachments of m)
+		set nm to my clean(name of x)
+		set isDone to false
+{saves}
+	end repeat
+	return out
+end tell'''
+        try:
+            raw = await self._run(save_script)
+        except RuntimeError as exc:
+            return {"error": f"could not save: {exc}"}
+        if raw.strip() == "NOTFOUND":
+            return {"error": "that email disappeared mid-save (moved or deleted) — "
+                             "search again"}
+        saved, failed = [], []
+        for rec in raw.split(_RS):
+            f = rec.split(_US)
+            if len(f) >= 2 and f[0] == "OK":
+                saved.append(str(targets[f[1]]))
+            elif len(f) >= 2 and f[0] == "ERR":
+                failed.append({"name": f[1], "reason": f[2] if len(f) > 2 else "unknown"})
+        result: dict = {}
+        if saved:
+            result["saved"] = saved
+            result["folder"] = str(downloads)
+        if failed:
+            result["failed"] = failed
+            result["note"] = ("a failed save usually means Mail hasn't downloaded "
+                              "the attachment yet — open the email in Mail once, "
+                              "then try again")
+        if not saved and not failed:
+            return {"error": "nothing was saved — the attachments changed under us; "
+                             "read_email again to see the current list"}
         return result
 
     # ---- drafts (compose on screen, send by draft id) ---------------------
@@ -602,14 +724,50 @@ end findOut
             self._drafts.popitem(last=False)
         return did
 
-    async def draft_new(self, to: str = "", subject: str = "", body: str = "",
-                        cc: str = "", bcc: str = "", from_id: str = "",
-                        draft_id: str = "") -> dict:
-        if draft_id:
-            return await self._edit_draft(draft_id, to, subject, body, cc, bcc)
+    @staticmethod
+    def _attach_lines(var: str, path: str) -> str:
+        """AppleScript lines appending a file attachment to outgoing message `var`."""
+        if not path:
+            return ""
+        return (f'\tdelay 0.5\n'
+                f'\ttell content of {var}\n'
+                f'\t\tmake new attachment with properties '
+                f'{{file name:(POSIX file "{_osa(path)}")}} at after the last paragraph\n'
+                f'\tend tell')
+
+    @staticmethod
+    def _attachment_file(attachment_path: str) -> tuple[str, dict | None]:
+        """Expand and validate an attachment path; ('', error-dict) if bad."""
+        raw = str(attachment_path or "").strip()
+        if not raw:
+            return "", None
+        p = Path(raw).expanduser()
+        if not p.is_file():
+            return "", {"error": f"attachment file not found: {p} — pass the full "
+                                 "path of an existing file (~/ is fine)"}
+        return str(p.resolve()), None
+
+    async def draft_email(self, to: str = "", subject: str = "", body: str = "",
+                          cc: str = "", bcc: str = "", from_id: str = "",
+                          reply_to_email_id: str = "", reply_all: bool = False,
+                          attachment_path: str = "", draft_id: str = "") -> dict:
+        """One entry point for drafting: new email, reply, or edit-by-draft-id."""
+        attach, err = self._attachment_file(attachment_path)
+        if err:
+            return err
+        if str(draft_id or "").strip():
+            return await self._edit_draft(draft_id, to, subject, body, cc, bcc, attach)
+        if str(reply_to_email_id or "").strip():
+            return await self._draft_reply(reply_to_email_id, body, reply_all, attach)
+        return await self._draft_new(to, subject, body, cc, bcc, from_id, attach)
+
+    async def _draft_new(self, to: str, subject: str, body: str,
+                         cc: str, bcc: str, from_id: str, attach: str) -> dict:
         if not str(to or "").strip():
-            return {"error": "need at least one recipient in 'to'"}
-        logger.info(f"draft_new_email to={to!r} subject={subject!r} from_id={from_id!r}")
+            return {"error": "need at least one recipient in 'to' (or pass "
+                             "reply_to_email_id to reply to an email)"}
+        logger.info(f"draft_email to={to!r} subject={subject!r} from_id={from_id!r} "
+                    f"attach={attach!r}")
         sender_line = ""
         from_account = ""
         if str(from_id or "").strip():
@@ -631,6 +789,7 @@ end findOut
 {recips}
 	end tell
 {sender_line}
+{self._attach_lines("msg", attach)}
 	activate
 	delay 0.3
 	set wid to "0"
@@ -656,18 +815,18 @@ end tell'''
                   "open_on_screen": True,
                   "note": ("the draft is open in Mail for review — after the user "
                            f"confirms, call send_email with draft_id '{did}'")}
+        if attach:
+            result["attached"] = Path(attach).name
         if from_account:
             result["from_account"] = from_account
         return result
 
-    async def draft_reply(self, sid: str, body: str, reply_all: bool = False,
-                          draft_id: str = "") -> dict:
-        if draft_id:
-            return await self._edit_draft(draft_id, "", "", body, "", "")
+    async def _draft_reply(self, sid: str, body: str, reply_all: bool,
+                           attach: str) -> dict:
         entry = self._resolve(sid)
         if not entry:
             return self._unknown_handle(sid)
-        logger.info(f"draft_reply_email id={sid} reply_all={reply_all}")
+        logger.info(f"draft_email reply_to={sid} reply_all={reply_all} attach={attach!r}")
         verb = ("reply m with opening window and reply to all" if reply_all
                 else "reply m with opening window")
         script = f'''{_PRELUDE}{_find_handler(entry["clause"], entry["account"])}
@@ -676,6 +835,7 @@ tell application "Mail"
 	if m is missing value then return "NOTFOUND"
 	set r to {verb}
 	set content of r to "{_osa(body)}"
+{self._attach_lines("r", attach)}
 	activate
 	delay 0.3
 	set wid to "0"
@@ -699,18 +859,21 @@ end tell'''
                                   "win_id": int(win_s or 0),
                                   "to": entry.get("sender", ""),
                                   "subject": entry.get("subject", "")})
-        return {"draft_id": did, "replying_to": entry.get("subject", ""),
-                "reply_all": bool(reply_all), "open_on_screen": True,
-                "note": ("the reply draft is open in Mail for review — after the "
-                         f"user confirms, call send_email with draft_id '{did}'")}
+        result = {"draft_id": did, "replying_to": entry.get("subject", ""),
+                  "reply_all": bool(reply_all), "open_on_screen": True,
+                  "note": ("the reply draft is open in Mail for review — after the "
+                           f"user confirms, call send_email with draft_id '{did}'")}
+        if attach:
+            result["attached"] = Path(attach).name
+        return result
 
     async def _edit_draft(self, draft_id: str, to: str, subject: str,
-                          body: str, cc: str, bcc: str) -> dict:
+                          body: str, cc: str, bcc: str, attach: str = "") -> dict:
         info = self._draft_entry(draft_id)
         if not info:
-            return {"error": f"unknown draft id '{draft_id}' — draft_new_email or "
-                             "draft_reply_email returns one"}
-        logger.info(f"edit draft {draft_id}")
+            return {"error": f"unknown draft id '{draft_id}' — draft_email "
+                             "returns one"}
+        logger.info(f"edit draft {draft_id} attach={attach!r}")
         sets = []
         if str(subject or "").strip() and info["kind"] == "new":
             sets.append(f'\tset subject of om to "{_osa(subject)}"')
@@ -721,6 +884,8 @@ end tell'''
                 sets.append(f"\tdelete every {kind} recipient of om")
                 block = self._recipients_block(kind, addrs).replace("\t\t", "\t\t")
                 sets.append(f"\ttell om\n{block}\n\tend tell")
+        if attach:
+            sets.append(self._attach_lines("om", attach))
         if not sets:
             return {"error": "nothing to change — pass the field(s) to update"}
         script = f'''{self._find_out_handler(info["out_id"])}
@@ -742,9 +907,12 @@ end tell'''
             info["subject"] = subject
         if str(to or "").strip() and info["kind"] == "new":
             info["to"] = to
-        return {"draft_id": draft_id, "updated": True, "open_on_screen": True,
-                "note": ("draft updated on screen — after the user confirms, call "
-                         f"send_email with draft_id '{draft_id}'")}
+        result = {"draft_id": draft_id, "updated": True, "open_on_screen": True,
+                  "note": ("draft updated on screen — after the user confirms, call "
+                           f"send_email with draft_id '{draft_id}'")}
+        if attach:
+            result["attached"] = Path(attach).name
+        return result
 
     async def discard_draft(self, draft_id: str) -> dict:
         """Discard a draft: close its on-screen compose window without saving.
@@ -813,8 +981,8 @@ end tell'''
     async def send_draft(self, draft_id: str) -> dict:
         info = self._draft_entry(draft_id)
         if not info:
-            return {"error": f"unknown draft id '{draft_id}' — draft_new_email or "
-                             "draft_reply_email returns one; nothing was sent"}
+            return {"error": f"unknown draft id '{draft_id}' — draft_email "
+                             "returns one; nothing was sent"}
         logger.info(f"send_email draft={draft_id}")
         script = f'''{self._find_out_handler(info["out_id"])}
 tell application "Mail"
