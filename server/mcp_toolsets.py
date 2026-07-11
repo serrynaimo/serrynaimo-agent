@@ -26,11 +26,9 @@ HOME = os.path.expanduser("~")
 # Registry of available MCP servers. "when" feeds the load_toolset description
 # so the model knows what each toolset is for WITHOUT loading it.
 TOOLSETS: dict[str, dict] = {
-    "apple-mail": {
-        "command": "uvx",
-        "args": ["mcp-apple-mail"],
-        "when": "reading, searching, organizing, or sending email via Apple Mail",
-    },
+    # Apple Mail is handled by NATIVE tools (see apple_mail.py + bot.py), not an
+    # MCP server — search_email / read_email / send_email / reply_email /
+    # trash_email / mark_email.
     "calendar": {
         "command": "uv",
         "args": [

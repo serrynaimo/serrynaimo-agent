@@ -208,6 +208,16 @@ class NotificationStore:
             items.append(dict(r))
             if len(items) >= limit:
                 break
+        if terms and not items:
+            # Fuzzy pass: dictated keywords are often misspelled — keep rows
+            # whose text merely resembles a term, flagged approximate.
+            import fuzzy
+            for r in rows:
+                hay = f"{r['app']} {r['title']} {r['text']}"
+                if fuzzy.any_close(terms, hay):
+                    items.append({**dict(r), "approximate_match": True})
+                    if len(items) >= limit:
+                        break
         if mark_reported and items:
             self.mark_read([r["id"] for r in items])
         return items

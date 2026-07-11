@@ -56,7 +56,7 @@ def _mem_id(note_key: str, content: str) -> str:
     stable across reloads; folding in the note key keeps identical text in two
     different notes distinct.
     """
-    return hashlib.sha1(f"{note_key}\x00{_norm(content)}".encode("utf-8")).hexdigest()[:8]
+    return hashlib.sha1(f"{note_key}\x00{_norm(content)}".encode()).hexdigest()[:8]
 
 
 def _osa_str(s: str) -> str:
@@ -471,7 +471,15 @@ end tell'''
                 return alias
             if len(n) < 3:
                 return []  # substring on a 2-char token would match too much
-            return [p["name"] for p in self._people.values() if n in p["name"].lower()]
+            subs = [p["name"] for p in self._people.values() if n in p["name"].lower()]
+            if subs:
+                return subs
+            # Fuzzy last: dictated names arrive misspelled (Kahler for Kähler,
+            # Gisele for Giselle) — accept a close-enough name or alias.
+            import fuzzy
+            return [p["name"] for p in self._people.values()
+                    if fuzzy.close(n, p["name"])
+                    or any(fuzzy.close(n, a) for a in p.get("aliases", []))]
 
     def recall(self, keywords, person=None, limit=8, kind=None) -> dict:
         kw = [str(k) for k in (keywords or [])]
@@ -567,6 +575,21 @@ end tell'''
                     [(m["id"], now) for m in out],
                 )
                 self._db.commit()
+        if not out and kw:
+            # Fuzzy fallback: no literal/stem hits — keep memories whose words
+            # merely resemble the keywords (dictation misspells names), flagged
+            # approximate so the caller confirms rather than asserts.
+            import fuzzy
+            with self._lock:
+                cand = [r for r in self._mem.values()
+                        if (not kind or r["kind"] == kind)
+                        and fuzzy.any_close(kw, f"{r['content']} {r.get('person') or ''}")]
+            cand.sort(key=lambda r: r.get("created_at", ""), reverse=True)
+            out = [self._public(r) for r in cand[:limit]]
+            if out:
+                return {"memories": out, "matched_people": sorted(matched_people),
+                        "approximate": True,
+                        **({"person": person} if person else {})}
         return {"memories": out, "matched_people": sorted(matched_people),
                 **({"person": person} if person else {})}
 

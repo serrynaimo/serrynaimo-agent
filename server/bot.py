@@ -29,8 +29,8 @@ import os
 import re
 import shutil
 import time
-from types import SimpleNamespace
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 
 from dotenv import load_dotenv
 
@@ -87,18 +87,6 @@ from pipecat.frames.frames import (
     TranscriptionFrame,
     TTSSpeakFrame,
 )
-from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
-from pipecat.processors.frameworks.rtvi import (
-    RTVIFunctionCallReportLevel,
-    RTVIObserverParams,
-    RTVIServerMessageFrame,
-)
-from pipecat.utils.context.llm_context_summarization import (
-    LLMAutoContextSummarizationConfig,
-    LLMContextSummaryConfig,
-)
-from pipecat.utils.string import TextPartForConcatenation
-from pipecat.services.llm_service import FunctionCallParams
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker
 from pipecat.processors.aggregators.llm_context import LLMContext
@@ -107,14 +95,30 @@ from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
     LLMUserAggregatorParams,
 )
+from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
+from pipecat.processors.frameworks.rtvi import (
+    RTVIFunctionCallReportLevel,
+    RTVIObserverParams,
+    RTVIServerMessageFrame,
+)
 from pipecat.runner.types import RunnerArguments
 from pipecat.runner.utils import create_transport
+from pipecat.services.llm_service import FunctionCallParams
 from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.transcriptions.language import Language
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.transports.daily.transport import DailyParams
+from pipecat.turns.user_start import TranscriptionUserTurnStartStrategy
+from pipecat.turns.user_turn_strategies import UserTurnStrategies
+from pipecat.utils.context.llm_context_summarization import (
+    LLMAutoContextSummarizationConfig,
+    LLMContextSummaryConfig,
+)
+from pipecat.utils.string import TextPartForConcatenation
 from pipecat.workers.runner import WorkerRunner
 
+import fuzzy
+from apple_mail import AppleMail
 from mcp_toolsets import (
     TOOLSETS,
     call_mcp_tool,
@@ -125,8 +129,6 @@ from mcp_toolsets import (
 )
 from notes_memory_store import NotesMemoryStore
 from notification_store import NotificationStore
-from pipecat.turns.user_start import TranscriptionUserTurnStartStrategy
-from pipecat.turns.user_turn_strategies import UserTurnStrategies
 from services_local import (
     GatedInterruptionVADTurnStartStrategy,
     Qwen3ASRSTTService,
@@ -156,6 +158,10 @@ memory = NotesMemoryStore(
 _NOTIF_DB = os.path.join(os.path.dirname(__file__), "notifications.db")
 notif_store = NotificationStore(_NOTIF_DB)
 
+# Native Apple Mail — replaces the mcp-apple-mail toolset. Short handles ("m1"…)
+# it hands out in search results are valid across tool calls for the session.
+mail = AppleMail()
+
 # Seeded action memories (kind='action') = TOOL QUIRKS / best-practice for the
 # tools: objective, reusable facts about how a tool behaves and how to use it
 # for reliable results — NOT Thomas' personal preferences (those are ordinary
@@ -165,18 +171,20 @@ notif_store = NotificationStore(_NOTIF_DB)
 # phrase BEFORE the first colon, and auto-injection truncates at ~220 chars —
 # so each keeps a keyword-rich trigger and front-loads its most useful quirk.
 SEED_ACTION_MEMORIES = [
-    "Searching or finding emails or messages: search mailbox 'All' across "
-    "accounts, since mail lives in Archive as well as the Inbox, and use a broad "
-    "sender name over an exact address, bounding dates with date_from/date_to.",
-    "Older or missing emails, only the newest showing: max_results caps before "
-    "sorting, so reach older mail with date_from and date_to, a higher max_results, "
-    "or offset, and broaden the filters when a search finds nothing.",
-    "Deleting, trashing, or cleaning up emails: there is no delete tool, so use "
-    "manage_trash with action 'move_to_trash', and set dry_run to false to actually "
-    "move it, since it only previews otherwise. Look up and specify the correct account to delete correctly. ‘All’ doesn’t work for deleting.",
-    "Reading one specific email in full: search and inbox show only a preview, so "
-    "use read_full_email_content by sender and/or subject for the full body, and if it returns "
-    "continue_offset, call it again with that offset until done.",
+    "Checking new mail or the inbox: call search_email with no query — unread_only "
+    "true for 'any new mail?', nothing at all for 'what's in my inbox?'. Keywords "
+    "make it search every account and mailbox instead, Archive included.",
+    "Email — reading, replying, archiving, trashing, or flagging a message: first "
+    "search_email with one or two broad keywords (OR-matched across sender and "
+    "subject), then use the short id it returns (like 'm3') with read_email, "
+    "draft_reply_email, archive_email, trash_email, or mark_email. Sending is two "
+    "steps: draft_new_email or draft_reply_email opens the draft on screen and "
+    "returns a draft id like 'd1'; only after the user confirms, send_email with "
+    "that draft id. No account name is ever needed, and 'done' means archive_email.",
+    "Finding older or missing emails: search_email is newest-first and capped at 40, "
+    "so widen with fewer keywords, page with offset from the 'more' hint, and for a "
+    "specific period pass date_from/date_to as YYYY-MM-DD — never years or dates as "
+    "query keywords.",
     "When creating reminders they require the date in full, e.g. 'July 10, 2026 at 9:20 AM'"
 ]
 
@@ -911,33 +919,50 @@ async def find_files(params: FunctionCallParams):
     )
     plain_alts = [alt.replace('"', "").replace("\\", "") for alt, _ws in alternatives]
     name_pred = " || ".join(f'kMDItemFSName = "*{alt}*"cd' for alt in plain_alts)
+    def rank(content_paths: list[str], name_paths: list[str]) -> list[tuple[int, float, str]]:
+        content_set, name_set = set(content_paths), set(name_paths)
+        out: list[tuple[int, float, str]] = []
+        for p in dict.fromkeys(content_paths + name_paths):
+            # Skip app-support noise, dependency trees, and hidden directories.
+            parts = p.split(os.sep)
+            if (
+                "/Library/" in p
+                or any(part.startswith(".") for part in parts)
+                or any(part in EXCLUDED_DIR_SEGMENTS for part in parts)
+            ):
+                continue
+            try:
+                mtime = os.stat(p).st_mtime
+            except OSError:
+                continue
+            # Content beats name-only; document types beat code regardless of age.
+            score = (
+                (4 if p in content_set else 0)
+                + (2 if p in name_set else 0)
+                + (1 if os.path.splitext(p)[1].lower() in DOCUMENT_EXTENSIONS else 0)
+            )
+            out.append((score, mtime, p))
+        out.sort(reverse=True)
+        return out
+
     content_paths, name_paths = await asyncio.gather(
         mdfind([content_pred]), mdfind([name_pred])
     )
+    ranked = rank(content_paths, name_paths)
 
-    content_set, name_set = set(content_paths), set(name_paths)
-    ranked: list[tuple[int, float, str]] = []
-    for p in dict.fromkeys(content_paths + name_paths):
-        # Skip app-support noise, dependency trees, and hidden directories.
-        parts = p.split(os.sep)
-        if (
-            "/Library/" in p
-            or any(part.startswith(".") for part in parts)
-            or any(part in EXCLUDED_DIR_SEGMENTS for part in parts)
-        ):
-            continue
-        try:
-            mtime = os.stat(p).st_mtime
-        except OSError:
-            continue
-        # Content beats name-only; document types beat code regardless of age.
-        score = (
-            (4 if p in content_set else 0)
-            + (2 if p in name_set else 0)
-            + (1 if os.path.splitext(p)[1].lower() in DOCUMENT_EXTENSIONS else 0)
+    # Fuzzy fallback: zero hits often means a dictated word is misspelled —
+    # retry once with substring stems of each word (see fuzzy.variants).
+    approximate = False
+    stems = list(dict.fromkeys(v for w in words for v in fuzzy.variants(w)))
+    if not ranked and stems:
+        logger.info(f"find_files fuzzy retry with stems {stems}")
+        stem_content = " || ".join(f'kMDItemTextContent = "*{s}*"cd' for s in stems)
+        stem_name = " || ".join(f'kMDItemFSName = "*{s}*"cd' for s in stems)
+        content_paths, name_paths = await asyncio.gather(
+            mdfind([stem_content]), mdfind([stem_name])
         )
-        ranked.append((score, mtime, p))
-    ranked.sort(reverse=True)
+        ranked = rank(content_paths, name_paths)
+        approximate = bool(ranked)
 
     # Token diet: plain-text lines, home-relative paths, and full detail only
     # for the top hits — the tail is paths alone. The path lines are accepted
@@ -953,7 +978,12 @@ async def find_files(params: FunctionCallParams):
                 lines.append(f"  > {snippet}")
         else:
             lines.append(display)
-    await params.result_callback({"files": "\n".join(lines) or "no files found"})
+    result = {"files": "\n".join(lines) or "no files found"}
+    if approximate:
+        result["approximate"] = True
+        result["note"] = (f"no exact matches for {query!r} — these merely resemble "
+                          "the query (likely a spelling variant); confirm before acting")
+    await params.result_callback(result)
 
 
 async def open_file(params: FunctionCallParams):
@@ -1586,138 +1616,261 @@ read_file_schema = FunctionSchema(
 )
 
 
-# Reading one specific email in full. The normal mail path can't: search/list
-# only expose a 150-500 char preview, and the MCP proxy caps every result at
-# 6000 chars. read_full_email_content fetches the WHOLE body server-side (search_emails with
-# max_content_length=0, which call_mcp_tool returns uncapped) and then pages it
-# out in READ_MAX_CHARS chunks, mirroring read_file's continue_from pagination.
-_email_read_cache: dict[str, dict] = {}   # locator key -> {body, subject, sender, date, mailbox, others}
+# --- Native Apple Mail (see apple_mail.py) ---------------------------------
+# search_email hands out short ids ("m1", "m2"…); read/reply/trash/mark then act
+# on an email by that id. No account names anywhere — search spans every account,
+# and the id carries the account internally. Bodies come only from read_email.
 
 
-def _email_locator_key(sender: str, subject: str, mailbox: str) -> str:
-    return "\x00".join((sender.strip().lower(), subject.strip().lower(), mailbox.strip().lower()))
-
-
-async def read_full_email_content(params: FunctionCallParams):
-    """Tool handler: return the full text of one specific email, paged."""
-    a = params.arguments
-    sender = (a.get("sender") or "").strip()
-    subject = (a.get("subject") or "").strip()
-    mailbox = (a.get("mailbox") or "All").strip() or "All"
+def _mail_int(v, default=0):
     try:
-        offset = max(0, int(a.get("offset") or 0))
+        return int(v)
     except (TypeError, ValueError):
-        offset = 0
-    if not sender and not subject:
-        await params.result_callback(
-            {"error": "give a sender and/or subject to identify which email to read"}
-        )
-        return
-    logger.info(
-        f"read_full_email_content: sender=[{sender}] subject=[{subject}] mailbox=[{mailbox}] offset={offset}"
+        return default
+
+
+async def search_email(params: FunctionCallParams):
+    """Tool handler: broad-net keyword search across all mail, newest first."""
+    a = params.arguments
+    days = a.get("days")
+    result = await mail.search(
+        query=str(a.get("query") or ""),
+        unread_only=bool(a.get("unread_only")),
+        days=_mail_int(days, None) if str(days or "").strip() else None,
+        offset=_mail_int(a.get("offset"), 0),
+        date_from=str(a.get("date_from") or ""),
+        date_to=str(a.get("date_to") or ""),
+        folder=str(a.get("folder") or ""),
     )
-
-    key = _email_locator_key(sender, subject, mailbox)
-    # A follow-up page reuses the body fetched on the first call — no second
-    # trip through Mail — as long as the locator is unchanged.
-    cached = _email_read_cache.get(key) if offset > 0 else None
-    if cached is None:
-        search_args = {
-            "mailbox": mailbox,
-            "include_content": True,
-            "max_content_length": 0,        # 0 = full body (uncapped via call_mcp_tool)
-            "output_format": "json",
-            "limit": 5,
-            "sort": "date_desc",
-        }
-        if sender:
-            search_args["sender"] = sender
-        if subject:
-            search_args["subject_keyword"] = subject
-        try:
-            raw = await call_mcp_tool("apple-mail", "search_emails", search_args)
-        except Exception as exc:  # noqa: BLE001
-            await params.result_callback({"error": f"could not read email: {exc}"})
-            return
-        try:
-            items = (json.loads(raw) or {}).get("items", [])
-        except (ValueError, TypeError):
-            items = []
-        items = [it for it in items if (it.get("content_preview") or "").strip()]
-        if not items:
-            await params.result_callback(
-                {"error": "no matching email with readable content found — "
-                          "adjust sender/subject, or set mailbox to 'All'"}
-            )
-            return
-        chosen = items[0]  # most recent match (sort=date_desc)
-        cached = {
-            "body": (chosen.get("content_preview") or "").strip(),
-            "subject": chosen.get("subject", ""),
-            "sender": chosen.get("sender", ""),
-            "date": chosen.get("received_date", ""),
-            "mailbox": chosen.get("mailbox", mailbox),
-            "others": max(0, len(items) - 1),
-        }
-        _email_read_cache.clear()   # only the currently-open email is ever cached
-        _email_read_cache[key] = cached
-
-    body = cached["body"]
-    total = len(body)
-    if offset >= total:
-        await params.result_callback(
-            {"error": f"offset {offset} is past the end of this email ({total} chars)"}
-        )
-        return
-    chunk = body[offset:offset + READ_MAX_CHARS]
-    end = offset + len(chunk)
-    result = {
-        "subject": cached["subject"],
-        "from": cached["sender"],
-        "date": cached["date"],
-        "mailbox": cached["mailbox"],
-        "content": chunk,
-        "chars": f"{offset}–{end} of {total}",
-    }
-    if end < total:
-        result["continue_offset"] = end
-        result["note"] = (
-            f"{total - end} more characters remain — call read_full_email_content again with the "
-            f"same sender/subject and offset={end} to read the next part."
-        )
-    if offset == 0 and cached.get("others"):
-        result["also_matched"] = (
-            f"{cached['others']} other email(s) matched; showing the most recent. "
-            "Narrow by subject/sender/date to pick a different one."
-        )
     await params.result_callback(result)
 
 
-read_full_email_content_schema = FunctionSchema(
-    name="read_full_email_content",
+async def read_email(params: FunctionCallParams):
+    """Tool handler: full text of one email, by its search id, paged."""
+    a = params.arguments
+    result = await mail.read(str(a.get("id") or ""), offset=_mail_int(a.get("offset"), 0))
+    await params.result_callback(result)
+
+
+async def draft_new_email(params: FunctionCallParams):
+    """Tool handler: open a new-email draft on screen (or edit one by draft id)."""
+    a = params.arguments
+    result = await mail.draft_new(
+        to=str(a.get("to") or ""), subject=str(a.get("subject") or ""),
+        body=str(a.get("body") or ""), cc=str(a.get("cc") or ""),
+        bcc=str(a.get("bcc") or ""), from_id=str(a.get("from_id") or ""),
+        draft_id=str(a.get("draft_id") or ""),
+    )
+    await params.result_callback(result)
+
+
+async def draft_reply_email(params: FunctionCallParams):
+    """Tool handler: open a reply draft on screen (or edit one by draft id)."""
+    a = params.arguments
+    result = await mail.draft_reply(
+        str(a.get("id") or ""), body=str(a.get("body") or ""),
+        reply_all=bool(a.get("reply_all")),
+        draft_id=str(a.get("draft_id") or ""),
+    )
+    await params.result_callback(result)
+
+
+async def send_email(params: FunctionCallParams):
+    """Tool handler: send a previously drafted email by its draft id."""
+    result = await mail.send_draft(str(params.arguments.get("draft_id") or ""))
+    await params.result_callback(result)
+
+
+async def discard_draft(params: FunctionCallParams):
+    """Tool handler: discard a draft and close its compose window."""
+    result = await mail.discard_draft(str(params.arguments.get("draft_id") or ""))
+    await params.result_callback(result)
+
+
+async def archive_email(params: FunctionCallParams):
+    """Tool handler: mark read + archive an email by its search id."""
+    result = await mail.archive(str(params.arguments.get("id") or ""))
+    await params.result_callback(result)
+
+
+async def trash_email(params: FunctionCallParams):
+    """Tool handler: move an email to Trash by its search id."""
+    result = await mail.trash(str(params.arguments.get("id") or ""))
+    await params.result_callback(result)
+
+
+async def mark_email(params: FunctionCallParams):
+    """Tool handler: mark an email read/unread/flagged/unflagged by its search id."""
+    a = params.arguments
+    result = await mail.mark(str(a.get("id") or ""), str(a.get("status") or ""))
+    await params.result_callback(result)
+
+
+search_email_schema = FunctionSchema(
+    name="search_email",
     description=(
-        "Read the FULL text of one specific email. Use this whenever you need an "
-        "email's complete body — searching or listing mail only shows a short "
-        "preview that cuts long emails off. Identify the email by sender and/or "
-        "subject (mailbox defaults to 'All'). Long emails are paged: if the "
-        "response has continue_offset, call read_full_email_content again with the same "
-        "sender/subject and offset=continue_offset to get the next part."
+        "Find email, newest first. With NO query it returns the Inbox — use "
+        "that to find 'any new mail?' or 'what's in my inbox?'. Queries EVERY account "
+        "and mailbox (Archive included). Sent, Trash, Junk, and Drafts are skipped "
+        "unless you name one in 'folder'. Results are ONE PAGE of up to 40 — "
+        "total_matched is the real total. Each result has a short id like 'm3' for "
+        "the other email tools; no account name is ever needed. NEVER put years or "
+        "dates in the query — use date_from/date_to."
     ),
     properties={
-        "sender": {"type": "string", "description": "Sender email or name identifying the email"},
-        "subject": {"type": "string", "description": "Subject keyword identifying the email"},
-        "mailbox": {
-            "type": "string",
-            "description": "Where to look: 'All' (default), 'INBOX', 'Archive', or a folder name",
-        },
-        "offset": {
-            "type": "integer",
-            "description": "Character offset to resume from (the continue_offset from a "
-                           "previous read_full_email_content); omit to start at the beginning",
-        },
+        "query": {"type": "string",
+                  "description": "Keywords (sender name and/or subject words). Fewer is "
+                                 "broader. Omit to just check the Inbox. No dates or years "
+                                 "here — use date_from/date_to."},
+        "unread_only": {"type": "boolean", "description": "Only unread emails"},
+        "days": {"type": "integer",
+                 "description": "Only emails from the last N days (omit for no time limit)"},
+        "date_from": {"type": "string",
+                      "description": "Earliest date, YYYY-MM-DD (e.g. 2020-01-01)"},
+        "date_to": {"type": "string",
+                    "description": "Latest date, YYYY-MM-DD (e.g. 2022-12-31)"},
+        "folder": {"type": "string",
+                   "description": "Search only this folder (any account): 'Sent', 'Trash', "
+                                  "'Junk', 'Drafts', 'Archive', or a custom folder name. "
+                                  "Omit to search everywhere except Sent/Trash/Junk/Drafts."},
+        "offset": {"type": "integer",
+                   "description": "Skip this many results, for paging older matches (from 'more')"},
     },
     required=[],
-    handler=read_full_email_content,
+    handler=search_email,
+)
+
+read_email_schema = FunctionSchema(
+    name="read_email",
+    description=(
+        "Read the full text of one email, identified by the 'id' from a previous "
+        "search_email (e.g. 'm3'). Long emails are paged: if the result has "
+        "continue_offset, call again with the same id and offset=continue_offset."
+    ),
+    properties={
+        "id": {"type": "string", "description": "The email id from search_email, e.g. 'm3'"},
+        "offset": {"type": "integer",
+                   "description": "Resume point for a long email (the continue_offset from last read)"},
+    },
+    required=["id"],
+    handler=read_email,
+)
+
+draft_new_email_schema = FunctionSchema(
+    name="draft_new_email",
+    description=(
+        "Open a NEW email as an on-screen draft in Mail for the user to review — "
+        "nothing is sent. Returns a draft id like 'd1'. Call this again with "
+        "that draft_id and the field(s) to update the draft; "
+        "Optionally pass from_id (an email id like 'm3') to send from the account "
+        "that received that email."
+    ),
+    properties={
+        "to": {"type": "string", "description": "Recipient address(es), comma-separated"},
+        "subject": {"type": "string", "description": "Subject line"},
+        "body": {"type": "string", "description": "Plain-text body"},
+        "cc": {"type": "string", "description": "Optional CC address(es), comma-separated"},
+        "bcc": {"type": "string", "description": "Optional BCC address(es), comma-separated"},
+        "from_id": {"type": "string",
+                    "description": "Optional email id (e.g. 'm3') — send from the account "
+                                   "that received that email"},
+        "draft_id": {"type": "string",
+                     "description": "Pass an existing draft id (e.g. 'd1') to EDIT that "
+                                    "draft instead of creating a new one; only the fields "
+                                    "you pass change"},
+    },
+    required=[],
+    handler=draft_new_email,
+)
+
+draft_reply_email_schema = FunctionSchema(
+    name="draft_reply_email",
+    description=(
+        "Open a REPLY to an email (by its search id, e.g. 'm3') as an on-screen "
+        "draft in Mail for the user to review — nothing is sent. Replies from the "
+        "right account automatically; set reply_all to include everyone. Returns a "
+        "draft id like 'd1'."
+    ),
+    properties={
+        "id": {"type": "string", "description": "The email id from search_email to reply to"},
+        "body": {"type": "string", "description": "Your reply text"},
+        "reply_all": {"type": "boolean", "description": "Reply to all recipients, not just the sender"},
+        "draft_id": {"type": "string",
+                     "description": "Pass an existing draft id (e.g. 'd1') to update that "
+                                    "reply draft's text instead of creating a new one"},
+    },
+    required=[],
+    handler=draft_reply_email,
+)
+
+send_email_schema = FunctionSchema(
+    name="send_email",
+    description=(
+        "Send a draft created by draft_new_email or draft_reply_email, by its "
+        "draft id (e.g. 'd1'). This is the step that actually sends — only call it "
+        "on the user's explicit go-ahead."
+    ),
+    properties={
+        "draft_id": {"type": "string", "description": "The draft id, e.g. 'd1'"},
+    },
+    required=["draft_id"],
+    handler=send_email,
+)
+
+discard_draft_schema = FunctionSchema(
+    name="discard_draft",
+    description=(
+        "Discard a draft by its draft id (e.g. 'd1') and close its on-screen "
+        "window. Use when the user decides not to send."
+    ),
+    properties={
+        "draft_id": {"type": "string", "description": "The draft id, e.g. 'd1'"},
+    },
+    required=["draft_id"],
+    handler=discard_draft,
+)
+
+archive_email_schema = FunctionSchema(
+    name="archive_email",
+    description=(
+        "Archive an email by its search id (e.g. 'm3'): marks it read and moves it "
+        "out of the Inbox into its account's Archive. This is 'mark as done', "
+        "'clear it', or 'I'm finished with it' — the email is kept, just tidied away."
+    ),
+    properties={
+        "id": {"type": "string", "description": "The email id from search_email"},
+    },
+    required=["id"],
+    handler=archive_email,
+)
+
+trash_email_schema = FunctionSchema(
+    name="trash_email",
+    description=(
+        "Move an email to the Trash, identified by its search id (e.g. 'm3'). Works "
+        "on any account without naming it. For 'done' or 'clear it', prefer "
+        "archive_email — trash is for deleting."
+    ),
+    properties={
+        "id": {"type": "string", "description": "The email id from search_email"},
+    },
+    required=["id"],
+    handler=trash_email,
+)
+
+mark_email_schema = FunctionSchema(
+    name="mark_email",
+    description=(
+        "Mark an email read, unread, flagged, or unflagged, by its search id (e.g. "
+        "'m3'). 'Follow up later' means flagged; for 'done' use archive_email instead."
+    ),
+    properties={
+        "id": {"type": "string", "description": "The email id from search_email"},
+        "status": {"type": "string", "enum": ["read", "unread", "flagged", "unflagged"],
+                   "description": "New state for the email"},
+    },
+    required=["id", "status"],
+    handler=mark_email,
 )
 
 
@@ -1966,7 +2119,7 @@ for _schema in (
     google_search_schema, x_web_search_schema, x_search_schema,
     escalate_to_grok_schema,
     open_in_safari_schema, find_files_schema, open_file_schema,
-    read_file_schema, read_full_email_content_schema, recent_notifications_schema,
+    read_file_schema, search_email_schema, read_email_schema, draft_new_email_schema, draft_reply_email_schema, send_email_schema, discard_draft_schema, archive_email_schema, trash_email_schema, mark_email_schema, recent_notifications_schema,
     run_javascript_schema, get_weather_schema,
     remember_schema, recall_schema, forget_schema,
     add_person_schema, edit_person_schema, list_people_schema,
@@ -1981,7 +2134,7 @@ for _schema in (
     google_search_schema, x_web_search_schema, x_search_schema,
     escalate_to_grok_schema,
     get_current_time_schema, open_in_safari_schema, find_files_schema,
-    open_file_schema, read_file_schema, read_full_email_content_schema,
+    open_file_schema, read_file_schema, search_email_schema, read_email_schema, draft_new_email_schema, draft_reply_email_schema, send_email_schema, discard_draft_schema, archive_email_schema, trash_email_schema, mark_email_schema,
     recent_notifications_schema, run_javascript_schema,
     get_weather_schema, get_financial_info_schema, remember_schema,
     recall_schema, forget_schema, add_person_schema, edit_person_schema,
@@ -1996,7 +2149,7 @@ NATIVE_TOOL_SCHEMAS = (
     google_search_schema, x_web_search_schema, x_search_schema,
     escalate_to_grok_schema,
     get_current_time_schema, open_in_safari_schema, find_files_schema,
-    open_file_schema, read_file_schema, read_full_email_content_schema,
+    open_file_schema, read_file_schema, search_email_schema, read_email_schema, draft_new_email_schema, draft_reply_email_schema, send_email_schema, discard_draft_schema, archive_email_schema, trash_email_schema, mark_email_schema,
     recent_notifications_schema, run_javascript_schema,
     get_weather_schema, get_financial_info_schema, remember_schema,
     recall_schema, forget_schema, add_person_schema, edit_person_schema,
@@ -2684,7 +2837,7 @@ def build_system_prompt() -> str:
     "Relevant memories are previewed for you each turn, but that preview is partial — "
     "for anything it lacks about a person, plan, or detail, quietly call 'recall' "
     "before you answer.\n"
-    "If recall stays thin, keep climbing: recent_notifications, find_files for documents, search_emails then "
+    "If recall stays thin, keep climbing: recent_notifications, find_files for documents, search_email then "
     "search_events for the calendar.\n"
     "Should you not find a person in memory, ask if you misheard the name or if it's someone you haven't heard about before, then add_person to store them with the context.\n"
     + _lazy_toolset_hint() +
@@ -3392,7 +3545,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
         find_files_schema,
         open_file_schema,
         read_file_schema,
-        read_full_email_content_schema,
+        search_email_schema, read_email_schema, draft_new_email_schema, draft_reply_email_schema, send_email_schema, discard_draft_schema, archive_email_schema, trash_email_schema, mark_email_schema,
         recent_notifications_schema,
         run_javascript_schema,
         get_weather_schema,
