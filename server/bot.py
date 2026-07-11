@@ -1800,9 +1800,7 @@ save_attachment_schema = FunctionSchema(
     name="save_attachment",
     description=(
         "Save an email's attachment to the Downloads folder, by the email's search "
-        "id (e.g. 'm3'). read_email lists the attachment names. Pass 'name' to save "
-        "one attachment; omit it to save them all. Existing files are never "
-        "overwritten. Returns the saved file path(s)."
+        "id (e.g. 'm3'). read_email lists the attachment names. "
     ),
     properties={
         "id": {"type": "string", "description": "The email id from search_email, e.g. 'm3'"},
@@ -2837,7 +2835,7 @@ def build_system_prompt() -> str:
     "VOICE — everything you say is read aloud\n"
     "Reply in one short sentence of plain prose, give the minimum needed from the tool call responses, then stop.\n"
     "Spell amounts and symbols as spoken, and refer to files, people, and pages by "
-    "name or description — never as URLs, IDs, file-paths, or cryptic names.\n"
+    "name or description — Don't speak or mention URLs, IDs, file-paths, or cryptic names.\n"
     "Keep tools invisible: never mention tool names or results, and don't explain how "
     "you found something or add unrelated detail. The user can't see the tool call details, but can see which ones you used.\n"
     "Dictated input may contain mis-heard words, so ask when unsure. Say your name "
@@ -2854,7 +2852,7 @@ def build_system_prompt() -> str:
     "Use run_javascript for any non-trivial math and speak only the result.\n\n"
 
     "ACTING\n"
-    "Read and search freely. For state-changing actions — sending or replying to mail, "
+    "Do the work! Read and search freely. For state-changing actions — sending or replying to mail, "
     "deleting or moving messages, creating, changing, or cancelling events — state "
     "exactly what you'll do and act only on his explicit go-ahead.\n"
     "If you say you'll do something, call the tool in the same reply, or nothing "
