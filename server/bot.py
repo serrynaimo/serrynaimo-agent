@@ -2411,16 +2411,21 @@ class AudioToLLMAttach(FrameProcessor):
             break  # only ever consider the newest user message
 
 
+# How many of the newest fact memories to seed into the first turn. When fewer
+# than this exist, memory is still "sparse" and we nudge the model to onboard.
+MEMORY_SEED_MAX = 5
+
+
 def _recent_memories_block() -> str:
-    """The five newest memories for the system prompt, so the model has
-    recency awareness without a recall call."""
+    """The newest memories for the system prompt, so the model has recency
+    awareness without a recall call. When memory is still sparse (fewer than
+    MEMORY_SEED_MAX facts on record), append an onboarding nudge so the model
+    offers to start building the user's memory from the people in their life."""
     try:
-        recent = memory.recent(5, kind="fact")
+        recent = memory.recent(MEMORY_SEED_MAX, kind="fact")
     except Exception as exc:  # noqa: BLE001
         logger.warning(f"Could not load recent memories: {exc}")
-        return ""
-    if not recent:
-        return ""
+        recent = []
 
     def _line(m):
         tags = m["person"] or ""
@@ -2428,20 +2433,36 @@ def _recent_memories_block() -> str:
         marker = ", action" if m.get("kind") == "action" else ""
         return f"- [{m['id']}{marker}, {date}{', ' + tags if tags else ''}] {m['content']}"
 
-    out = (
-        "\nYour five most recent memories, newest first (recall has the rest):\n"
-        + "\n".join(_line(m) for m in recent)
-    )
-    try:
-        top = memory.top_recalled(5, exclude_ids={m["id"] for m in recent})
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(f"Could not load top-recalled memories: {exc}")
-        top = []
-    if top:
+    out = ""
+    if recent:
         out += (
-            "\nYour most frequently recalled memories:\n"
-            + "\n".join(_line(m) for m in top)
+            "\nYour most recent memories, newest first (recall has the rest):\n"
+            + "\n".join(_line(m) for m in recent)
         )
+        try:
+            top = memory.top_recalled(
+                MEMORY_SEED_MAX, exclude_ids={m["id"] for m in recent}
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"Could not load top-recalled memories: {exc}")
+            top = []
+        if top:
+            out += (
+                "\nYour most frequently recalled memories:\n"
+                + "\n".join(_line(m) for m in top)
+            )
+
+    if len(recent) < MEMORY_SEED_MAX:
+        out += (
+            "\nYour long-term memory is still sparse — only a few facts recorded so "
+            "far. Early in the conversation, warmly invite the user to name a few of "
+            "the most important people in their life. For each one, look them up "
+            "across their contacts, recent emails, calendar events, and files to "
+            "draft a profile, then save it with your memory tools — that is how you "
+            "begin building their memory. Ask once and don't nag; skip it entirely if "
+            "they'd rather just get on with a task."
+        )
+
     return out
 
 
