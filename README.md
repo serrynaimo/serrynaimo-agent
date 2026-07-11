@@ -111,6 +111,46 @@ One thing worth knowing: because you start Serry from the Terminal, these permis
 
 ---
 
+## A quick tour
+
+Serry is a single glowing orb on a dark canvas, with four soft controls in the corners.
+
+### The buttons
+
+| Button | What it does |
+| --- | --- |
+| **＋ Type a message** | Prefer to type? Opens a text box to talk to her silently |
+| **🎙 Stop &amp; mute** | Puts her to sleep — she'll wait for her name again. The label changes to **"Speak now"** while muted. Tap again to wake her |
+| **🔔 Notifications** | Turns reading your notifications aloud on or off (on by default) |
+| **↻ New session** | Starts a fresh conversation |
+
+### Keyboard shortcuts
+
+| Key | Action |
+| --- | --- |
+| Start typing / **Enter** | Opens the message box (your first keystroke lands in it) |
+| **Delete / Backspace** | Mute or wake her |
+| **Esc** | Stop her mid-sentence |
+| **⌘N** | Start a new session |
+
+### Just talk to her
+
+Say her name anywhere in your first breath — *"Serry, what's on my calendar today?"* or *"read me that email, Serry"* — and then keep going for a few seconds without repeating it.
+
+- **Mail** — "read, search, or send an email"
+- **Calendar** — "what's on today?", "am I free Thursday afternoon?"
+- **Reminders & Contacts** — "remind me to…", "what's Alex's number in my contacts?"
+- **Notes** — "make a note that…", "what did I note about…?"
+- **Files** — "find the file about…", "read me that PDF in Downloads", "open it in Safari"
+- **Recent notifications** - "What did my mom write this morning?" (Only if agent was running at time of notification)
+- **The world** — "search the web for…", "what's the weather this weekend?", "how's the market doing?"
+- **Memory** — "remember that Jane likes morning meetings", "what do you know about Alex?"
+- **When it's hard** — she may say *"let me check on that"* and quietly hand the question to a stronger cloud model, with your personal details kept out of it
+
+You can also just tell her to **be quiet** ("shut up", "stop", "thank you") or to **start over** ("start a new session") — she handles those herself, without sending them anywhere.
+
+---
+
 ## Optional online extras
 
 Serry is fully capable offline. These optional services simply extend her reach into the wider world — switch on only the ones you want by pasting a key into your `.env`. Weather already works out of the box, with no key at all (via the free [Open-Meteo](https://open-meteo.com)).
@@ -150,46 +190,6 @@ Only needed if you swap Serry's default on-device connection for [Daily](https:/
 ```
 
 Weather (via Open-Meteo) needs nothing, and the local speech and language models never require a key — everything above is strictly optional.
-
----
-
-## A quick tour
-
-Serry is a single glowing orb on a dark canvas, with four soft controls in the corners.
-
-### The buttons
-
-| Button | What it does |
-| --- | --- |
-| **＋ Type a message** | Prefer to type? Opens a text box to talk to her silently |
-| **🎙 Stop &amp; mute** | Puts her to sleep — she'll wait for her name again. The label changes to **"Speak now"** while muted. Tap again to wake her |
-| **🔔 Notifications** | Turns reading your notifications aloud on or off (on by default) |
-| **↻ New session** | Starts a fresh conversation |
-
-### Keyboard shortcuts
-
-| Key | Action |
-| --- | --- |
-| Start typing / **Enter** | Opens the message box (your first keystroke lands in it) |
-| **Delete / Backspace** | Mute or wake her |
-| **Esc** | Stop her mid-sentence |
-| **⌘N** | Start a new session |
-
-### Just talk to her
-
-Say her name anywhere in your first breath — *"Serry, what's on my calendar today?"* or *"read me that email, Serry"* — and then keep going for a few seconds without repeating it.
-
-- **Mail** — "read, search, or send an email"
-- **Calendar** — "what's on today?", "am I free Thursday afternoon?"
-- **Reminders & Contacts** — "remind me to…", "what's Alex's number in my contacts?"
-- **Notes** — "make a note that…", "what did I note about…?"
-- **Files** — "find the file about…", "read me that PDF in Downloads", "open it in Safari"
-- **Recent notifications** - "What did my mom write this morning?" (Only if agent was running at time of notification)
-- **The world** — "search the web for…", "what's the weather this weekend?", "how's the market doing?"
-- **Memory** — "remember that Jane likes morning meetings", "what do you know about Alex?"
-- **When it's hard** — she may say *"let me check on that"* and quietly hand the question to a stronger cloud model, with your personal details kept out of it
-
-You can also just tell her to **be quiet** ("shut up", "stop", "thank you") or to **start over** ("start a new session") — she handles those herself, without sending them anywhere.
 
 ---
 
