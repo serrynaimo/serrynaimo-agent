@@ -1,10 +1,10 @@
 # Serry - Voice Agent for Mac
 
-**Serry is LOCAL a helpful, ethereal AI voice agent for Mac** — happiest on an Apple Silicon machine with **more than 96 GB of unified memory**.
+**Serry is a  helpful, ethereal, LOCAL AI voice agent for Mac** — happiest on an Apple Silicon machine with **more than 96 GB of unified memory**.
 
 ![Serry](serry-story.png)
 
-She lives on your computer, sees your world — your files, mail, calendar, notifications — remembers what matters to you, and talks back in a warm, natural voice. And she does it all without your data ever leaving the laptop.
+She lives on your computer, sees your world — your files, mail, calendar, notifications — remembers what matters to you, and talks back in a warm, natural voice. And she does it all without your data ever leaving the computer.
 
 ## What she does
 
@@ -54,7 +54,7 @@ The first run also downloads Serry's speech models (about 7 GB), so give it a mi
 ### 2. Set up her brain (LM Studio)
 
 1. Install **[LM Studio](https://lmstudio.ai)**.
-2. Download a capable model — **Qwen3.5 110B-A10B** is the current favourite on a 96 GB+ Mac. Something smaller is fine on less memory.
+2. Download a capable model — **Qwen3.5 110B-A10B** is the current favourite on a 96 GB+ Mac. Something smaller probably works, but can be frustrating at times.
 3. Load it, then start LM Studio's **local server** (Developer → Start Server).
 4. In the model's settings, turn **off** reasoning (thinking) parsing. Serry manages the model's reasoning herself, and letting LM Studio split out the "thinking" section can garble or slow her spoken replies.
 
@@ -79,7 +79,7 @@ USER_NAME_SHORT=Jane
 
 Everything else has a sensible default. If you later want the optional online extras, this same file is where you'd paste in the relevant keys (each is labelled with what it unlocks).
 
-### 4. Run her
+### 4. Run the bot server
 
 ```bash
 uv run bot.py
@@ -91,7 +91,11 @@ She looks her best in **Chrome's fullscreen mode on a dedicated monitor** — th
 
 ### 5. Teach her your voice and introduce
 
-So Serry answers only you, open the **calibration** page she serves (the link is shown when she starts). Record yourself a few times, and — just as importantly — record a few voices to *ignore*: someone else in the room, a podcast, the TV. She'll tune herself to you automatically. That's it.
+So Serry answers only you, open the **calibration** page at **[https://localhost:7860/calibration](https://localhost:7860/calibration)**. Record yourself a few times, and — just as importantly — record a few voices to *ignore*: someone else in the room, a podcast, the TV. She'll tune herself to you automatically. That's it.
+
+### 6. Open her in your browser
+
+Point a browser at **[https://localhost:7860/serrynaimo](https://localhost:7860/serrynaimo)** to meet her — the glowing orb and her controls. This is the address to open in Chrome's fullscreen mode on a dedicated monitor. (If your browser warns about the local certificate the first time, it's safe to continue past it.)
 
 ---
 
