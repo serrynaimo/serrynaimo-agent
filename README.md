@@ -87,15 +87,15 @@ uv run bot.py
 
 Open the link it prints, allow the microphone when macOS asks, and say hello. The first time she checks your mail, calendar, or notifications, macOS will ask permission for those too — just allow it.
 
-She looks her best in **Chrome's fullscreen mode on a dedicated monitor** — the glowing orb becomes an ambient presence on your desk, always a word away.
+She looks her best in **Chrome's fullscreen mode on a dedicated monitor** — the glowing orb becomes an ambient presence on your desk, always a wake-word away.
 
 ### 5. Teach her your voice and introduce
 
-So Serry answers only you, open the **calibration** page at **[https://localhost:7860/calibration](https://localhost:7860/calibration)**. Record yourself a few times, and — just as importantly — record a few voices to *ignore*: someone else in the room, a podcast, the TV. She'll tune herself to you automatically. That's it.
+So Serry answers only you, open the **calibration** page at **[http://localhost:7860/calibration](http://localhost:7860/calibration)**. Record yourself a few times, and — just as importantly — record a few voices to *ignore*: someone else in the room, a podcast, the TV. She'll tune herself to you automatically. That's it.
 
 ### 6. Open her in your browser
 
-Point a browser at **[https://localhost:7860/serrynaimo](https://localhost:7860/serrynaimo)** to meet her — the glowing orb and her controls. This is the address to open in Chrome's fullscreen mode on a dedicated monitor. (If your browser warns about the local certificate the first time, it's safe to continue past it.)
+Point a browser at **[http://localhost:7860/serrynaimo](http://localhost:7860/serrynaimo)** to meet her — the glowing orb and her controls. This is the address to open in Chrome's fullscreen mode on a dedicated monitor. (If your browser warns about the local certificate the first time, it's safe to continue past it.)
 
 ---
 
@@ -139,9 +139,10 @@ Say her name anywhere in your first breath — *"Serry, what's on my calendar to
 
 - **Mail** — "read, search, or send an email"
 - **Calendar** — "what's on today?", "am I free Thursday afternoon?"
-- **Reminders & Contacts** — "remind me to…", "what's Alex's number?"
+- **Reminders & Contacts** — "remind me to…", "what's Alex's number in my contacts?"
 - **Notes** — "make a note that…", "what did I note about…?"
 - **Files** — "find the file about…", "read me that PDF in Downloads", "open it in Safari"
+- **Recent notifications** - "What did my mom write this morning?" (Only if agent was running at time of notification)
 - **The world** — "search the web for…", "what's the weather this weekend?", "how's the market doing?"
 - **Memory** — "remember that Jane likes morning meetings", "what do you know about Alex?"
 - **When it's hard** — she may say *"let me check on that"* and quietly hand the question to a stronger cloud model, with your personal details kept out of it
