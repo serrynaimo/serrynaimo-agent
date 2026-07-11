@@ -111,6 +111,48 @@ One thing worth knowing: because you start Serry from the Terminal, these permis
 
 ---
 
+## Optional online extras
+
+Serry is fully capable offline. These optional services simply extend her reach into the wider world — switch on only the ones you want by pasting a key into your `.env`. Weather already works out of the box, with no key at all (via the free [Open-Meteo](https://open-meteo.com)).
+
+### Grok — a bigger brain, plus live web &amp; X search (paid)
+
+Lets Serry escalate a hard question to xAI's **Grok**, and powers her deep **web search** and **X (Twitter) search**. This one is **paid** — create a key in the [xAI console](https://console.x.ai).
+
+```bash
+XAI_API_KEY=your-key-here
+#XAI_MODEL=grok-4.5     # optional — this is already the default
+```
+
+### Google search — everyday web lookups (free, ~100/day)
+
+A free way to give Serry general web search (she falls back to this when Grok isn't set up). It needs **two** values: an API key and a search-engine ID. Create a Programmable Search Engine at [programmablesearchengine.google.com](https://programmablesearchengine.google.com), then get the key from the [Custom Search docs](https://developers.google.com/custom-search/v1/overview). Free for roughly **100 searches a day**.
+
+```bash
+GOOGLE_SEARCH_API_KEY=your-key-here
+GOOGLE_SEARCH_ENGINE_ID=your-engine-id
+```
+
+### Alpha Vantage — stocks, currencies &amp; crypto (free, 25/day)
+
+Gives Serry live stock quotes, company fundamentals, exchange rates, and crypto prices. Grab a free key at [alphavantage.co](https://www.alphavantage.co/support/#api-key) — the free tier allows **25 lookups a day**.
+
+```bash
+ALPHA_VANTAGE_API_KEY=your-key-here
+```
+
+### Daily — an alternative connection (optional)
+
+Only needed if you swap Serry's default on-device connection for [Daily](https://www.daily.co)'s hosted WebRTC. Most people never touch this — leave it blank.
+
+```bash
+#DAILY_API_KEY=your-key-here
+```
+
+Weather (via Open-Meteo) needs nothing, and the local speech and language models never require a key — everything above is strictly optional.
+
+---
+
 ## A quick tour
 
 Serry is a single glowing orb on a dark canvas, with four soft controls in the corners.
