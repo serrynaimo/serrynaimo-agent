@@ -141,7 +141,7 @@ Say her name anywhere in your first breath — *"Serry, what's on my calendar to
 - **Calendar** — "what's on today?", "am I free Thursday afternoon?"
 - **Reminders & Contacts** — "remind me to…", "what's Alex's number in my contacts?"
 - **Notes** — "make a note that…", "what did I note about…?"
-- **Files** — "find the file about…", "read me that PDF in Downloads", "open it in Safari"
+- **Files** — "find the file about…", "read me that PDF in Downloads", "open it in the browser"
 - **Recent notifications** - "What did my mom write this morning?" (Only if agent was running at time of notification)
 - **The world** — "search the web for…", "what's the weather this weekend?", "how's the market doing?"
 - **Memory** — "remember that Jane likes morning meetings", "what do you know about Alex?"

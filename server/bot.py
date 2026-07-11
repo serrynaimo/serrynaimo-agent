@@ -435,8 +435,8 @@ get_current_time_schema = FunctionSchema(
 )
 
 
-async def open_in_safari(params: FunctionCallParams):
-    """Tool handler: open a URL in Safari on this Mac."""
+async def open_in_browser(params: FunctionCallParams):
+    """Tool handler: open a URL in the user's default browser."""
     url = str(params.arguments.get("url", "")).strip()
     # Only allow web URLs — `open` would happily run file:// or other schemes.
     if not url.lower().startswith(("http://", "https://")):
@@ -446,16 +446,16 @@ async def open_in_safari(params: FunctionCallParams):
             await params.result_callback({"error": f"not a valid web URL: {url!r}"})
             return
 
-    logger.info(f"open_in_safari: [{url}]")
+    logger.info(f"open_in_browser: [{url}]")
     proc = await asyncio.create_subprocess_exec(
-        "open", "-a", "Safari", url,
+        "open", url,
         stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.PIPE,
     )
     _, stderr = await proc.communicate()
     if proc.returncode != 0:
         await params.result_callback(
-            {"error": f"could not open Safari: {stderr.decode(errors='ignore').strip()}"}
+            {"error": f"could not open the browser: {stderr.decode(errors='ignore').strip()}"}
         )
         return
     await params.result_callback({"status": "opened", "url": url})
@@ -1986,17 +1986,17 @@ open_file_schema = FunctionSchema(
 )
 
 
-open_in_safari_schema = FunctionSchema(
-    name="open_in_safari",
+open_in_browser_schema = FunctionSchema(
+    name="open_in_browser",
     description=(
-        "Open a web page in the Safari browser on the user's computer. Use when "
-        "the user asks to open, show, or bring up a website or a search result."
+        "Open a web page in the user's default browser. Use when the user asks "
+        "to open, show, or bring up a website or a search result."
     ),
     properties={
         "url": {"type": "string", "description": "The full web URL to open"},
     },
     required=["url"],
-    handler=open_in_safari,
+    handler=open_in_browser,
 )
 
 
@@ -2118,7 +2118,7 @@ def _with_current_time(handler):
 for _schema in (
     google_search_schema, x_web_search_schema, x_search_schema,
     escalate_to_grok_schema,
-    open_in_safari_schema, find_files_schema, open_file_schema,
+    open_in_browser_schema, find_files_schema, open_file_schema,
     read_file_schema, search_email_schema, read_email_schema, draft_new_email_schema, draft_reply_email_schema, send_email_schema, discard_draft_schema, archive_email_schema, trash_email_schema, mark_email_schema, recent_notifications_schema,
     run_javascript_schema, get_weather_schema,
     remember_schema, recall_schema, forget_schema,
@@ -2133,7 +2133,7 @@ for _schema in (
 for _schema in (
     google_search_schema, x_web_search_schema, x_search_schema,
     escalate_to_grok_schema,
-    get_current_time_schema, open_in_safari_schema, find_files_schema,
+    get_current_time_schema, open_in_browser_schema, find_files_schema,
     open_file_schema, read_file_schema, search_email_schema, read_email_schema, draft_new_email_schema, draft_reply_email_schema, send_email_schema, discard_draft_schema, archive_email_schema, trash_email_schema, mark_email_schema,
     recent_notifications_schema, run_javascript_schema,
     get_weather_schema, get_financial_info_schema, remember_schema,
@@ -2148,7 +2148,7 @@ for _schema in (
 NATIVE_TOOL_SCHEMAS = (
     google_search_schema, x_web_search_schema, x_search_schema,
     escalate_to_grok_schema,
-    get_current_time_schema, open_in_safari_schema, find_files_schema,
+    get_current_time_schema, open_in_browser_schema, find_files_schema,
     open_file_schema, read_file_schema, search_email_schema, read_email_schema, draft_new_email_schema, draft_reply_email_schema, send_email_schema, discard_draft_schema, archive_email_schema, trash_email_schema, mark_email_schema,
     recent_notifications_schema, run_javascript_schema,
     get_weather_schema, get_financial_info_schema, remember_schema,
@@ -3541,7 +3541,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
         x_search_schema,
         escalate_to_grok_schema,
         get_current_time_schema,
-        open_in_safari_schema,
+        open_in_browser_schema,
         find_files_schema,
         open_file_schema,
         read_file_schema,
