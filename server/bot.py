@@ -876,8 +876,9 @@ def _match_snippet(path: str, words: list[str]) -> str | None:
 async def find_files(params: FunctionCallParams):
     """Tool handler: search home-directory file contents via Spotlight (mdfind).
 
-    Content matches rank first; filename matches are a secondary signal
-    (both > content-only > name-only, then recency).
+    Results are ordered by recency (newest modification first); match quality
+    (content+name > content-only > name-only, documents over code) only
+    breaks ties between files touched at the same moment.
     """
     query = str(params.arguments.get("query", "")).strip()
     # "|" separates alternatives; within one alternative all words must match.
@@ -940,14 +941,15 @@ async def find_files(params: FunctionCallParams):
                 mtime = os.stat(p).st_mtime
             except OSError:
                 continue
-            # Content beats name-only; document types beat code regardless of age.
+            # Content beats name-only; document types beat code — but only as
+            # a tiebreaker: recency orders the list (newest first).
             score = (
                 (4 if p in content_set else 0)
                 + (2 if p in name_set else 0)
                 + (1 if os.path.splitext(p)[1].lower() in DOCUMENT_EXTENSIONS else 0)
             )
             out.append((score, mtime, p))
-        out.sort(reverse=True)
+        out.sort(key=lambda t: (t[1], t[0]), reverse=True)
         return out
 
     content_paths, name_paths = await asyncio.gather(
@@ -2211,8 +2213,9 @@ find_files_schema = FunctionSchema(
     name="find_files",
     description=(
         "Search the user's home directory for files by words in their content; "
-        "filename matches rank too (uses Spotlight). Returns paths with "
-        "modification dates and, where possible, a matching line from the file."
+        "filename matches rank too (uses Spotlight). Returns paths newest "
+        "first, with modification dates and, where possible, a matching line "
+        "from the file."
     ),
     properties={
         "query": {
