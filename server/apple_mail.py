@@ -448,7 +448,8 @@ end tell'''
         return boxes
 
     async def _scan_fast(self, terms: list[str], unread_only: bool,
-                         folder: str) -> tuple[list[dict], bool]:
+                         folder: str, offset: int = 0,
+                         ) -> tuple[list[dict], bool, int, bool]:
         """Keyword scan via whole-column dumps filtered in Python.
 
         Mail's `whose` predicate is the slow part of searching (3-5s on a
@@ -470,7 +471,10 @@ end tell'''
         Gmail accounts scan only INBOX + All Mail — every other Gmail
         "mailbox" is a label, i.e. a subset of All Mail.
 
-        Returns (rows, approximate) where rows match scan()'s shape.
+        Returns (rows, approximate, total, capped): rows match scan()'s shape
+        but hold only the matches that can appear on the requested page;
+        total is the full match count and capped says whether a mailbox hit
+        _PER_MAILBOX_CAP (i.e. total is a lower bound).
         """
         boxes: list[tuple[str, str, list, list, list, list]] | None = None
         if not folder and self._scan_snapshot:
@@ -513,7 +517,32 @@ end tell'''
                 picked = match(stems, True)
                 approximate = bool(picked)
         if not picked:
-            return [], False
+            return [], False, 0, False
+
+        # True match count and cap flag, before trimming. Gmail messages in
+        # the INBOX also match in All Mail and the rfc-dedup below can only
+        # merge rows whose details were fetched, so total may count those
+        # twice — a tolerable overcount for a paging hint.
+        box_hits: dict[int, int] = {}
+        for bi, _ in picked:
+            box_hits[bi] = box_hits.get(bi, 0) + 1
+        capped = any(v >= _PER_MAILBOX_CAP for v in box_hits.values())
+        total = len(picked)
+
+        # Only the newest offset+_MAX_RESULTS matches per mailbox can appear
+        # on the requested page (position order = date order), so only those
+        # need the per-message date/RFC fetch below. Paging deeper re-enters
+        # with a larger offset and fetches the next slice (details cache
+        # makes the already-fetched ones free).
+        want = max(0, offset) + _MAX_RESULTS
+        trimmed: list[tuple[int, int]] = []
+        taken: dict[int, int] = {}
+        for bi, i in picked:
+            t = taken.get(bi, 0)
+            if t < want:
+                trimmed.append((bi, i))
+                taken[bi] = t + 1
+        picked = trimmed
 
         # Phase 2: date received + RFC id for matches only — both immutable,
         # so cached hits skip Mail entirely. Uncached ones are addressed by
@@ -602,7 +631,7 @@ end tell'''
             elif (mbname.upper() == "INBOX"
                   and rows[prev]["mailbox"].upper() != "INBOX"):
                 rows[prev] = row  # prefer the Inbox-labelled copy (Gmail dupes)
-        return rows, approximate
+        return rows, approximate, total, capped
 
     async def search(self, query: str, unread_only: bool = False,
                      days: int | None = None, offset: int = 0,
@@ -610,6 +639,7 @@ end tell'''
                      folder: str = "") -> dict:
         terms = [t for t in str(query or "").split() if t]
         folder = str(folder or "").strip()
+        offset = max(0, int(offset or 0))
         base_conds: list[str] = []
         if unread_only:
             base_conds.append("read status is false")
@@ -765,10 +795,12 @@ end tell'''
         # path (see _scan_fast); date windows still need `whose` so the
         # per-mailbox cap applies after date filtering.
         approximate = False
+        fast_meta = None
         if terms and not (days and days > 0) and not date_conds:
             try:
-                rows, approximate = await self._scan_fast(terms, unread_only,
-                                                          folder)
+                rows, approximate, fast_total, fast_capped = (
+                    await self._scan_fast(terms, unread_only, folder, offset))
+                fast_meta = (fast_total, fast_capped)
             except RuntimeError as exc:
                 return {"error": f"could not search mail: {exc}"}
         else:
@@ -801,8 +833,7 @@ end tell'''
                     approximate = bool(rows)
 
         rows.sort(key=lambda r: r["iso"], reverse=True)
-        total = len(rows)
-        offset = max(0, int(offset or 0))
+        total = fast_meta[0] if fast_meta else len(rows)
         page = rows[offset:offset + _MAX_RESULTS]
 
         items = []
@@ -822,13 +853,16 @@ end tell'''
                 "account": r["account"],
             })
 
-        # A mailbox that emitted exactly the per-mailbox cap was probably
+        # A mailbox that matched exactly the per-mailbox cap was probably
         # truncated, so the total is a lower bound — say "N+" rather than "N".
-        per_box: dict[tuple, int] = {}
-        for r in rows:
-            k = (r["mailbox"], r["account"])
-            per_box[k] = per_box.get(k, 0) + 1
-        plus = "+" if any(v >= _PER_MAILBOX_CAP for v in per_box.values()) else ""
+        if fast_meta:
+            plus = "+" if fast_meta[1] else ""
+        else:
+            per_box: dict[tuple, int] = {}
+            for r in rows:
+                k = (r["mailbox"], r["account"])
+                per_box[k] = per_box.get(k, 0) + 1
+            plus = "+" if any(v >= _PER_MAILBOX_CAP for v in per_box.values()) else ""
         result = {"total_matched": f"{total}{plus}" if plus else total, "emails": items}
         if items:
             result["showing"] = (f"{offset + 1}-{offset + len(items)} of {total}{plus} "

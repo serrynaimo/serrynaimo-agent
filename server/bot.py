@@ -2384,6 +2384,63 @@ for _schema in (
 ):
     _schema._handler = _with_current_time(_schema.handler)  # noqa: SLF001 — handler property has no setter
 
+
+_INFLIGHT_TOOL_CALLS: dict[tuple[str, str], asyncio.Future] = {}
+
+
+def _dedup_inflight(handler):
+    """Attach a duplicate concurrent call (same tool, same arguments) to the
+    already-running one instead of executing it again.
+
+    The local model sometimes re-issues a tool call when the async 'running'
+    stub comes back as the tool result; without this, the duplicate doubles
+    the work and races the original. Scope is in-flight only — once the
+    first call has delivered its result, a repeated call runs normally.
+    """
+
+    async def wrapped(params):
+        key = (params.function_name,
+               json.dumps(params.arguments or {}, sort_keys=True, default=str))
+        fut = _INFLIGHT_TOOL_CALLS.get(key)
+        if fut is not None:
+            logger.info(f"{params.function_name} duplicate in-flight call — "
+                        "attaching to the running one")
+            result = await asyncio.shield(fut)
+            await params.result_callback(result)
+            return
+        fut = asyncio.get_running_loop().create_future()
+        _INFLIGHT_TOOL_CALLS[key] = fut
+        original = params.result_callback
+
+        async def callback(result, **kwargs):
+            props = kwargs.get("properties")
+            if getattr(props, "is_final", True) and not fut.done():
+                fut.set_result(result)
+            await original(result, **kwargs)
+
+        try:
+            await handler(_ParamsWithCallback(params, callback))
+        finally:
+            _INFLIGHT_TOOL_CALLS.pop(key, None)
+            if not fut.done():
+                # No final result (handler error or cancellation) — cancel any
+                # attached duplicates the same way the original ended.
+                fut.cancel()
+
+    return wrapped
+
+
+# Lookups only: a re-run lookup is pure waste, while state-changing tools
+# (send, archive, remember, …) keep their call-per-invocation semantics.
+for _schema in (
+    google_search_schema, x_web_search_schema, x_search_schema,
+    escalate_to_grok_schema, find_files_schema, read_file_schema,
+    search_email_schema, read_email_schema, search_local_schema,
+    recent_notifications_schema, get_weather_schema,
+    get_financial_info_schema, recall_schema, list_people_schema,
+):
+    _schema._handler = _dedup_inflight(_schema.handler)  # noqa: SLF001
+
 # Tool calls never cancel on generic interruptions: mid-speech barge-ins are
 # raw VAD (speaker unknown), so noise or other voices must not kill in-flight
 # work. The enrolled speaker's cancellation happens explicitly via the
