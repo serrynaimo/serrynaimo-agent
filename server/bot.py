@@ -186,6 +186,10 @@ SEED_ACTION_MEMORIES = [
     "so widen with fewer keywords, page with offset from the 'more' hint, and for a "
     "specific period pass date_from/date_to as YYYY-MM-DD — never years or dates as "
     "query keywords.",
+    "Broad lookups — find something, what do we know about X, where is that thing: "
+    "one search_local call checks memory, notifications, email, calendar, and files "
+    "together; add include_notes or include_contacts when Notes or Contacts might "
+    "hold it, then drill in with the matching source tool.",
     "When creating reminders they require the date in full, e.g. 'July 10, 2026 at 9:20 AM'"
 ]
 
@@ -1957,6 +1961,252 @@ recent_notifications_schema = FunctionSchema(
 )
 
 
+# --- search_local: one fan-out across every local source --------------------
+# Memories, notifications, email, calendar, and files are always searched;
+# Apple Notes and Contacts join on request (include_notes / include_contacts).
+# Sources run concurrently and fail alone — one broken source never sinks the
+# rest — and each result stays compact, pointing at the source's own tool for
+# the drill-down.
+
+_SEARCH_LOCAL_TIMEOUT = 30  # per source, seconds
+
+
+async def _captured(handler, arguments: dict) -> dict:
+    """Run an existing tool handler in-process and return what it reported."""
+    holder: dict = {}
+
+    class _Params:
+        def __init__(self):
+            self.arguments = arguments
+
+        async def result_callback(self, result, **_kwargs):
+            if isinstance(result, dict):
+                holder.update(result)
+
+    await handler(_Params())
+    return holder
+
+
+async def search_local(params: FunctionCallParams):
+    """Tool handler: combined lookup across memory, notifications, email,
+    calendar, and files — plus Apple Notes / Contacts on request."""
+    a = params.arguments
+    query = str(a.get("query") or "").strip()
+    if not query:
+        await params.result_callback({"error": "a query is required"})
+        return
+    keywords = query.split()
+    days = _mail_int(a.get("days"), 0) or None
+    logger.info(f"search_local query={query!r} days={days} "
+                f"notes={bool(a.get('include_notes'))} "
+                f"contacts={bool(a.get('include_contacts'))}")
+
+    async def _memories():
+        r = await _captured(recall, {"keywords": keywords})
+        m = r.get("memories")
+        return m if m and m != "no matching memories" else None
+
+    async def _notifications():
+        # Straight store call: unlike the recent_notifications tool this does
+        # NOT mark anything as reported — a broad lookup isn't reading them.
+        date_from = (datetime.now() - timedelta(days=days or 14)).strftime("%Y-%m-%d")
+        items = await asyncio.to_thread(
+            notif_store.search, query, date_from, None, False, 6)
+        now_ts = time.time()
+        return [
+            (it["app"] or "?")
+            + (f" / {it['title']}" if it["title"] else "")
+            + f": {str(it['text'])[:160]} ({_ago(now_ts - it['ts'])})"
+            for it in items
+        ] or None
+
+    async def _emails():
+        r = await mail.search(query=query, days=days)
+        emails = (r.get("emails") or [])[:6]
+        if not emails:
+            return None
+        lines = [
+            f"[{e['id']}] {e['from']} — {e['subject']} ({e['when']}, {e['folder']})"
+            for e in emails
+        ]
+        total = r.get("total_matched")
+        if isinstance(total, str) or (isinstance(total, int) and total > len(lines)):
+            lines.append(f"({total} matched in total — search_email pages through the rest)")
+        if r.get("approximate"):
+            lines.append("(approximate matches only — no exact hit for the query)")
+        return lines
+
+    async def _calendar():
+        # search_events matches its query as ONE substring, so a multi-word
+        # query would miss — also try each keyword, then dedupe the events.
+        queries = list(dict.fromkeys([query, *keywords[:3]]))
+        texts = await asyncio.gather(
+            *(call_mcp_tool("calendar", "search_events", {"query": q})
+              for q in queries),
+            return_exceptions=True,
+        )
+        errors = [t for t in texts if isinstance(t, Exception)]
+        if len(errors) == len(texts):
+            raise errors[0]
+        events, seen = [], set()
+        for text in texts:
+            if isinstance(text, Exception):
+                continue
+            cur = None
+            for line in str(text).splitlines():
+                line = line.strip()
+                if line.startswith("Title: "):
+                    cur = {"title": line[7:]}
+                    events.append(cur)
+                elif cur is None:
+                    continue
+                elif line.startswith("Start: "):
+                    cur["start"] = line[7:]
+                elif line.startswith("End: "):
+                    cur["end"] = line[5:]
+                elif line.startswith("Location: "):
+                    cur["loc"] = line[10:]
+        lines = []
+        for e in sorted(events, key=lambda e: e.get("start", "")):
+            key = (e["title"], e.get("start"))
+            if key in seen:
+                continue
+            seen.add(key)
+            lines.append(f"{e['title']}: {e.get('start', '?')} to {e.get('end', '?')}"
+                         + (f" at {e['loc']}" if e.get("loc") else ""))
+        return lines[:8] or None
+
+    async def _files():
+        r = await _captured(find_files, {"query": query})
+        f = r.get("files")
+        if not f or f == "no files found":
+            return None
+        if r.get("approximate"):
+            f += "\n(approximate matches — likely a spelling variant)"
+        return f
+
+    async def _notes():
+        # Long-term memory lives in the agent's own Notes folder — skip it
+        # here, the memories source already covers those.
+        agent_folder = (os.getenv("AGENT_NAME") or "").strip().lower()
+        queries = list(dict.fromkeys([query, *keywords[:2]]))
+        outs = await asyncio.gather(
+            *(call_mcp_tool("notes", "search_notes", {"query": q}) for q in queries),
+            return_exceptions=True,
+        )
+        errors = [o for o in outs if isinstance(o, Exception)]
+        if len(errors) == len(outs):
+            raise errors[0]
+        lines, seen = [], set()
+        for out in outs:
+            if isinstance(out, Exception):
+                continue
+            try:
+                notes = json.loads(out)
+            except (ValueError, TypeError):
+                continue
+            for n in notes if isinstance(notes, list) else []:
+                title = str(n.get("title") or "").strip()
+                folder = str(n.get("folder") or "").strip()
+                key = n.get("id") or (title, folder)
+                if not title or key in seen or folder.lower() == agent_folder:
+                    continue
+                seen.add(key)
+                lines.append(f"{title} ({folder})" if folder else title)
+        return lines[:8] or None
+
+    async def _contacts():
+        # Contacts match on the NAME only — each keyword gets its own pass.
+        queries = list(dict.fromkeys([query, *keywords[:3]]))
+        outs = await asyncio.gather(
+            *(call_mcp_tool("contacts", "search_contacts", {"query": q})
+              for q in queries),
+            return_exceptions=True,
+        )
+        errors = [o for o in outs if isinstance(o, Exception)]
+        if len(errors) == len(outs):
+            raise errors[0]
+        names = []
+        for out in outs:
+            if isinstance(out, Exception):
+                continue
+            try:
+                people = json.loads(out)
+            except (ValueError, TypeError):
+                continue
+            for p in people if isinstance(people, list) else []:
+                name = str(p.get("name") or "").strip()
+                if name and name not in names:
+                    names.append(name)
+        return names[:10] or None
+
+    fetchers = {
+        "memories": _memories,
+        "notifications": _notifications,
+        "emails": _emails,
+        "calendar": _calendar,
+        "files": _files,
+    }
+    if a.get("include_notes"):
+        fetchers["notes"] = _notes
+    if a.get("include_contacts"):
+        fetchers["contacts"] = _contacts
+
+    async def _run(name, fn):
+        try:
+            return name, await asyncio.wait_for(fn(), timeout=_SEARCH_LOCAL_TIMEOUT), None
+        except Exception as exc:  # noqa: BLE001 — a failed source must not sink the rest
+            logger.warning(f"search_local {name} failed: {exc}")
+            return name, None, str(exc)[:160]
+
+    triples = await asyncio.gather(*(_run(n, f) for n, f in fetchers.items()))
+    result: dict = {}
+    empty, failed = [], []
+    for name, value, err in triples:
+        if err:
+            failed.append(f"{name} ({err})")
+        elif value:
+            result[name] = value
+        else:
+            empty.append(name)
+    if empty:
+        result["nothing_in"] = ", ".join(empty)
+    if failed:
+        result["unavailable"] = ", ".join(failed)
+    if not any(k in result for k in fetchers):
+        result["note"] = ("nothing matched anywhere — keywords match literally, "
+                          "so try a shorter stem or a synonym, or one source's "
+                          "own search tool with different words")
+    await params.result_callback(result)
+
+
+search_local_schema = FunctionSchema(
+    name="search_local",
+    description=(
+        "ONE search across everything at once: memories, captured notifications, "
+        "email, calendar events, and files. Use it for broad lookups — 'find X', "
+        "'what do we know about X' — or when unsure where something lives. Set "
+        "include_notes / include_contacts to also search Apple Notes and "
+        "Contacts. Results are compact; drill into a source with its own tool "
+        "(recall, recent_notifications, read_email/search_email, search_events, "
+        "find_files/read_file)."
+    ),
+    properties={
+        "query": {"type": "string",
+                  "description": "Keywords — a name, topic, or phrase. Fewer words "
+                                 "search broader; no dates or years."},
+        "days": {"type": "integer",
+                 "description": "Optional: only email/notifications from the last "
+                                "N days (notifications default to 14)"},
+        "include_notes": {"type": "boolean", "description": "Also search Apple Notes"},
+        "include_contacts": {"type": "boolean",
+                             "description": "Also search Apple Contacts (matches names)"},
+    },
+    required=["query"],
+    handler=search_local,
+)
+
+
 find_files_schema = FunctionSchema(
     name="find_files",
     description=(
@@ -2127,7 +2377,7 @@ for _schema in (
     google_search_schema, x_web_search_schema, x_search_schema,
     escalate_to_grok_schema,
     open_in_browser_schema, find_files_schema, open_file_schema,
-    read_file_schema, search_email_schema, read_email_schema, save_attachment_schema, draft_email_schema, send_email_schema, discard_draft_schema, archive_email_schema, trash_email_schema, mark_email_schema, recent_notifications_schema,
+    read_file_schema, search_email_schema, read_email_schema, save_attachment_schema, draft_email_schema, send_email_schema, discard_draft_schema, archive_email_schema, trash_email_schema, mark_email_schema, search_local_schema, recent_notifications_schema,
     run_javascript_schema, get_weather_schema,
     remember_schema, recall_schema, forget_schema,
     add_person_schema, edit_person_schema, list_people_schema,
@@ -2142,7 +2392,7 @@ for _schema in (
     google_search_schema, x_web_search_schema, x_search_schema,
     escalate_to_grok_schema,
     get_current_time_schema, open_in_browser_schema, find_files_schema,
-    open_file_schema, read_file_schema, search_email_schema, read_email_schema, save_attachment_schema, draft_email_schema, send_email_schema, discard_draft_schema, archive_email_schema, trash_email_schema, mark_email_schema,
+    open_file_schema, read_file_schema, search_email_schema, read_email_schema, save_attachment_schema, draft_email_schema, send_email_schema, discard_draft_schema, archive_email_schema, trash_email_schema, mark_email_schema, search_local_schema,
     recent_notifications_schema, run_javascript_schema,
     get_weather_schema, get_financial_info_schema, remember_schema,
     recall_schema, forget_schema, add_person_schema, edit_person_schema,
@@ -2157,7 +2407,7 @@ NATIVE_TOOL_SCHEMAS = (
     google_search_schema, x_web_search_schema, x_search_schema,
     escalate_to_grok_schema,
     get_current_time_schema, open_in_browser_schema, find_files_schema,
-    open_file_schema, read_file_schema, search_email_schema, read_email_schema, save_attachment_schema, draft_email_schema, send_email_schema, discard_draft_schema, archive_email_schema, trash_email_schema, mark_email_schema,
+    open_file_schema, read_file_schema, search_email_schema, read_email_schema, save_attachment_schema, draft_email_schema, send_email_schema, discard_draft_schema, archive_email_schema, trash_email_schema, mark_email_schema, search_local_schema,
     recent_notifications_schema, run_javascript_schema,
     get_weather_schema, get_financial_info_schema, remember_schema,
     recall_schema, forget_schema, add_person_schema, edit_person_schema,
@@ -2843,10 +3093,13 @@ def build_system_prompt() -> str:
 
     "ANSWERING\n"
     "Relevant memories are previewed for you each turn, but that preview is partial — "
-    "for anything it lacks about a person, plan, or detail, quietly call 'recall' "
-    "before you answer.\n"
-    "If recall stays thin, keep climbing: recent_notifications, find_files for documents, search_email then "
-    "search_events for the calendar.\n"
+    "for a simple question, or before acting, quietly 'recall' what it lacks about a "
+    "person, plan, or detail.\n"
+    "For anything that means looking something up — find X, when/where is it, what do "
+    "we know about X — call search_local ONCE: it checks memory, notifications, email, "
+    "calendar, and files together (include_notes/include_contacts add those). Don't "
+    "chain the per-source search tools one after another; use a source's own tool only "
+    "to drill into a hit.\n"
     "Should you not find a person in memory, ask if you misheard the name or if it's someone you haven't heard about before, then add_person to store them with the context.\n"
     + _lazy_toolset_hint() +
     "Use run_javascript for any non-trivial math and speak only the result.\n\n"
@@ -3241,6 +3494,17 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
     except Exception as exc:  # noqa: BLE001
         logger.error(f"Memory (Notes) startup failed — running with whatever loaded: {exc}")
 
+    # Pre-warm the mail search column cache while models load, so the first
+    # search_email of the session skips the ~15s cold dump.
+    async def _mail_warmup():
+        try:
+            await mail.warmup()
+            logger.info("mail search cache pre-warmed")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"mail search cache warmup failed: {exc}")
+
+    _mail_warm = asyncio.create_task(_mail_warmup())
+
     # Speech-to-Text service — Qwen3-ASR, local via mlx-audio.
     # Speaker gating: with VOICE_ENROLL_AUDIO set, only the enrolled voice is
     # transcribed; everyone else is ignored.
@@ -3553,7 +3817,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
         find_files_schema,
         open_file_schema,
         read_file_schema,
-        search_email_schema, read_email_schema, save_attachment_schema, draft_email_schema, send_email_schema, discard_draft_schema, archive_email_schema, trash_email_schema, mark_email_schema,
+        search_email_schema, read_email_schema, save_attachment_schema, draft_email_schema, send_email_schema, discard_draft_schema, archive_email_schema, trash_email_schema, mark_email_schema, search_local_schema,
         recent_notifications_schema,
         run_javascript_schema,
         get_weather_schema,
