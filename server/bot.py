@@ -4124,6 +4124,19 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
             last = msgs[-1] if msgs else None
             role = last.get("role") if isinstance(last, dict) else None
             if role in ("tool", "developer") and not stt.bot_speaking():
+                # An async-tool "running" stub is NOT an orphaned answer: the
+                # tool is still in flight and its finished result will push
+                # its own context frame. Re-running against the dangling stub
+                # makes the model re-issue the call (often with reworded
+                # arguments the in-flight dedup can't match).
+                try:
+                    payload = json.loads(last.get("content") or "")
+                except (ValueError, TypeError):
+                    payload = {}
+                if (isinstance(payload, dict)
+                        and payload.get("type") == "async_tool"
+                        and payload.get("status") == "running"):
+                    return
                 logger.info("Resuming tool answer orphaned by a gate-dropped utterance")
                 await worker.queue_frames([LLMRunFrame()])
         finally:
