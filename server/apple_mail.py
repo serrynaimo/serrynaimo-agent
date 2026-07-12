@@ -1435,6 +1435,24 @@ end tell'''
         logger.info(f"archive_email id={sid}")
         clause = entry["clause"]
         script = f'''{_PRELUDE}{_find_handler(clause, entry["account"])}
+on stripSubject(t)
+	set t to t as text
+	repeat
+		set lt to t
+		try
+			ignoring case
+				if t starts with "re:" then set t to text 4 thru -1 of t
+				if t starts with "fwd:" then set t to text 5 thru -1 of t
+				if t starts with "fw:" then set t to text 4 thru -1 of t
+			end ignoring
+			repeat while t starts with " "
+				set t to text 2 thru -1 of t
+			end repeat
+		end try
+		if t is lt then exit repeat
+	end repeat
+	return t
+end stripSubject
 set srv to ""
 tell application "Mail"
 	set m to my findMsg()
@@ -1486,41 +1504,80 @@ set outcome to "ROWNOTFOUND"
 tell application "System Events" to tell process "Mail"
 	set theTable to missing value
 	set theWin to missing value
-	repeat with w in windows
-		try
-			set t to UI element 1 of UI element 1 of UI element 4 of splitter group 1 of w
-			if role of t is "AXTable" then
-				set theTable to t
-				set theWin to w
-				exit repeat
-			end if
-		end try
+	-- The message-list table lives in an inner AXSplitGroup of the viewer,
+	-- but its child index varies with window state (an All Inboxes viewer
+	-- lacks a static-text sibling a single-mailbox viewer has) — search by
+	-- role, never by position. Two passes: a freshly created viewer may
+	-- still be populating on the first.
+	repeat with attempt from 1 to 2
+		repeat with w in windows
+			try
+				set sg to splitter group 1 of w
+				repeat with c in UI elements of sg
+					if role of c is "AXSplitGroup" then
+						repeat with c2 in UI elements of c
+							if role of c2 is "AXScrollArea" then
+								set t to UI element 1 of c2
+								if role of t is "AXTable" then
+									set theTable to t
+									set theWin to w
+								end if
+								exit repeat
+							end if
+						end repeat
+						exit repeat
+					end if
+				end repeat
+			end try
+			if theTable is not missing value then exit repeat
+		end repeat
+		if theTable is not missing value then exit repeat
+		delay 1.0
 	end repeat
 	if theTable is missing value then
 		set outcome to "NOVIEWER"
 	else
 		perform action "AXRaise" of theWin
 		delay 0.4
+		set subjKey to my stripSubject(subj)
 		repeat with rw in rows of theTable
 			set hit to false
 			try
-				repeat with t in UI elements of UI element 1 of UI element 1 of rw
-					if role of t is "AXStaticText" and value of t is subj then
-						set hit to true
-						exit repeat
+				repeat with c in UI elements of UI element 1 of rw
+					if role of c is "AXStaticText" then
+						if my stripSubject(value of c) is subjKey then set hit to true
+					else
+						repeat with t in UI elements of c
+							if role of t is "AXStaticText" and my stripSubject(value of t) is subjKey then
+								set hit to true
+								exit repeat
+							end if
+						end repeat
 					end if
+					if hit then exit repeat
 				end repeat
 			end try
 			if hit then
 				set selected of rw to true
 				delay 0.4
 				set verified to (targetRfc is "")
+				set convCount to 1
 				if not verified then
+					-- A threaded row selects the whole conversation; accept it
+					-- when the target message is among the selection (archiving
+					-- the row then archives the visible thread, exactly as
+					-- Mail's own Archive does on a collapsed conversation).
 					tell application "Mail"
 						try
 							set selMsgs to selected messages of message viewer 1
-							if selMsgs is not missing value and (count of selMsgs) is 1 then
-								if message id of item 1 of selMsgs is targetRfc then set verified to true
+							if selMsgs is not missing value then
+								set convCount to count of selMsgs
+								repeat with sm in selMsgs
+									if (message id of sm) is targetRfc then
+										set verified to true
+										exit repeat
+									end if
+								end repeat
 							end if
 						end try
 					end tell
@@ -1568,7 +1625,10 @@ if frontProc is not "" and frontProc is not "Mail" then
 	end try
 end if
 if outcome is "CLICKED" then
-	if gone then return "OK" & subj
+	if gone then
+		if convCount > 1 then return "OKCONV" & subj
+		return "OK" & subj
+	end if
 	return "SLOWSYNC" & subj
 end if
 return outcome'''
@@ -1599,6 +1659,11 @@ return outcome'''
             return {"archived": True, "marked_read": True,
                     "subject": raw[len("SLOWSYNC"):] or entry.get("subject", ""),
                     "note": "archive issued; Gmail may take a moment to sync"}
+        if raw.startswith("OKCONV"):
+            return {"archived": True, "marked_read": True,
+                    "subject": raw[len("OKCONV"):] or entry.get("subject", ""),
+                    "note": "Mail shows this as a conversation, so the whole "
+                            "visible thread was archived with it"}
         if raw.startswith("OK"):
             return {"archived": True, "marked_read": True,
                     "subject": raw[len("OK"):] or entry.get("subject", "")}

@@ -2472,6 +2472,13 @@ NATIVE_TOOL_SCHEMAS = (
 )
 
 
+# Notification lines the announcer spoke aloud while the conversation was
+# idle, awaiting injection into the next user turn (see
+# MemoryInjector._inject_spoken_notifications). Bounded: only the freshest
+# few matter for "what was that?" follow-ups.
+_SPOKEN_NOTIFS: collections.deque = collections.deque(maxlen=8)
+
+
 # Conversational filler that makes useless memory-search keywords.
 _INJECT_STOPWORDS = {
     "that", "this", "with", "have", "what", "when", "where", "which", "your",
@@ -2672,6 +2679,10 @@ class MemoryInjector(FrameProcessor):
                 await self._inject_notifications()
             except Exception as exc:  # noqa: BLE001 — never block the utterance
                 logger.warning(f"Notification injection failed: {exc}")
+            try:
+                await self._inject_spoken_notifications()
+            except Exception as exc:  # noqa: BLE001 — never block the utterance
+                logger.warning(f"Spoken-notification injection failed: {exc}")
         await self.push_frame(frame, direction)
 
     async def _inject_time(self):
@@ -2775,6 +2786,33 @@ class MemoryInjector(FrameProcessor):
                     "role": "user",
                     "content": f"{mark} ({hint}):\n{lines}",
                 }],
+                run_llm=False,
+            )
+        )
+
+    async def _inject_spoken_notifications(self):
+        """Tell the model what it read aloud while idle. Proactive notification
+        announcements are spoken via a side LLM call and never enter the
+        conversation context, so without this note the user's next words
+        ("reply to that", "what was that about?") reference something the
+        model has never seen."""
+        if not _SPOKEN_NOTIFS:
+            return
+        lines = []
+        while _SPOKEN_NOTIFS:
+            item = _SPOKEN_NOTIFS.popleft()
+            when = datetime.fromtimestamp(item["ts"]).astimezone().strftime("%-I:%M %p")
+            lines.append(f"- [{when}] {item['line']}")
+        note = (
+            "<system-note>While the conversation was idle, you read these "
+            f"notifications aloud to {USER_NAME_SHORT} (his next words may refer "
+            "to them):\n" + "\n".join(lines) +
+            "\nInjected status, NOT something he said.</system-note>"
+        )
+        logger.info(f"Spoken-notification injection: {len(lines)} line(s)")
+        await self.push_frame(
+            LLMMessagesAppendFrame(
+                messages=[{"role": "user", "content": note}],
                 run_llm=False,
             )
         )
@@ -3455,6 +3493,10 @@ class NotificationAnnouncer:
                     self._store.mark_read(item["db_id"])   # spoken aloud = read
                 except Exception:  # noqa: BLE001
                     pass
+            # Buffer the spoken line so the next user turn's <system-note>
+            # tells the model what was announced (spoken lines never enter
+            # the conversation context directly).
+            _SPOKEN_NOTIFS.append({"ts": time.time(), "line": line})
             logger.info(f"Notification announced: [{line}]")
             self._cooldown_until = time.monotonic() + self._min_gap
 
