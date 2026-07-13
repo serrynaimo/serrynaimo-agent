@@ -3371,7 +3371,7 @@ class NotificationAnnouncer:
     """
 
     def __init__(self, *, stt, worker, memory, base_url, model, loop,
-                 min_gap=12.0, skip_gap=4.0, max_age=90.0, tick=0.7, allow=(), deny=(),
+                 min_gap=12.0, skip_gap=4.0, max_age=60.0, tick=0.7, allow=(), deny=(),
                  store=None):
         self._stt = stt
         self._worker = worker
@@ -4205,6 +4205,11 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
                 stt=stt, worker=worker, memory=memory, base_url=base_url, model=llm_model,
                 loop=asyncio.get_running_loop(),
                 min_gap=float(os.getenv("NOTIFY_MIN_GAP_SECS", "12")),
+                # Freshness window: a banner is only spoken if it appeared
+                # within this many seconds (capture time = when macOS showed
+                # it). Older ones stay silent but still land in the store,
+                # the unread dot, and the next turn's digest note.
+                max_age=float(os.getenv("NOTIFY_MAX_AGE_SECS", "60")),
                 allow=[a.strip().lower() for a in os.getenv("NOTIFY_ALLOW", "").split(",") if a.strip()],
                 deny=[d.strip().lower() for d in os.getenv("NOTIFY_DENY", "").split(",") if d.strip()],
                 store=notif_store,
