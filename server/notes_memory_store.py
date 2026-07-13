@@ -124,11 +124,26 @@ class NotesMemoryStore:
         return await self._call("notes", tool, args)
 
     async def _ensure_folders(self):
-        for f in (self._root, self._profiles, self._actions):
-            try:
-                await self._mcp("create_folder", {"name": f})
-            except Exception as exc:  # noqa: BLE001 — already-exists is fine
-                logger.debug(f"notes folder {f}: {exc}")
+        """Create the agent's folders only if missing, in one osascript.
+
+        This must NOT go through the MCP server's create_folder: Notes' `make
+        new folder` never errors on an existing name — it happily mints a second
+        folder with the SAME name, and every later read/write that says
+        `folder "X"` then resolves to an arbitrary one of the duplicates. The
+        existence check is what makes startup reuse the folders already in
+        iCloud instead of shadowing them.
+        """
+        script = f'''tell application "Notes"
+	repeat with fn in {self._folder_list_literal()}
+		if not (exists folder (fn as text)) then
+			make new folder with properties {{name:(fn as text)}}
+		end if
+	end repeat
+end tell'''
+        try:
+            await self._run_osascript(script)
+        except Exception as exc:  # noqa: BLE001 — memory still works read-only
+            logger.warning(f"notes ensure folders: {exc}")
 
     # ---- direct AppleScript (read paths) --------------------------------
     #
@@ -136,7 +151,8 @@ class NotesMemoryStore:
     # so a poll or a reload would spawn one osascript per folder (poll) or per
     # note (reload). Both the poll's "did anything change?" check and the batch
     # fetch below run their whole scan inside ONE osascript instead, driving
-    # Notes far less. Writes still go through the MCP server (see flush()).
+    # Notes far less. Note writes still go through the MCP server (see flush());
+    # folder creation is also direct osascript so it can check existence first.
 
     @staticmethod
     async def _run_osascript(script: str) -> str:
