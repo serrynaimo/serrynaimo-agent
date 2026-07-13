@@ -13,6 +13,13 @@ running entirely on-device:
 - LM Studio  (LLM)           OpenAI-compatible endpoint at http://localhost:1234/v1
 - Qwen3-TTS  (Text-to-Speech) via mlx-audio  -> services_local.Qwen3TTSService
 
+OMNI_LLM=1 swaps the LLM stage for an audio-native model the bot runs itself:
+llama.cpp's llama-server with Qwen3-Omni, which HEARS the gated utterance
+audio (LLM_AUDIO_INPUT is forced on) instead of only reading the ASR
+transcript. ASR still runs the speaker/wake gates and live captions, and
+Qwen3-TTS still speaks — llama.cpp runs the omni Thinker (text out), not the
+Talker (speech out).
+
 Requirements:
 - macOS on Apple Silicon (arm64)
 - LM Studio running locally with the model loaded and its server started
@@ -141,6 +148,12 @@ from services_local import (
 )
 
 load_dotenv(override=True)
+
+# OMNI_LLM=1 (llama.cpp serving Qwen3-Omni as the LLM) is what LLM_AUDIO_INPUT
+# was built for — the model hears; force the audio hand-off on. Must happen
+# before the STT service is constructed (it reads the flag at init).
+if os.getenv("OMNI_LLM", "0").strip().lower() in ("1", "true", "yes"):
+    os.environ["LLM_AUDIO_INPUT"] = "1"
 
 # Long-term memory lives in Apple Notes (folder = agent name). A SQLite
 # sidecar holds ids + recall stats (+ future caches). The old memories.db was
@@ -406,6 +419,110 @@ async def detect_lmstudio_context_window(base_url: str, model_id: str | None) ->
     except Exception as exc:  # noqa: BLE001
         logger.warning(f"Could not query LM Studio for the context window: {exc}")
     return None
+
+
+# --- Omni LLM: llama.cpp serving Qwen3-Omni (audio-native), OMNI_LLM=1 ---
+# The newest omni model with OPEN weights that runs locally — the Qwen3.5-Omni
+# tier (Plus/Flash/Light) is API-only so far. llama-server runs its Thinker
+# (audio+text in -> text out) with tool calling via --jinja; the Talker
+# (speech out) isn't supported by llama.cpp, so Qwen3-TTS keeps speaking.
+OMNI_LLM_DEFAULT_MODEL = "ggml-org/Qwen3-Omni-30B-A3B-Instruct-GGUF"
+
+
+def omni_llm_enabled() -> bool:
+    return os.getenv("OMNI_LLM", "0").strip().lower() in ("1", "true", "yes")
+
+
+def omni_llm_base_url() -> str:
+    return f"http://127.0.0.1:{int(os.getenv('OMNI_LLM_PORT', '8033'))}/v1"
+
+
+def _omni_health_url() -> str:
+    return omni_llm_base_url().rsplit("/v1", 1)[0] + "/health"
+
+
+def start_omni_server() -> None:
+    """Spawn llama-server with the omni model as a child of the bot.
+
+    Called once at startup, before the event loop. Non-blocking: sessions
+    poll omni_llm_ready() and fall back to LM Studio until the server is up.
+    A server already answering on the port (manual start, previous bot run)
+    is reused instead of spawned over.
+    """
+    import subprocess
+    import urllib.error
+    import urllib.request
+
+    try:
+        urllib.request.urlopen(_omni_health_url(), timeout=1)
+        logger.info("Omni LLM: reusing the llama-server already on the port")
+        return
+    except urllib.error.HTTPError:
+        # 503 = up but still loading the model — still a live server.
+        logger.info("Omni LLM: reusing the llama-server already on the port (still loading)")
+        return
+    except OSError:
+        pass  # nothing listening — spawn our own
+
+    binary = os.getenv("OMNI_LLM_BIN") or shutil.which("llama-server")
+    if not binary:
+        logger.error(
+            "OMNI_LLM=1 but llama-server was not found — `brew install llama.cpp` "
+            "or set OMNI_LLM_BIN; sessions will use LM Studio until it exists"
+        )
+        return
+    model = os.getenv("OMNI_LLM_MODEL", OMNI_LLM_DEFAULT_MODEL)
+    log_path = os.path.join(os.path.dirname(__file__), "omni-server.log")
+    # nice 10 for the same reason LM Studio is reniced: the voice pipeline
+    # (ASR/TTS) must win CPU contention. -hf downloads the GGUF and its mmproj
+    # audio encoder into llama.cpp's cache on first start (~18 GB).
+    cmd = [
+        "nice", "-n", "10", binary,
+        "-hf", model,
+        "--host", "127.0.0.1",
+        "--port", str(int(os.getenv("OMNI_LLM_PORT", "8033"))),
+        "--ctx-size", str(int(os.getenv("OMNI_LLM_CTX", "32768"))),
+        "--jinja",  # enables tool calling (Hermes-style, parsed server-side)
+        "-ngl", "99",
+    ]
+    log_file = open(log_path, "ab")
+    try:
+        proc = subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT)
+    except OSError as exc:
+        logger.error(f"Omni LLM: could not start llama-server: {exc}")
+        return
+    logger.info(f"Omni LLM: llama-server pid {proc.pid} starting {model} (log: {log_path})")
+
+    import atexit
+
+    def _stop():
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+
+    atexit.register(_stop)
+
+
+async def omni_llm_ready(wait_secs: float) -> bool:
+    """True once llama-server answers /health with 200 (model loaded)."""
+    deadline = time.monotonic() + wait_secs
+    url = _omni_health_url()
+    async with aiohttp.ClientSession() as session:
+        while True:
+            try:
+                async with session.get(
+                    url, timeout=aiohttp.ClientTimeout(total=2)
+                ) as response:
+                    if response.status == 200:
+                        return True
+            except Exception:  # noqa: BLE001 — not up yet
+                pass
+            if time.monotonic() >= deadline:
+                return False
+            await asyncio.sleep(2)
 
 
 def local_timezone_name() -> str:
@@ -3293,7 +3410,11 @@ async def run_text_chat(prompt: str, history: list, max_tool_rounds: int = 6) ->
     "messages" back as "history" for multi-turn conversations.
     """
     base_url = os.getenv("LMSTUDIO_BASE_URL", "http://localhost:1234/v1")
-    model = os.getenv("LMSTUDIO_MODEL") or await detect_lmstudio_model(base_url) or "qwen3.5-122b-a10b"
+    if omni_llm_enabled() and await omni_llm_ready(0):
+        base_url = omni_llm_base_url()
+        model = os.getenv("OMNI_LLM_MODEL", OMNI_LLM_DEFAULT_MODEL)
+    else:
+        model = os.getenv("LMSTUDIO_MODEL") or await detect_lmstudio_model(base_url) or "qwen3.5-122b-a10b"
     calendar_block, files_block = await asyncio.gather(
         _calendar_outlook_block(), _recent_files_block()
     )
@@ -3722,16 +3843,30 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
     tts.prime_phrases(FILLER_LINES)
     tts.prime_phrases([REFOCUS_LINE], publish_filler_wavs=False)
 
-    # LLM service — local LM Studio (OpenAI-compatible endpoint).
-    # Model selection: LMSTUDIO_MODEL if set, otherwise whatever is currently
-    # loaded in LM Studio (detected per session, so reconnecting after a model
+    # LLM service — the in-bot omni server when OMNI_LLM=1 (llama.cpp serving
+    # Qwen3-Omni, which hears the utterance audio), otherwise LM Studio.
+    # LM Studio model selection: LMSTUDIO_MODEL if set, otherwise whatever is
+    # currently loaded (detected per session, so reconnecting after a model
     # switch picks up the new one).
     base_url = os.getenv("LMSTUDIO_BASE_URL", "http://localhost:1234/v1")
-    llm_model = os.getenv("LMSTUDIO_MODEL") or await detect_lmstudio_model(base_url)
-    if not llm_model:
-        llm_model = "qwen3.5-122b-a10b"
-        logger.warning(f"No model detected in LM Studio; falling back to {llm_model}")
-    logger.info(f"LLM model for this session: {llm_model}")
+    omni_active = False
+    if omni_llm_enabled():
+        omni_active = await omni_llm_ready(float(os.getenv("OMNI_LLM_WAIT_SECS", "120")))
+        if omni_active:
+            base_url = omni_llm_base_url()
+            llm_model = os.getenv("OMNI_LLM_MODEL", OMNI_LLM_DEFAULT_MODEL)
+            logger.info(f"Omni LLM for this session: {llm_model} (hears utterance audio)")
+        else:
+            logger.warning(
+                "OMNI_LLM=1 but the omni server is not ready (still starting or "
+                "downloading?) — using LM Studio for this session"
+            )
+    if not omni_active:
+        llm_model = os.getenv("LMSTUDIO_MODEL") or await detect_lmstudio_model(base_url)
+        if not llm_model:
+            llm_model = "qwen3.5-122b-a10b"
+            logger.warning(f"No model detected in LM Studio; falling back to {llm_model}")
+        logger.info(f"LLM model for this session: {llm_model}")
 
     # Context-compression threshold. "auto" senses the loaded model's context
     # window from LM Studio and reserves ~16k for the tools array + template
@@ -3744,7 +3879,11 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
         context_max_tokens = None
         logger.info("Context compression disabled")
     elif raw_max in ("", "auto"):
-        window = await detect_lmstudio_context_window(base_url, llm_model)
+        if omni_active:
+            # llama-server has no load-state API; we chose the window ourselves.
+            window = int(os.getenv("OMNI_LLM_CTX", "32768"))
+        else:
+            window = await detect_lmstudio_context_window(base_url, llm_model)
         context_max_tokens = max(8000, (window or 32768) - 16000)
         logger.info(
             f"Context compression threshold: {context_max_tokens} tokens "
@@ -3752,22 +3891,23 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
         )
     else:
         context_max_tokens = int(raw_max)
+    # Best-effort reasoning suppression across models (voice needs low
+    # latency): chat_template_kwargs for Qwen-style templates (works when the
+    # server forwards it; qwen3.5's on-disk template is also patched),
+    # reasoning_effort for gpt-oss-style models. ThinkTagFilter guards the TTS.
+    # extra keys are passed as direct kwargs to the OpenAI SDK, so
+    # non-standard fields must be tunneled through the SDK's extra_body.
+    # reasoning_effort only goes to LM Studio — llama-server may reject
+    # request fields it doesn't know, and the omni Instruct model never thinks.
+    llm_extra = {"extra_body": {"chat_template_kwargs": {"enable_thinking": False}}}
+    if not omni_active:
+        llm_extra["reasoning_effort"] = os.getenv("LMSTUDIO_REASONING_EFFORT", "low")
     llm = LMStudioLLMService(
         base_url=base_url,
         api_key=os.getenv("LMSTUDIO_API_KEY", "lm-studio"),
         settings=OpenAILLMService.Settings(
             model=llm_model,
-            # Best-effort reasoning suppression across models (voice needs low
-            # latency): chat_template_kwargs for Qwen-style templates (works
-            # when LM Studio forwards it; qwen3.5's on-disk template is also
-            # patched), reasoning_effort for gpt-oss-style models. Unsupported
-            # fields are ignored server-side. ThinkTagFilter guards the TTS.
-            # extra keys are passed as direct kwargs to the OpenAI SDK, so
-            # non-standard fields must be tunneled through the SDK's extra_body.
-            extra={
-                "reasoning_effort": os.getenv("LMSTUDIO_REASONING_EFFORT", "low"),
-                "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
-            },
+            extra=llm_extra,
         ),
     )
 
@@ -4422,6 +4562,12 @@ if __name__ == "__main__":
     # LM Studio a step down. The MLX model threads set their own QoS.
     set_thread_qos_user_interactive()
     deprioritize_lmstudio()
+
+    # OMNI_LLM=1: bring up the audio-native LLM as part of the bot. Non-
+    # blocking — the model loads (or downloads) while the server binds;
+    # sessions fall back to LM Studio until it reports healthy.
+    if omni_llm_enabled():
+        start_omni_server()
 
     # Speaker-gate calibration UI at /calibration
     register_calibration(runner_run.app)
