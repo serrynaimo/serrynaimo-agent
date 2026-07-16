@@ -604,6 +604,28 @@ async def omni_llm_ready(wait_secs: float) -> bool:
             await asyncio.sleep(2)
 
 
+async def detect_openai_model(base_url: str) -> str | None:
+    """Model id from a generic OpenAI-compatible /v1/models endpoint.
+
+    Fallback for non-LM-Studio servers (llama-server, vLLM, ...) that lack
+    LM Studio's /api/v0/models REST API. llama-server answers with a
+    "models" list of {name, model, ...}; the OpenAI standard is a "data"
+    list of {id, ...} — accept either shape.
+    """
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{base_url}/models", timeout=aiohttp.ClientTimeout(total=5)
+            ) as response:
+                data = await response.json(content_type=None)
+        entries = data.get("data") or data.get("models") or []
+        ids = (m.get("id") or m.get("name") or m.get("model") for m in entries)
+        return next((i for i in ids if i), None)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"Could not query {base_url} for served models: {exc}")
+        return None
+
+
 def local_timezone_name() -> str:
     """Return the system's IANA timezone name (e.g. 'Asia/Singapore')."""
     try:
@@ -4020,8 +4042,12 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
     if not omni_active:
         llm_model = os.getenv("LMSTUDIO_MODEL") or await detect_lmstudio_model(base_url)
         if not llm_model:
+            # The endpoint may not be LM Studio at all (llama-server on
+            # another box) — the standard /v1/models works everywhere.
+            llm_model = await detect_openai_model(base_url)
+        if not llm_model:
             llm_model = "qwen3.5-122b-a10b"
-            logger.warning(f"No model detected in LM Studio; falling back to {llm_model}")
+            logger.warning(f"No model detected at {base_url}; falling back to {llm_model}")
         logger.info(f"LLM model for this session: {llm_model}")
 
     # Context-compression threshold. "auto" senses the loaded model's context
@@ -4060,9 +4086,16 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
     # or ':' and immediate EOS). Those sessions get cooler sampling instead,
     # because tool discipline on audio turns degrades at the server default
     # (~0.8).
-    audio_native = omni_active or os.getenv(
-        "LLM_AUDIO_INPUT", "omni"
-    ).strip().lower() in ("1", "true", "yes")
+    # Model-aware, not just mode-aware: an omni model served at the LM
+    # Studio endpoint (llama-server on another machine, say) must never
+    # receive the reasoning-suppression fields either — even in mode 0,
+    # where it only reads transcripts, enable_thinking=False derails its
+    # template into garbage ("user\n") and near-empty completions.
+    audio_native = (
+        omni_active
+        or os.getenv("LLM_AUDIO_INPUT", "omni").strip().lower() in ("1", "true", "yes")
+        or "omni" in (llm_model or "").lower()
+    )
     llm_extra = {}
     llm_settings = {"model": llm_model}
     if audio_native:
