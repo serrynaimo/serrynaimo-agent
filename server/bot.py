@@ -3057,8 +3057,18 @@ class AudioToLLMAttach(FrameProcessor):
                     },
                     {
                         "type": "text",
+                        # Tool-discipline nudge: on audio-conditioned turns
+                        # with a long context, small omni models answer from
+                        # guesswork instead of calling tools. An instruction
+                        # ADJACENT to the audio survives where the system
+                        # prompt (12k tokens back) gets ignored.
                         "text": f"[voice message — ASR transcript, may contain "
-                                f"mishearings: {audio['text']}]",
+                                f"mishearings: {audio['text']}]\n"
+                                "(If answering needs any information you'd have "
+                                "to look up — schedule, mail, memory, facts, "
+                                "live data — call the matching tool FIRST and "
+                                "answer only from its result, never from "
+                                "guesswork.)",
                     },
                 ]
                 logger.info("Attached utterance audio to the LLM turn")
@@ -3929,7 +3939,13 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
     # and enable_thinking=False derails Qwen3-Omni's chat template into
     # near-empty completions (a stray '\n' or ':' and immediate EOS).
     llm_extra = {}
-    if not omni_active:
+    llm_settings = {"model": llm_model}
+    if omni_active:
+        # Tool discipline: llama-server's default sampling (~0.8) makes the
+        # omni model's call-a-tool-vs-just-answer decision flaky on audio
+        # turns; cooler sampling keeps it honest.
+        llm_settings["temperature"] = float(os.getenv("OMNI_LLM_TEMPERATURE", "0.4"))
+    else:
         llm_extra = {
             "reasoning_effort": os.getenv("LMSTUDIO_REASONING_EFFORT", "low"),
             "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
@@ -3938,8 +3954,8 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
         base_url=base_url,
         api_key=os.getenv("LMSTUDIO_API_KEY", "lm-studio"),
         settings=OpenAILLMService.Settings(
-            model=llm_model,
             extra=llm_extra,
+            **llm_settings,
         ),
     )
 
