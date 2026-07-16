@@ -4215,7 +4215,10 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
         context.add_message(
             {
                 "role": "user",
-                "content": note + "\n\nGreet the user with a very short, casual hello. No introduction. Sometimes mention a personal detail.",
+                # Explicitly a no-tools turn: small models otherwise burn
+                # seconds on lookups (time, memory searches) before saying
+                # "hey" — the note above already has everything they need.
+                "content": note + "\n\nGreet the user with a very short, casual hello. No introduction. Sometimes mention a personal detail. Do NOT call any tools for this greeting — the note above already has everything you need; just speak.",
             }
         )
         await worker.queue_frames([LLMRunFrame()])
