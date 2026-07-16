@@ -88,6 +88,8 @@ from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.frames.frames import (
     Frame,
+    FunctionCallInProgressFrame,
+    FunctionCallResultFrame,
     LLMContextFrame,
     LLMFullResponseStartFrame,
     LLMMessagesAppendFrame,
@@ -1601,7 +1603,11 @@ def _read_file_sync(
         return _outline(path, text, lines, page_offsets, page_count, line_starts)
 
     # Keyword mode: merged excerpt windows around each match, with line anchors.
-    if keywords:
+    # An explicit line range WINS over keywords: the keyword hint tells the
+    # model to "expand an excerpt with start_line" and models keep the
+    # keywords in that follow-up call — if keywords still took precedence it
+    # would get the identical excerpts back and loop on the call forever.
+    if keywords and start_line is None:
         lowered = text.lower()
         spans = []
         for kw in keywords:
@@ -1740,7 +1746,8 @@ read_file_schema = FunctionSchema(
         "Read a document, PDF, or code file from the home directory. Output is "
         "capped per call — navigate to what you need: outline=true maps the structure "
         "with line numbers; keywords return excerpts around matches; "
-        "start_line/end_line read a range (negative start = from the end); "
+        "start_line/end_line read a range (negative start = from the end) "
+        "and take precedence over keywords; "
         "truncated responses include continue_from_line. Flow: outline or "
         "keywords first, then the relevant range. find_files locates files; "
         "open_file shows them on screen."
@@ -2681,10 +2688,65 @@ class LMStudioLLMService(OpenAILLMService):
 
     supports_developer_role = False
 
+    # A tool call repeated with byte-identical arguments returns the same
+    # result — from the third consecutive repeat it's a loop, not a retry.
+    REPEAT_CALL_LIMIT = 2
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._verbatim_parts: list[str] = []
         self._verbatim_consumed = True
+        self._last_call_key: str | None = None
+        self._repeat_call_count = 0
+
+    async def run_function_calls(self, function_calls):
+        """Brake for tool-call repetition loops (small models get stuck
+        re-issuing the identical call: same name, same arguments, identical
+        result, forever — burning a context-compression cycle per lap).
+        Blocked calls never execute; the model gets an error result telling
+        it to answer or change course. Applied only to single-call batches —
+        grouped parallel calls have their own completion bookkeeping.
+        """
+        if len(function_calls) == 1:
+            fc = function_calls[0]
+            try:
+                key = f"{fc.function_name}:{json.dumps(fc.arguments, sort_keys=True, default=str)}"
+            except (TypeError, ValueError):
+                key = f"{fc.function_name}:{fc.arguments!r}"
+            if key == self._last_call_key:
+                self._repeat_call_count += 1
+            else:
+                self._last_call_key, self._repeat_call_count = key, 1
+            if self._repeat_call_count > self.REPEAT_CALL_LIMIT:
+                logger.warning(
+                    f"Blocked repeat #{self._repeat_call_count} of tool call "
+                    f"{fc.function_name} with identical arguments"
+                )
+                await self.broadcast_frame(
+                    FunctionCallInProgressFrame,
+                    function_name=fc.function_name,
+                    tool_call_id=fc.tool_call_id,
+                    arguments=fc.arguments,
+                    cancel_on_interruption=False,
+                )
+                await self.broadcast_frame(
+                    FunctionCallResultFrame,
+                    function_name=fc.function_name,
+                    tool_call_id=fc.tool_call_id,
+                    arguments=fc.arguments,
+                    result={
+                        "error": (
+                            "You already made this exact call and the result "
+                            "will not change. Do NOT repeat it. Answer the "
+                            "user with what you have, or make a genuinely "
+                            "different call (other arguments or another tool)."
+                        )
+                    },
+                )
+                return
+        else:
+            self._last_call_key, self._repeat_call_count = None, 0
+        await super().run_function_calls(function_calls)
 
     async def push_frame(self, frame, direction=FrameDirection.DOWNSTREAM):
         if isinstance(frame, LLMFullResponseStartFrame):
