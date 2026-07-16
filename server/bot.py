@@ -2745,6 +2745,13 @@ class LMStudioLLMService(OpenAILLMService):
         self._last_call_key: str | None = None
         self._repeat_call_count = 0
 
+    def reset_repeat_call_guard(self):
+        """Called on every genuine user turn: a fresh request is never a
+        loop, even when it repeats an earlier call exactly (a second
+        'what time is it?' re-runs get_current_time with the same empty
+        arguments). Only repetition WITHIN one tool chain counts."""
+        self._last_call_key, self._repeat_call_count = None, 0
+
     async def run_function_calls(self, function_calls):
         """Brake for tool-call repetition loops (small models get stuck
         re-issuing the identical call: same name, same arguments, identical
@@ -4084,6 +4091,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
         stub with no result, and the model silently drops whatever it had
         promised to do ("I'll check" ... nothing). Context-only note, never
         shown or spoken."""
+        llm.reset_repeat_call_guard()  # a new user turn is never a loop
         had_work = bool(llm._function_call_tasks)  # noqa: SLF001
         for name in list(llm._functions.keys()):  # noqa: SLF001
             await llm._cancel_function_call(name)  # noqa: SLF001
