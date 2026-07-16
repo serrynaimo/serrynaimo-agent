@@ -484,7 +484,9 @@ def start_omni_server() -> None:
     log_path = os.path.join(os.path.dirname(__file__), "omni-server.log")
     # nice 10 for the same reason LM Studio is reniced: the voice pipeline
     # (ASR/TTS) must win CPU contention. -hf downloads the GGUF and its mmproj
-    # audio encoder into llama.cpp's cache on first start (~18 GB).
+    # audio encoder into the huggingface hub cache on first start (~18 GB);
+    # llama-server prints no progress to a log file, so omni_llm_ready()'s
+    # heartbeat reports the cache size instead.
     cmd = [
         "nice", "-n", "10", binary,
         "-hf", model,
@@ -514,6 +516,43 @@ def start_omni_server() -> None:
                 proc.kill()
 
     atexit.register(_stop)
+
+
+def _omni_download_size_gb() -> float:
+    """GB of omni weights downloaded so far (in-progress partials included).
+
+    Current llama.cpp downloads -hf models into the huggingface hub cache
+    ($HF_HUB_CACHE, else $HF_HOME/hub, else ~/.cache/huggingface/hub) under
+    models--<org>--<repo>; older builds used $LLAMA_CACHE (default
+    ~/Library/Caches/llama.cpp on macOS, ~/.cache/llama.cpp on Linux).
+    Sums whichever exists so the startup heartbeat can show real progress —
+    llama-server itself prints no download progress when logging to a file.
+    """
+    import sys
+
+    model = os.getenv("OMNI_LLM_MODEL", OMNI_LLM_DEFAULT_MODEL)
+    hf_home = os.getenv("HF_HOME") or os.path.expanduser("~/.cache/huggingface")
+    hub = os.getenv("HF_HUB_CACHE") or os.path.join(hf_home, "hub")
+    hub_model_dir = os.path.join(hub, "models--" + model.replace("/", "--"))
+    legacy = os.getenv("LLAMA_CACHE")
+    if not legacy:
+        if sys.platform == "darwin":
+            legacy = os.path.expanduser("~/Library/Caches/llama.cpp")
+        else:
+            xdg = os.getenv("XDG_CACHE_HOME", os.path.expanduser("~/.cache"))
+            legacy = os.path.join(xdg, "llama.cpp")
+    total = 0
+    for cache in (hub_model_dir, legacy):
+        try:
+            for root, _dirs, files in os.walk(cache):
+                for name in files:
+                    try:
+                        total += os.path.getsize(os.path.join(root, name))
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+    return total / 1e9
 
 
 async def omni_llm_ready(wait_secs: float) -> bool:
@@ -551,10 +590,17 @@ async def omni_llm_ready(wait_secs: float) -> bool:
                 return False
             if time.monotonic() - last_note >= 15:
                 last_note = time.monotonic()
-                logger.info(
-                    "Omni LLM: waiting for llama-server to finish starting "
-                    "(first run downloads ~18 GB of weights, then the model loads)"
-                )
+                cached_gb = _omni_download_size_gb()
+                if cached_gb < 17.5:
+                    logger.info(
+                        f"Omni LLM: downloading weights — {cached_gb:.1f} GB "
+                        "of ~18 GB in the llama.cpp cache so far"
+                    )
+                else:
+                    logger.info(
+                        "Omni LLM: weights downloaded, waiting for the model "
+                        "to load into memory"
+                    )
             await asyncio.sleep(2)
 
 
