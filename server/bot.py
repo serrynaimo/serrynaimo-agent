@@ -10,18 +10,21 @@ This bot uses a cascade pipeline: Speech-to-Text → LLM → Text-to-Speech,
 running entirely on-device:
 
 - Qwen3-ASR  (Speech-to-Text) via mlx-audio  -> services_local.Qwen3ASRSTTService
-- LM Studio  (LLM)           OpenAI-compatible endpoint at http://localhost:1234/v1
+- Qwen3-Omni (LLM — hears the gated utterance audio) via llama.cpp's
+  llama-server, started and managed by the bot (default, LLM_AUDIO_INPUT=omni)
 - Qwen3-TTS  (Text-to-Speech) via mlx-audio  -> services_local.Qwen3TTSService
 
-LLM_AUDIO_INPUT=omni swaps the LLM stage for an audio-native model the bot
-runs itself: llama.cpp's llama-server with Qwen3-Omni, which HEARS the gated
-utterance audio instead of only reading the ASR transcript. ASR still runs
-the speaker/wake gates and live captions, and Qwen3-TTS still speaks —
-llama.cpp runs the omni Thinker (text out), not the Talker (speech out).
+LLM_AUDIO_INPUT=0 swaps the LLM stage for LM Studio (OpenAI-compatible
+endpoint at http://localhost:1234/v1): a bigger text-only model that reads
+the ASR transcript instead of hearing — stronger tool orchestration, deaf
+to tone. Either way ASR runs the speaker/wake gates and live captions, and
+Qwen3-TTS speaks — llama.cpp runs the omni Thinker (text out), not the
+Talker (speech out).
 
 Requirements:
 - macOS on Apple Silicon (arm64)
-- LM Studio running locally with the model loaded and its server started
+- llama.cpp (`brew install llama.cpp`) for the default omni brain, or
+  LM Studio running locally with a model loaded (LLM_AUDIO_INPUT=0)
 
 Run the bot using::
 
@@ -429,10 +432,10 @@ _OMNI_SERVER: dict = {"state": "none", "proc": None}
 
 
 def omni_llm_enabled() -> bool:
-    # One knob, three states: LLM_AUDIO_INPUT=0 (transcript only), 1 (attach
-    # audio to the configured endpoint), omni (also run the omni server and
-    # use it as the LLM). "omni" counts as truthy for the STT's audio stash.
-    return os.getenv("LLM_AUDIO_INPUT", "0").strip().lower() == "omni"
+    # One knob, three states: omni (default — run the omni server and use it
+    # as the LLM), 0 (LM Studio reads transcripts only), 1 (attach audio to
+    # the LM Studio endpoint). "omni" counts as truthy for the STT's audio stash.
+    return os.getenv("LLM_AUDIO_INPUT", "omni").strip().lower() == "omni"
 
 
 def omni_llm_base_url() -> str:

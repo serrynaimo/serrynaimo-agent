@@ -562,7 +562,7 @@ class Qwen3ASRSTTService(SegmentedSTTService):
         # audio-native LLM (e.g. Qwen3-Omni) instead of only the transcript.
         # ("omni" additionally makes the bot run Qwen3-Omni itself — bot.py.)
         self._llm_audio_input = (
-            os.getenv("LLM_AUDIO_INPUT", "0").strip().lower()
+            os.getenv("LLM_AUDIO_INPUT", "omni").strip().lower()
             in ("1", "true", "yes", "omni")
         )
         self._llm_audio: dict | None = None

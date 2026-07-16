@@ -1,6 +1,6 @@
 # Serry - Voice Agent for Mac
 
-**Serry is a  helpful, ethereal, LOCAL AI voice agent for Mac** — happiest on an Apple Silicon machine with **more than 96 GB of unified memory**.
+**Serry is a  helpful, ethereal, LOCAL AI voice agent for Mac** — runs on an Apple Silicon machine with **32 GB of unified memory** or more.
 
 ![Serry](serry-story.png)
 
@@ -17,7 +17,7 @@ She lives on your computer, sees your world — your files, mail, calendar, noti
 
 ## How she does it
 
-- **Offline by default**, thinking with a local model running in [LM Studio](https://lmstudio.ai) (Best with Qwen3.5 110B)
+- **Offline by default**, thinking with **Qwen3-Omni** — a local model that *hears your actual voice*, tone and all, run automatically by the bot via [llama.cpp](https://github.com/ggml-org/llama.cpp). On a big Mac you can swap in a much larger brain via [LM Studio](https://lmstudio.ai) instead (best with Qwen3.5 110B)
 - **Learns your voice**, so she only ever answers *you* — you can even teach her which other voices (a housemate, the TV) to ignore
 - Answers to her name: *"Serry, can you…"* or *"…, Serry"* — then keeps listening for a moment so you can carry on without repeating it
 - **Responsive, high-quality speech**, back and forth, turn by turn
@@ -30,9 +30,9 @@ Built on [Pipecat](https://github.com/pipecat-ai/pipecat), the open-source frame
 
 ## What you'll need
 
-- A Mac with **Apple Silicon** and, ideally, **more than 96 GB of unified memory** — that headroom is what lets the big local model, the speech models, and everything else run smoothly at once. Less memory still works with a smaller model, just less capably.
+- A Mac with **Apple Silicon** and **32 GB of unified memory** or more. 32 GB runs the default brain, if snugly — close your other memory-hungry apps; 48 GB is comfortable; **96 GB+** lets you swap in a much bigger LM Studio brain (see below).
 - A microphone (the built-in one is fine)
-- **[LM Studio](https://lmstudio.ai)** — this is what runs Serry's "brain" locally
+- **[Homebrew](https://brew.sh)** with **llama.cpp** (`brew install llama.cpp`) — this is what runs Serry's "brain"
 - **[uv](https://docs.astral.sh/uv/)** and **Node.js** — used to install and run everything
 
 You don't need any accounts or API keys to get going. A few optional online features (deeper web search, live stock prices, a cloud model to escalate to) can be switched on later by adding keys — more on that below.
@@ -44,23 +44,15 @@ You don't need any accounts or API keys to get going. A few optional online feat
 ### 1. Get the code and install
 
 ```bash
+brew install llama.cpp
 git clone https://github.com/serrynaimo/serrynaimo-agent.git
 cd serrynaimo-agent/server
 uv sync
 ```
 
-The first run also downloads Serry's speech models (about 7 GB), so give it a minute.
+That's the whole brain setup — Serry starts and manages her own model (**Qwen3-Omni**, via llama.cpp) when you run her. No separate app to install or server to click through.
 
-### 2. Set up her brain (LM Studio)
-
-1. Install **[LM Studio](https://lmstudio.ai)**.
-2. Download a capable model — **Qwen3.5 110B-A10B** is the current favourite on a 96 GB+ Mac. Something smaller probably works, but can be frustrating at times.
-3. Load it, then start LM Studio's **local server** (Developer → Start Server).
-4. In the model's settings, turn **off** reasoning (thinking) parsing. Serry manages the model's reasoning herself, and letting LM Studio split out the "thinking" section can garble or slow her spoken replies.
-
-Serry automatically uses whichever model you've loaded — you don't have to name it anywhere.
-
-### 3. Introduce yourself
+### 2. Introduce yourself
 
 Copy the example settings file and open it:
 
@@ -79,23 +71,38 @@ USER_NAME_SHORT=Jane
 
 Everything else has a sensible default. If you later want the optional online extras, this same file is where you'd paste in the relevant keys (each is labelled with what it unlocks).
 
-### 4. Run the bot server
+### 3. Run the bot server
 
 ```bash
 uv run bot.py
 ```
 
+The **first start downloads her models** — about 7 GB of speech models plus about 18 GB for the brain — so give it a while; she stays quiet until the brain is up, and the log keeps you posted. Every start after that takes seconds.
+
 Open the link it prints, allow the microphone when macOS asks, and say hello. The first time she checks your mail, calendar, or notifications, macOS will ask permission for those too — just allow it.
 
 She looks her best in **Chrome's fullscreen mode on a dedicated monitor** — the glowing orb becomes an ambient presence on your desk, always a wake-word away.
 
-### 5. Teach her your voice and introduce
+### 4. Teach her your voice and introduce
 
 So Serry answers only you, open the **calibration** page at **[http://localhost:7860/calibration](http://localhost:7860/calibration)**. Record yourself a few times, and — just as importantly — record a few voices to *ignore*: someone else in the room, a podcast, the TV. She'll tune herself to you automatically. That's it.
 
-### 6. Open her in your browser
+### 5. Open her in your browser
 
 Point a browser at **[http://localhost:7860/serrynaimo](http://localhost:7860/serrynaimo)** to meet her — the glowing orb and her controls. This is the address to open in Chrome's fullscreen mode on a dedicated monitor.
+
+---
+
+## Swap in a bigger brain (optional)
+
+By default Serry thinks with **Qwen3-Omni**, a model that *listens to your actual voice* — tone, hesitation, mood — instead of just reading a transcript. On a **96 GB+ Mac** you can trade that hearing for considerably more brainpower:
+
+1. Install **[LM Studio](https://lmstudio.ai)**.
+2. Download a capable model — **Qwen3.5 110B-A10B** is the current favourite. Load it, then start LM Studio's **local server** (Developer → Start Server).
+3. In the model's settings, turn **off** reasoning (thinking) parsing. Serry manages the model's reasoning herself, and letting LM Studio split out the "thinking" section can garble or slow her spoken replies.
+4. In your `.env`, set `LLM_AUDIO_INPUT=0`.
+
+Serry automatically uses whichever model you've loaded — you don't have to name it anywhere. In this mode she reads what you said rather than hearing how you said it, but the bigger model is a noticeably stronger reasoner and tool user.
 
 ---
 
@@ -262,6 +269,6 @@ Restart her, and she'll take on the new voice. (A rich, varied sentence with lot
 
 ## Credits & license
 
-Built on [Pipecat](https://github.com/pipecat-ai/pipecat) for the voice pipeline, local speech models running on Apple's MLX, and a local model served by [LM Studio](https://lmstudio.ai).
+Built on [Pipecat](https://github.com/pipecat-ai/pipecat) for the voice pipeline, local speech models running on Apple's MLX, and a local brain served by [llama.cpp](https://github.com/ggml-org/llama.cpp) (Qwen3-Omni) or, optionally, [LM Studio](https://lmstudio.ai).
 
 Licensed under the [Apache License 2.0](LICENSE). Copyright © 2026 Thomas Gorissen.
