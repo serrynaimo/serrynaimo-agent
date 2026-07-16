@@ -421,6 +421,12 @@ async def detect_lmstudio_context_window(base_url: str, model_id: str | None) ->
 # (speech out) isn't supported by llama.cpp, so Qwen3-TTS keeps speaking.
 OMNI_LLM_DEFAULT_MODEL = "ggml-org/Qwen3-Omni-30B-A3B-Instruct-GGUF"
 
+# What start_omni_server() ended up with: "none" (missing binary / spawn
+# failure), "spawned" (our child, proc kept for liveness checks), or
+# "reused" (a server already owned the port). Lets omni_llm_ready() fail
+# fast instead of burning the full session wait when there is no server.
+_OMNI_SERVER: dict = {"state": "none", "proc": None}
+
 
 def omni_llm_enabled() -> bool:
     # One knob, three states: LLM_AUDIO_INPUT=0 (transcript only), 1 (attach
@@ -452,10 +458,12 @@ def start_omni_server() -> None:
     try:
         urllib.request.urlopen(_omni_health_url(), timeout=1)
         logger.info("Omni LLM: reusing the llama-server already on the port")
+        _OMNI_SERVER["state"] = "reused"
         return
     except urllib.error.HTTPError:
         # 503 = up but still loading the model — still a live server.
         logger.info("Omni LLM: reusing the llama-server already on the port (still loading)")
+        _OMNI_SERVER["state"] = "reused"
         return
     except OSError:
         pass  # nothing listening — spawn our own
@@ -488,6 +496,7 @@ def start_omni_server() -> None:
         logger.error(f"Omni LLM: could not start llama-server: {exc}")
         return
     logger.info(f"Omni LLM: llama-server pid {proc.pid} starting {model} (log: {log_path})")
+    _OMNI_SERVER.update(state="spawned", proc=proc)
 
     import atexit
 
@@ -503,21 +512,44 @@ def start_omni_server() -> None:
 
 
 async def omni_llm_ready(wait_secs: float) -> bool:
-    """True once llama-server answers /health with 200 (model loaded)."""
+    """True once llama-server answers /health with 200 (model loaded).
+
+    Fails fast — no full wait — when there is no server to wait for: the
+    binary was missing / the spawn failed, or our child exited (crash,
+    out-of-disk mid-download; see omni-server.log). Logs a heartbeat while
+    waiting so a first-run download doesn't read as a startup hang.
+    """
     deadline = time.monotonic() + wait_secs
     url = _omni_health_url()
+    last_note = time.monotonic()
     async with aiohttp.ClientSession() as session:
         while True:
+            proc = _OMNI_SERVER.get("proc")
+            if proc is not None and proc.poll() is not None:
+                logger.error(
+                    f"Omni LLM: llama-server exited with code {proc.returncode} "
+                    "— see omni-server.log"
+                )
+                return False
             try:
                 async with session.get(
                     url, timeout=aiohttp.ClientTimeout(total=2)
                 ) as response:
                     if response.status == 200:
                         return True
-            except Exception:  # noqa: BLE001 — not up yet
+            except aiohttp.ClientConnectionError:
+                if _OMNI_SERVER["state"] == "none":
+                    return False  # nothing listening and nothing starting
+            except Exception:  # noqa: BLE001 — not up yet (503 while loading)
                 pass
             if time.monotonic() >= deadline:
                 return False
+            if time.monotonic() - last_note >= 15:
+                last_note = time.monotonic()
+                logger.info(
+                    "Omni LLM: waiting for llama-server to finish starting "
+                    "(first run downloads ~18 GB of weights, then the model loads)"
+                )
             await asyncio.sleep(2)
 
 
