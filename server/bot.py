@@ -13,12 +13,11 @@ running entirely on-device:
 - LM Studio  (LLM)           OpenAI-compatible endpoint at http://localhost:1234/v1
 - Qwen3-TTS  (Text-to-Speech) via mlx-audio  -> services_local.Qwen3TTSService
 
-OMNI_LLM=1 swaps the LLM stage for an audio-native model the bot runs itself:
-llama.cpp's llama-server with Qwen3-Omni, which HEARS the gated utterance
-audio (LLM_AUDIO_INPUT is forced on) instead of only reading the ASR
-transcript. ASR still runs the speaker/wake gates and live captions, and
-Qwen3-TTS still speaks — llama.cpp runs the omni Thinker (text out), not the
-Talker (speech out).
+LLM_AUDIO_INPUT=omni swaps the LLM stage for an audio-native model the bot
+runs itself: llama.cpp's llama-server with Qwen3-Omni, which HEARS the gated
+utterance audio instead of only reading the ASR transcript. ASR still runs
+the speaker/wake gates and live captions, and Qwen3-TTS still speaks —
+llama.cpp runs the omni Thinker (text out), not the Talker (speech out).
 
 Requirements:
 - macOS on Apple Silicon (arm64)
@@ -148,12 +147,6 @@ from services_local import (
 )
 
 load_dotenv(override=True)
-
-# OMNI_LLM=1 (llama.cpp serving Qwen3-Omni as the LLM) is what LLM_AUDIO_INPUT
-# was built for — the model hears; force the audio hand-off on. Must happen
-# before the STT service is constructed (it reads the flag at init).
-if os.getenv("OMNI_LLM", "0").strip().lower() in ("1", "true", "yes"):
-    os.environ["LLM_AUDIO_INPUT"] = "1"
 
 # Long-term memory lives in Apple Notes (folder = agent name). A SQLite
 # sidecar holds ids + recall stats (+ future caches). The old memories.db was
@@ -421,7 +414,7 @@ async def detect_lmstudio_context_window(base_url: str, model_id: str | None) ->
     return None
 
 
-# --- Omni LLM: llama.cpp serving Qwen3-Omni (audio-native), OMNI_LLM=1 ---
+# --- Omni LLM: llama.cpp serving Qwen3-Omni, LLM_AUDIO_INPUT=omni ---
 # The newest omni model with OPEN weights that runs locally — the Qwen3.5-Omni
 # tier (Plus/Flash/Light) is API-only so far. llama-server runs its Thinker
 # (audio+text in -> text out) with tool calling via --jinja; the Talker
@@ -430,7 +423,10 @@ OMNI_LLM_DEFAULT_MODEL = "ggml-org/Qwen3-Omni-30B-A3B-Instruct-GGUF"
 
 
 def omni_llm_enabled() -> bool:
-    return os.getenv("OMNI_LLM", "0").strip().lower() in ("1", "true", "yes")
+    # One knob, three states: LLM_AUDIO_INPUT=0 (transcript only), 1 (attach
+    # audio to the configured endpoint), omni (also run the omni server and
+    # use it as the LLM). "omni" counts as truthy for the STT's audio stash.
+    return os.getenv("LLM_AUDIO_INPUT", "0").strip().lower() == "omni"
 
 
 def omni_llm_base_url() -> str:
@@ -467,7 +463,7 @@ def start_omni_server() -> None:
     binary = os.getenv("OMNI_LLM_BIN") or shutil.which("llama-server")
     if not binary:
         logger.error(
-            "OMNI_LLM=1 but llama-server was not found — `brew install llama.cpp` "
+            "LLM_AUDIO_INPUT=omni but llama-server was not found — `brew install llama.cpp` "
             "or set OMNI_LLM_BIN; sessions will use LM Studio until it exists"
         )
         return
@@ -3843,7 +3839,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
     tts.prime_phrases(FILLER_LINES)
     tts.prime_phrases([REFOCUS_LINE], publish_filler_wavs=False)
 
-    # LLM service — the in-bot omni server when OMNI_LLM=1 (llama.cpp serving
+    # LLM service — the in-bot omni server when LLM_AUDIO_INPUT=omni (llama.cpp serving
     # Qwen3-Omni, which hears the utterance audio), otherwise LM Studio.
     # LM Studio model selection: LMSTUDIO_MODEL if set, otherwise whatever is
     # currently loaded (detected per session, so reconnecting after a model
@@ -3858,7 +3854,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
             logger.info(f"Omni LLM for this session: {llm_model} (hears utterance audio)")
         else:
             logger.warning(
-                "OMNI_LLM=1 but the omni server is not ready (still starting or "
+                "LLM_AUDIO_INPUT=omni but the omni server is not ready (still starting or "
                 "downloading?) — using LM Studio for this session"
             )
     if not omni_active:
@@ -4563,7 +4559,7 @@ if __name__ == "__main__":
     set_thread_qos_user_interactive()
     deprioritize_lmstudio()
 
-    # OMNI_LLM=1: bring up the audio-native LLM as part of the bot. Non-
+    # LLM_AUDIO_INPUT=omni: bring up the audio-native LLM as part of the bot. Non-
     # blocking — the model loads (or downloads) while the server binds;
     # sessions fall back to LM Studio until it reports healthy.
     if omni_llm_enabled():

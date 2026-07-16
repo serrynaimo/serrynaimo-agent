@@ -557,11 +557,13 @@ class Qwen3ASRSTTService(SegmentedSTTService):
         # Per-utterance: whether the wake word has been heard yet in this turn's
         # partials. Once true, the give-up timer is disarmed for the turn.
         self._utterance_wake_seen = False
-        # LLM_AUDIO_INPUT=1: after ALL gates pass (speaker, wake, mute),
-        # stash the utterance audio so the pipeline can hand it to an
+        # LLM_AUDIO_INPUT=1 or omni: after ALL gates pass (speaker, wake,
+        # mute), stash the utterance audio so the pipeline can hand it to an
         # audio-native LLM (e.g. Qwen3-Omni) instead of only the transcript.
+        # ("omni" additionally makes the bot run Qwen3-Omni itself — bot.py.)
         self._llm_audio_input = (
-            os.getenv("LLM_AUDIO_INPUT", "0").strip().lower() in ("1", "true", "yes")
+            os.getenv("LLM_AUDIO_INPUT", "0").strip().lower()
+            in ("1", "true", "yes", "omni")
         )
         self._llm_audio: dict | None = None
         # Session-reset fence: utterances that STARTED before this stamp are
