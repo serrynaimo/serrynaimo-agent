@@ -3925,11 +3925,15 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
     # reasoning_effort for gpt-oss-style models. ThinkTagFilter guards the TTS.
     # extra keys are passed as direct kwargs to the OpenAI SDK, so
     # non-standard fields must be tunneled through the SDK's extra_body.
-    # reasoning_effort only goes to LM Studio — llama-server may reject
-    # request fields it doesn't know, and the omni Instruct model never thinks.
-    llm_extra = {"extra_body": {"chat_template_kwargs": {"enable_thinking": False}}}
+    # NONE of it goes to the omni server: the Instruct model never thinks,
+    # and enable_thinking=False derails Qwen3-Omni's chat template into
+    # near-empty completions (a stray '\n' or ':' and immediate EOS).
+    llm_extra = {}
     if not omni_active:
-        llm_extra["reasoning_effort"] = os.getenv("LMSTUDIO_REASONING_EFFORT", "low")
+        llm_extra = {
+            "reasoning_effort": os.getenv("LMSTUDIO_REASONING_EFFORT", "low"),
+            "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
+        }
     llm = LMStudioLLMService(
         base_url=base_url,
         api_key=os.getenv("LMSTUDIO_API_KEY", "lm-studio"),
