@@ -3938,15 +3938,19 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
     # reasoning_effort for gpt-oss-style models. ThinkTagFilter guards the TTS.
     # extra keys are passed as direct kwargs to the OpenAI SDK, so
     # non-standard fields must be tunneled through the SDK's extra_body.
-    # NONE of it goes to the omni server: the Instruct model never thinks,
-    # and enable_thinking=False derails Qwen3-Omni's chat template into
-    # near-empty completions (a stray '\n' or ':' and immediate EOS).
+    # NONE of it goes to audio-native sessions — the omni server, or
+    # LLM_AUDIO_INPUT=1 with an audio-capable model in LM Studio: omni-style
+    # Instruct models never think, and enable_thinking=False derails
+    # Qwen3-Omni's chat template into near-empty completions (a stray '\n'
+    # or ':' and immediate EOS). Those sessions get cooler sampling instead,
+    # because tool discipline on audio turns degrades at the server default
+    # (~0.8).
+    audio_native = omni_active or os.getenv(
+        "LLM_AUDIO_INPUT", "omni"
+    ).strip().lower() in ("1", "true", "yes")
     llm_extra = {}
     llm_settings = {"model": llm_model}
-    if omni_active:
-        # Tool discipline: llama-server's default sampling (~0.8) makes the
-        # omni model's call-a-tool-vs-just-answer decision flaky on audio
-        # turns; cooler sampling keeps it honest.
+    if audio_native:
         llm_settings["temperature"] = float(os.getenv("OMNI_LLM_TEMPERATURE", "0.4"))
     else:
         llm_extra = {
