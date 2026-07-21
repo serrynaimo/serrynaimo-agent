@@ -238,3 +238,6 @@ server/thomas_pipeline_enroll.wav
 server/voice_*.wav
 # ...except Serry's own bundled voice, which ships with the project.
 !server/voice_serry.wav
+
+# macOS Finder metadata
+.DS_Store
