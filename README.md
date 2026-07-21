@@ -17,7 +17,7 @@ She lives on your computer, sees your world — your files, mail, calendar, noti
 
 ## How she does it
 
-- **Offline by default**, thinking with **Qwen3-Omni** — a local model that *hears your actual voice*, tone and all, run automatically by the bot via [llama.cpp](https://github.com/ggml-org/llama.cpp). On a big Mac you can swap in a much larger brain via [LM Studio](https://lmstudio.ai) instead (best with Qwen3.5 110B)
+- **Offline by default**, thinking with whatever local model you load in [LM Studio](https://lmstudio.ai) (best with Qwen3.5 110B). Alternatively she can run **Qwen3-Omni** herself via [llama.cpp](https://github.com/ggml-org/llama.cpp) — a model that *hears your actual voice*, tone and all (see below)
 - **Learns your voice**, so she only ever answers *you* — you can even teach her which other voices (a housemate, the TV) to ignore
 - Answers to her name: *"Serry, can you…"* or *"…, Serry"* — then keeps listening for a moment so you can carry on without repeating it
 - **Responsive, high-quality speech**, back and forth, turn by turn
@@ -30,9 +30,9 @@ Built on [Pipecat](https://github.com/pipecat-ai/pipecat), the open-source frame
 
 ## What you'll need
 
-- A Mac with **Apple Silicon** and **32 GB of unified memory** or more. 32 GB runs the default brain, if snugly — close your other memory-hungry apps; 48 GB is comfortable; **96 GB+** lets you swap in a much bigger LM Studio brain (see below).
+- A Mac with **Apple Silicon** and **32 GB of unified memory** or more. What fits depends on the brain you pick in LM Studio — 32 GB runs a mid-size model, if snugly (close your other memory-hungry apps); **96 GB+** is comfortable for the big Qwen3.5 110B.
 - A microphone (the built-in one is fine)
-- **[Homebrew](https://brew.sh)** with **llama.cpp** (`brew install llama.cpp`) — this is what runs Serry's "brain"
+- **[LM Studio](https://lmstudio.ai)** with a model loaded — this is what runs Serry's "brain"
 - **[uv](https://docs.astral.sh/uv/)** and **Node.js** — used to install and run everything
 
 You don't need any accounts or API keys to get going. A few optional online features (deeper web search, live stock prices, a cloud model to escalate to) can be switched on later by adding keys — more on that below.
@@ -44,13 +44,17 @@ You don't need any accounts or API keys to get going. A few optional online feat
 ### 1. Get the code and install
 
 ```bash
-brew install llama.cpp
 git clone https://github.com/serrynaimo/serrynaimo-agent.git
 cd serrynaimo-agent/server
 uv sync
 ```
 
-That's the whole brain setup — Serry starts and manages her own model (**Qwen3-Omni**, via llama.cpp) when you run her. No separate app to install or server to click through.
+Then set up the brain in **[LM Studio](https://lmstudio.ai)**:
+
+1. Download a capable model — **Qwen3.5 110B-A10B** is the current favourite; pick what fits your memory. Load it, then start LM Studio's **local server** (Developer → Start Server).
+2. In the model's settings, turn **off** reasoning (thinking) parsing. Serry manages the model's reasoning herself, and letting LM Studio split out the "thinking" section can garble or slow her spoken replies.
+
+Serry automatically uses whichever model you've loaded — you don't have to name it anywhere.
 
 ### 2. Introduce yourself
 
@@ -77,7 +81,7 @@ Everything else has a sensible default. If you later want the optional online ex
 uv run bot.py
 ```
 
-The **first start downloads her models** — about 7 GB of speech models plus about 18 GB for the brain — so give it a while; she stays quiet until the brain is up, and the log keeps you posted. Every start after that takes seconds.
+The **first start downloads her speech models** — about 7 GB — so give it a moment; the log keeps you posted. Every start after that takes seconds. (The brain itself you already downloaded in LM Studio.)
 
 Open the link it prints, allow the microphone when macOS asks, and say hello. The first time she checks your mail, calendar, or notifications, macOS will ask permission for those too — just allow it.
 
@@ -93,16 +97,14 @@ Point a browser at **[http://localhost:7860/serrynaimo](http://localhost:7860/se
 
 ---
 
-## Swap in a bigger brain (optional)
+## Let her hear your actual voice (optional)
 
-By default Serry thinks with **Qwen3-Omni**, a model that *listens to your actual voice* — tone, hesitation, mood — instead of just reading a transcript. On a **96 GB+ Mac** you can trade that hearing for considerably more brainpower:
+By default Serry reads a transcript of what you said. She can instead think with **Qwen3-Omni**, a model that *listens to your actual voice* — tone, hesitation, mood — which she runs and manages herself, no LM Studio needed:
 
-1. Install **[LM Studio](https://lmstudio.ai)**.
-2. Download a capable model — **Qwen3.5 110B-A10B** is the current favourite. Load it, then start LM Studio's **local server** (Developer → Start Server).
-3. In the model's settings, turn **off** reasoning (thinking) parsing. Serry manages the model's reasoning herself, and letting LM Studio split out the "thinking" section can garble or slow her spoken replies.
-4. In your `.env`, set `LLM_AUDIO_INPUT=0`.
+1. Install **[Homebrew](https://brew.sh)**, then `brew install llama.cpp`.
+2. In your `.env`, set `LLM_AUDIO_INPUT=omni`.
 
-Serry automatically uses whichever model you've loaded — you don't have to name it anywhere. In this mode she reads what you said rather than hearing how you said it, but the bigger model is a noticeably stronger reasoner and tool user.
+The next start downloads the omni brain (about 18 GB) and she stays quiet until it's up — the log keeps you posted. She hears how you say things in this mode, but the 30B omni model is a weaker reasoner and tool user than a big LM Studio brain, which is why the transcript mode is the default.
 
 ---
 
@@ -164,7 +166,7 @@ Serry is fully capable offline. These optional services simply extend her reach 
 
 ### Grok — a bigger brain, plus live web &amp; X search (paid)
 
-Lets Serry escalate a hard question to xAI's **Grok**, and powers her deep **web search** and **X (Twitter) search**. This one is **paid** — create a key in the [xAI console](https://console.x.ai).
+Lets Serry hand a hard question to xAI's **Grok** as a background research task — she keeps chatting and reports the findings whenever they're ready — and powers her deep **web search** and **X (Twitter) search**. This one is **paid** — create a key in the [xAI console](https://console.x.ai).
 
 ```bash
 XAI_API_KEY=your-key-here
@@ -269,6 +271,6 @@ Restart her, and she'll take on the new voice. (A rich, varied sentence with lot
 
 ## Credits & license
 
-Built on [Pipecat](https://github.com/pipecat-ai/pipecat) for the voice pipeline, local speech models running on Apple's MLX, and a local brain served by [llama.cpp](https://github.com/ggml-org/llama.cpp) (Qwen3-Omni) or, optionally, [LM Studio](https://lmstudio.ai).
+Built on [Pipecat](https://github.com/pipecat-ai/pipecat) for the voice pipeline, local speech models running on Apple's MLX, and a local brain served by [LM Studio](https://lmstudio.ai) or, optionally, [llama.cpp](https://github.com/ggml-org/llama.cpp) (Qwen3-Omni).
 
 Licensed under the [Apache License 2.0](LICENSE). Copyright © 2026 Thomas Gorissen.

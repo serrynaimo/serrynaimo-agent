@@ -10,21 +10,22 @@ This bot uses a cascade pipeline: Speech-to-Text → LLM → Text-to-Speech,
 running entirely on-device:
 
 - Qwen3-ASR  (Speech-to-Text) via mlx-audio  -> services_local.Qwen3ASRSTTService
-- Qwen3-Omni (LLM — hears the gated utterance audio) via llama.cpp's
-  llama-server, started and managed by the bot (default, LLM_AUDIO_INPUT=omni)
+- LM Studio  (LLM — reads the ASR transcript) via its OpenAI-compatible
+  endpoint at http://localhost:1234/v1 (default, LLM_AUDIO_INPUT=0)
 - Qwen3-TTS  (Text-to-Speech) via mlx-audio  -> services_local.Qwen3TTSService
 
-LLM_AUDIO_INPUT=0 swaps the LLM stage for LM Studio (OpenAI-compatible
-endpoint at http://localhost:1234/v1): a bigger text-only model that reads
-the ASR transcript instead of hearing — stronger tool orchestration, deaf
-to tone. Either way ASR runs the speaker/wake gates and live captions, and
-Qwen3-TTS speaks — llama.cpp runs the omni Thinker (text out), not the
-Talker (speech out).
+LLM_AUDIO_INPUT=omni swaps the LLM stage for Qwen3-Omni via llama.cpp's
+llama-server, started and managed by the bot: an audio-native model that
+hears the gated utterance audio — tone and mood included — instead of
+reading a transcript. Either way ASR runs the speaker/wake gates and live
+captions, and Qwen3-TTS speaks — llama.cpp runs the omni Thinker (text
+out), not the Talker (speech out).
 
 Requirements:
 - macOS on Apple Silicon (arm64)
-- llama.cpp (`brew install llama.cpp`) for the default omni brain, or
-  LM Studio running locally with a model loaded (LLM_AUDIO_INPUT=0)
+- LM Studio running locally with a model loaded (default), or
+  llama.cpp (`brew install llama.cpp`) for the omni brain
+  (LLM_AUDIO_INPUT=omni)
 
 Run the bot using::
 
@@ -91,10 +92,12 @@ from pipecat.frames.frames import (
     FunctionCallInProgressFrame,
     FunctionCallResultFrame,
     LLMContextFrame,
+    LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
     LLMMessagesAppendFrame,
     LLMRunFrame,
     LLMTextFrame,
+    SystemFrame,
     TranscriptionFrame,
     TTSSpeakFrame,
 )
@@ -230,7 +233,7 @@ async def _xai_responses(input_messages: list, tools: list, timeout: int = 60,
                          action: str = "web search") -> dict:
     """Call xAI's Responses API with server-side tools; parse answer+citations.
 
-    Shared by the quick searches and the deeper escalate_to_grok tool.
+    Shared by the quick searches and the deeper background_research tool.
     """
     api_key = os.getenv("XAI_API_KEY")
     if not api_key:
@@ -280,20 +283,30 @@ async def _xai_search(query: str, tool_type: str) -> dict:
     )
 
 
-async def escalate_to_grok(params: FunctionCallParams):
-    """Tool handler: hand a hard query to Grok (xAI) for deep synthesis.
+# Background research tasks in flight, keyed by their normalized query — a
+# repeated call for the same question attaches to the running task's promise
+# ("already underway") instead of starting a second one.
+_BG_RESEARCH: dict[str, asyncio.Task] = {}
 
-    Grok answers with live web + X search available; it has NO access to the
-    user's files, memory, calendar, or mail — pass everything it needs in the
-    query. Use when the question needs careful synthesis or the local model is
-    not confident (high hallucination risk).
+
+async def background_research(params: FunctionCallParams):
+    """Tool handler: start a deep web+X research task in the BACKGROUND.
+
+    Grok (xAI) does the work under the hood, but the model just sees an
+    anonymous background researcher: the call returns immediately, the
+    session keeps going (speech, other tools), and the findings are injected
+    into the conversation — with a fresh LLM run — whenever they arrive.
+    Because no function call stays in flight, voice interruptions and the
+    tool-stall watchdog never touch it. Via /api/chat (params.llm is None)
+    there is no live session to report back into, so it runs synchronously
+    there instead.
     """
     query = str(params.arguments.get("query", "")).strip()
     if not query:
         await params.result_callback({"error": "empty query"})
         return
     context_note = str(params.arguments.get("context") or "").strip()
-    logger.info(f"escalate_to_grok: [{query[:80]}]")
+    logger.info(f"background_research: [{query[:80]}]")
     instructions = (
         "You are a careful expert consultant. Reason step by step and give a "
         "thorough, well-grounded synthesis. Prefer verified facts; use web and "
@@ -301,16 +314,71 @@ async def escalate_to_grok(params: FunctionCallParams):
         "conflicting, say so plainly rather than guessing. Cite key sources."
     )
     user = query if not context_note else f"{query}\n\nContext from the user:\n{context_note}"
-    result = await _xai_responses(
-        [{"role": "system", "content": instructions},
-         {"role": "user", "content": user}],
-        [{"type": "web_search"}, {"type": "x_search"}],
-        timeout=120,
-        action="the escalation to Grok",
-    )
-    if "error" in result and "not configured" in result["error"]:
-        result["hint"] = "XAI_API_KEY is required for escalation"
-    await params.result_callback(result)
+
+    async def _run() -> dict:
+        result = await _xai_responses(
+            [{"role": "system", "content": instructions},
+             {"role": "user", "content": user}],
+            [{"type": "web_search"}, {"type": "x_search"}],
+            timeout=int(os.getenv("BACKGROUND_RESEARCH_TIMEOUT_SECS", "240")),
+            action="the background research",
+        )
+        if "error" in result and "not configured" in result["error"]:
+            result["hint"] = "XAI_API_KEY is required for background research"
+        return result
+
+    llm, context = params.llm, params.context
+    if llm is None:  # /api/chat — synchronous, the HTTP caller wants the answer
+        await params.result_callback(await _run())
+        return
+
+    key = " ".join(query.lower().split())
+    if (existing := _BG_RESEARCH.get(key)) is not None and not existing.done():
+        await params.result_callback({
+            "status": "already_running",
+            "note": "this research task is already underway; its findings "
+                    "will arrive on their own — no need to start it again",
+        })
+        return
+
+    async def _research_and_report():
+        # The registry entry doubles as the task's strong reference (asyncio
+        # holds tasks only weakly) — keep it until the report is delivered.
+        try:
+            try:
+                result = await _run()
+            except Exception as exc:  # noqa: BLE001 — a lost report must never be silent
+                result = {"error": f"background research failed: {exc}"}
+            # Context-only note (never shown or spoken verbatim) + an
+            # immediate run so the report is spoken as soon as it lands —
+            # queued directly on the LLM so it cues up behind any speech
+            # still playing.
+            context.add_message({
+                "role": "user",
+                "content": (
+                    f"(Background research finished for: {query[:150]}\n"
+                    f"{json.dumps(result, ensure_ascii=False)}\n"
+                    "Report the findings to the user now, briefly and "
+                    "conversationally; if it failed, say so plainly.)"
+                ),
+            })
+            try:
+                await llm.queue_frame(LLMContextFrame(context=context), FrameDirection.DOWNSTREAM)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"background_research: could not trigger the report: {exc}")
+        finally:
+            _BG_RESEARCH.pop(key, None)
+
+    _BG_RESEARCH[key] = asyncio.create_task(_research_and_report())
+    await params.result_callback({
+        "status": "started",
+        "note": (
+            "The research is running in the background; the findings will be "
+            "announced to you when ready (typically a minute or two). Tell "
+            "the user it's underway and keep helping them — do NOT wait for "
+            "it or call this again."
+        ),
+    })
 
 
 async def _google_search(query: str) -> dict:
@@ -434,10 +502,11 @@ _OMNI_SERVER: dict = {"state": "none", "proc": None}
 
 
 def omni_llm_enabled() -> bool:
-    # One knob, three states: omni (default — run the omni server and use it
-    # as the LLM), 0 (LM Studio reads transcripts only), 1 (attach audio to
-    # the LM Studio endpoint). "omni" counts as truthy for the STT's audio stash.
-    return os.getenv("LLM_AUDIO_INPUT", "omni").strip().lower() == "omni"
+    # One knob, three states: 0 (default — LM Studio reads transcripts only),
+    # 1 (attach audio to the LM Studio endpoint), omni (run the in-bot omni
+    # server and use it as the LLM). "omni" counts as truthy for the STT's
+    # audio stash.
+    return os.getenv("LLM_AUDIO_INPUT", "0").strip().lower() == "omni"
 
 
 def omni_llm_base_url() -> str:
@@ -2531,33 +2600,37 @@ x_search_schema = FunctionSchema(
 )
 
 
-escalate_to_grok_schema = FunctionSchema(
-    name="escalate_to_grok",
+background_research_schema = FunctionSchema(
+    name="background_research",
     description=(
-        "Escalate a hard question to Grok AI for deep "
-        "synthesis or fact-critical answers or when you are not confident enough. "
-        "Grok has live web and X search but NO access to other tools — include all non-public details in the "
-        "query but mask private and identifiable information. "
-        "Tell the user you're checking with Grok before you do. "
+        "Start a research task that runs in the BACKGROUND with live web and "
+        "X search access — for hard questions needing deep synthesis, "
+        "fact-critical answers, or when you are not confident enough. It "
+        "returns immediately; the findings are announced to you when ready "
+        "(a minute or two), so keep helping the user meanwhile — never wait "
+        "for it. The researcher has NO access to your other tools or this "
+        "chat — include all non-public details in the query but mask private "
+        "and identifiable information. Tell the user you're starting it."
     ),
     properties={
         "query": {
             "type": "string",
             "description": (
-                "The full question for Grok, self-contained (Grok can't see this "
-                "chat). Mask the user's private details with placeholders first."
+                "The full research question, self-contained (the researcher "
+                "can't see this chat). Mask the user's private details with "
+                "placeholders first."
             ),
         },
         "context": {
             "type": "string",
             "description": (
-                "Optional: facts from the conversation Grok needs but couldn't "
-                "find online — with private identifiers masked by placeholders"
+                "Optional: facts from the conversation the researcher needs but "
+                "couldn't find online — with private identifiers masked by placeholders"
             ),
         },
     },
     required=["query"],
-    handler=escalate_to_grok,
+    handler=background_research,
 )
 
 
@@ -2601,7 +2674,7 @@ def _with_current_time(handler):
 # get_financial_info are excluded.
 for _schema in (
     google_search_schema, x_web_search_schema, x_search_schema,
-    escalate_to_grok_schema,
+    background_research_schema,
     open_in_browser_schema, find_files_schema, open_file_schema,
     read_file_schema, search_email_schema, read_email_schema, save_attachment_schema, draft_email_schema, send_email_schema, discard_draft_schema, archive_email_schema, trash_email_schema, mark_email_schema, search_local_schema, recent_notifications_schema,
     run_javascript_schema, get_weather_schema,
@@ -2658,9 +2731,11 @@ def _dedup_inflight(handler):
 
 # Lookups only: a re-run lookup is pure waste, while state-changing tools
 # (send, archive, remember, …) keep their call-per-invocation semantics.
+# background_research is NOT here: it returns instantly and keeps its own
+# in-flight registry (_BG_RESEARCH), which also answers duplicates.
 for _schema in (
     google_search_schema, x_web_search_schema, x_search_schema,
-    escalate_to_grok_schema, find_files_schema, read_file_schema,
+    find_files_schema, read_file_schema,
     search_email_schema, read_email_schema, search_local_schema,
     recent_notifications_schema, get_weather_schema,
     get_financial_info_schema, recall_schema, list_people_schema,
@@ -2673,7 +2748,7 @@ for _schema in (
 # verified-speech hook in run_bot once the speaker gate confirms the voice.
 for _schema in (
     google_search_schema, x_web_search_schema, x_search_schema,
-    escalate_to_grok_schema,
+    background_research_schema,
     get_current_time_schema, open_in_browser_schema, find_files_schema,
     open_file_schema, read_file_schema, search_email_schema, read_email_schema, save_attachment_schema, draft_email_schema, send_email_schema, discard_draft_schema, archive_email_schema, trash_email_schema, mark_email_schema, search_local_schema,
     recent_notifications_schema, run_javascript_schema,
@@ -2688,7 +2763,7 @@ for _schema in (
 # session-bound and excluded — the API preloads all MCP toolsets instead).
 NATIVE_TOOL_SCHEMAS = (
     google_search_schema, x_web_search_schema, x_search_schema,
-    escalate_to_grok_schema,
+    background_research_schema,
     get_current_time_schema, open_in_browser_schema, find_files_schema,
     open_file_schema, read_file_schema, search_email_schema, read_email_schema, save_attachment_schema, draft_email_schema, send_email_schema, discard_draft_schema, archive_email_schema, trash_email_schema, mark_email_schema, search_local_schema,
     recent_notifications_schema, run_javascript_schema,
@@ -2737,6 +2812,28 @@ def _speech_transform(text_filter):
     return transform
 
 
+# Function-call frames re-classed as SYSTEM frames. System frames skip every
+# processor's work queue — the TTS's synthesis backlog and the output
+# transport's playback-paced audio queue — so tool progress/results reach the
+# assistant aggregator the moment a tool finishes instead of after the bot
+# stops talking. That is what lets a tool chain keep running while speech
+# from earlier steps is still being read aloud. The original classes stay as
+# bases, so every isinstance() check in pipecat still matches; being
+# UninterruptibleFrames, they also still survive interruption flushes.
+class AsapFunctionCallInProgressFrame(FunctionCallInProgressFrame, SystemFrame):
+    pass
+
+
+class AsapFunctionCallResultFrame(FunctionCallResultFrame, SystemFrame):
+    pass
+
+
+_ASAP_FRAME_SWAP = {
+    FunctionCallInProgressFrame: AsapFunctionCallInProgressFrame,
+    FunctionCallResultFrame: AsapFunctionCallResultFrame,
+}
+
+
 class LMStudioLLMService(OpenAILLMService):
     """OpenAI-compatible service pointed at LM Studio.
 
@@ -2752,6 +2849,11 @@ class LMStudioLLMService(OpenAILLMService):
     copy lets run_bot store what the model actually generated, which keeps
     the next prompt a byte-exact continuation — required for LM Studio's
     cache to survive a turn on hybrid models like qwen3.5-122b-a10b.
+    Because the agentic loop keeps running while earlier speech still plays,
+    several completions can sit between the LLM and the (playback-paced)
+    aggregator at once — so completed text is banked in a ledger keyed by a
+    sequence number stamped on each completion's own LLMFullResponseEndFrame,
+    and released only when that exact frame reaches the aggregator.
     """
 
     supports_developer_role = False
@@ -2763,9 +2865,14 @@ class LMStudioLLMService(OpenAILLMService):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._verbatim_parts: list[str] = []
-        self._verbatim_consumed = True
+        self._verbatim_ledger: dict[int, str] = {}
+        self._verbatim_seq = 0
         self._last_call_key: str | None = None
         self._repeat_call_count = 0
+
+    async def broadcast_frame(self, frame_cls, **kwargs):
+        """Give function-call frames the system-frame express lane."""
+        await super().broadcast_frame(_ASAP_FRAME_SWAP.get(frame_cls, frame_cls), **kwargs)
 
     def reset_repeat_call_guard(self):
         """Called on every genuine user turn: a fresh request is never a
@@ -2826,21 +2933,40 @@ class LMStudioLLMService(OpenAILLMService):
     async def push_frame(self, frame, direction=FrameDirection.DOWNSTREAM):
         if isinstance(frame, LLMFullResponseStartFrame):
             self._verbatim_parts = []
-            self._verbatim_consumed = False
-        elif isinstance(frame, LLMTextFrame) and not self._verbatim_consumed:
+        elif isinstance(frame, LLMTextFrame):
             self._verbatim_parts.append(frame.text)
+        elif (
+            isinstance(frame, LLMFullResponseEndFrame)
+            and direction == FrameDirection.DOWNSTREAM
+        ):
+            # Bank the finished completion under a sequence number stamped on
+            # the End frame itself: the text and the frame that will release
+            # it travel (and get dropped by interruption flushes) together,
+            # so a completion can never pair with the wrong context message.
+            self._verbatim_seq += 1
+            frame._verbatim_seq = self._verbatim_seq  # noqa: SLF001 — dynamic tag, read in run_bot
+            text = "".join(self._verbatim_parts)
+            self._verbatim_parts = []
+            if text:
+                self._verbatim_ledger[self._verbatim_seq] = text
         await super().push_frame(frame, direction)
 
-    def has_verbatim(self) -> bool:
-        """True while the current completion's text has not been stored yet."""
-        return not self._verbatim_consumed and bool("".join(self._verbatim_parts))
+    def pop_verbatim(self, seq: int | None) -> str:
+        """The exact text of the completion whose End frame carried seq."""
+        return self._verbatim_ledger.pop(seq, "") if seq is not None else ""
 
-    def take_verbatim(self) -> str:
-        """The current completion's exact text; consumed once per completion."""
-        if self._verbatim_consumed:
-            return ""
-        self._verbatim_consumed = True
-        return "".join(self._verbatim_parts)
+    def drain_verbatim(self, include_current: bool = True) -> str:
+        """All generated text not yet written to context: banked completions
+        whose End frames died in flushed speech queues, plus (optionally) the
+        completion still streaming. The interruption hooks use this so the
+        conversation trail records what was generated no matter what was
+        actually spoken."""
+        parts = list(self._verbatim_ledger.values())
+        self._verbatim_ledger.clear()
+        if include_current:
+            parts.append("".join(self._verbatim_parts))
+            self._verbatim_parts = []
+        return "\n".join(p for p in parts if p)
 
 
 def _parse_phrase_list(env_name: str, default: list[str]) -> list[str]:
@@ -3498,12 +3624,11 @@ def build_system_prompt() -> str:
     "Use run_javascript for any non-trivial math and speak only the result.\n\n"
 
     "ACTING\n"
-    "Do the work! Read and search freely. For state-changing actions — sending or replying to mail, "
-    "deleting or moving messages, creating, changing, or cancelling events — state "
-    "exactly what you'll do and act only on his explicit go-ahead.\n"
-    "If you say you'll do something, call the tool in the same reply, or nothing "
-    "happens. Read every result: dry run, not available, or error means it did NOT "
-    "happen, so say so rather than claiming success.\n\n"
+    "Do the work when you announce it! Read and search freely. For actions that create notifications or communications for other people — sending or replying to mail, "
+    "creating, changing, or cancelling events with other invitees — state "
+    "what you'll attempt to do and act with the explicit go-ahead. "
+    "Use the tools available to get tasks done as instructed. If you encounter difficulties push through until it's evident you can't do it with the tools available and you need to change course.\n"
+    "Read every result: dry run, not available, or error means you need to try a different way before claiming success or failure.\n\n"
 
     "MEMORY (storing)\n"
     "Store one lean fact per remember — a single tight sentence; split unrelated facts "
@@ -3511,11 +3636,10 @@ def build_system_prompt() -> str:
     "Recalls are silent, so answer as if you simply knew. Tag each memory with the "
     "person it concerns. Ask which person is meant when a name is ambiguous, and "
     "renames keep their memories.\n"
-    "Facts are truths, including his preferences; action notes are tool quirks — how a "
-    "tool behaves and the most reliable way to use it — so store each in the right kind. "
+    "Facts are truths, including user preferences; action notes can be tool quirks — how a "
+    "tool behaves or the most reliable way to use it — so store each in the right kind. "
     "The people you remember are profiles you have learned about, not a contact book.\n"
-    "When something genuinely noteworthy surfaces, finish speaking first, then quietly "
-    "remember it.\n"
+    "Whenever you learn something genuinely noteworthy about a person or a user preference add it to your memory! \n"
     )
 
 
@@ -4093,7 +4217,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
     # template into garbage ("user\n") and near-empty completions.
     audio_native = (
         omni_active
-        or os.getenv("LLM_AUDIO_INPUT", "omni").strip().lower() in ("1", "true", "yes")
+        or os.getenv("LLM_AUDIO_INPUT", "0").strip().lower() in ("1", "true", "yes")
         or "omni" in (llm_model or "").lower()
     )
     llm_extra = {}
@@ -4260,7 +4384,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
         google_search_schema,
         x_web_search_schema,
         x_search_schema,
-        escalate_to_grok_schema,
+        background_research_schema,
         get_current_time_schema,
         open_in_browser_schema,
         find_files_schema,
@@ -4375,34 +4499,76 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
     # string is rebuilt from TTS sentence frames (blank lines collapse to
     # spaces), which diverges from the generated tokens and — on hybrid
     # models — costs a full re-prefill every turn. Presentation (TTS text,
-    # client bubbles) is unaffected.
+    # client bubbles) is unaffected. Each completion's text is banked in the
+    # LLM service and released by its own LLMFullResponseEndFrame arriving
+    # here — which can be long after later agentic steps already ran, since
+    # End frames ride the playback-paced speech path while the tool chain
+    # keeps moving.
     _orig_aggregation_string = assistant_aggregator.aggregation_string
+    _verbatim_stash = {"text": None}
 
     def _verbatim_aggregation_string():
-        return llm.take_verbatim() or _orig_aggregation_string()
+        text, _verbatim_stash["text"] = _verbatim_stash["text"], None
+        return text or _orig_aggregation_string()
 
     assistant_aggregator.aggregation_string = _verbatim_aggregation_string
 
+    _orig_handle_llm_end = assistant_aggregator._handle_llm_end  # noqa: SLF001
+
+    async def _handle_llm_end_verbatim(frame):
+        text = llm.pop_verbatim(getattr(frame, "_verbatim_seq", None))
+        if text:
+            _verbatim_stash["text"] = text
+            if not assistant_aggregator._aggregation:  # noqa: SLF001 — must be non-empty for push
+                assistant_aggregator._aggregation = [TextPartForConcatenation("", False)]  # noqa: SLF001
+        await _orig_handle_llm_end(frame)
+
+    assistant_aggregator._handle_llm_end = _handle_llm_end_verbatim  # noqa: SLF001
+
     # Interrupted turns keep their trail too: pipecat drops the aggregation
     # on interruption, but the trail must record what was generated no
-    # matter what was actually spoken. Push the verbatim text first, then
+    # matter what was actually spoken. Rescue the ledger (completions whose
+    # End frames died in the flushed speech queues) — plus the still-
+    # streaming completion when generation itself is being cancelled — then
     # let the original handler reset state.
     _orig_handle_interruptions = assistant_aggregator._handle_interruptions  # noqa: SLF001
 
     async def _interrupt_keeping_trail(frame):
-        # Voice-only stops don't cancel generation — the completion will
-        # finish and push its own (full) verbatim; an early partial push
-        # here would split the turn into two context messages.
         if getattr(frame, "voice_only", False):
-            await _orig_handle_interruptions(frame)
-            return
-        if llm.has_verbatim():
+            # Voice-only stops don't cancel generation. If nothing of the
+            # current completion has been spoken yet, leave it streaming —
+            # its End frame will push its own (full) verbatim; an early
+            # partial push would split the turn into two context messages.
+            leftover = llm.drain_verbatim(
+                include_current=bool(assistant_aggregator._aggregation)  # noqa: SLF001
+            )
+        else:
+            leftover = llm.drain_verbatim()
+        if leftover:
+            _verbatim_stash["text"] = leftover
             if not assistant_aggregator._aggregation:  # noqa: SLF001 — must be non-empty for push
                 assistant_aggregator._aggregation = [TextPartForConcatenation("", False)]  # noqa: SLF001
             await assistant_aggregator.push_aggregation()
         await _orig_handle_interruptions(frame)
 
     assistant_aggregator._handle_interruptions = _interrupt_keeping_trail  # noqa: SLF001
+
+    # Keep the agentic loop moving while the bot reads earlier messages
+    # aloud. Stock pipecat defers the post-tool-result run until the bot
+    # stops speaking, and even then routes the context upstream through the
+    # TTS, where it would crawl behind the synthesis backlog. Instead, hand
+    # the context straight to the LLM's own queue: the next step starts the
+    # moment the result lands, and its sentences simply cue up behind
+    # whatever is still playing. (The caller already skips this while the
+    # USER is speaking — their turn end triggers its own run.)
+    async def _continue_tool_chain_asap():
+        if assistant_aggregator.has_queued_frame(FunctionCallResultFrame):
+            # More results right behind this one — let one run see them all.
+            return
+        assistant_aggregator._push_context_on_bot_stopped_speaking = False  # noqa: SLF001
+        await llm.queue_frame(LLMContextFrame(context=context), FrameDirection.DOWNSTREAM)
+
+    assistant_aggregator._maybe_push_context_after_function_result = _continue_tool_chain_asap  # noqa: SLF001
 
     # Pipeline - assembled from reusable components
     pipeline = Pipeline(
