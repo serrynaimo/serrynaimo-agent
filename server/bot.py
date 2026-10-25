@@ -504,6 +504,97 @@ def lmstudio_extra_body(base_url: str) -> dict:
     return {}
 
 
+# Mood behind the page's subtle theming: each finished reply goes to the
+# classifier endpoint on the LM Studio host (a StartLux Decision model that
+# answers typed questions about a JSON state), and the page eases its colors
+# toward the result. Everyday replies classify as neutral and change nothing.
+MOOD_QUESTIONS = {
+    "emotion": {
+        "type": "choice",
+        "instructions": "Which emotion does the assistant's reply express? Most replies are neutral.",
+        "criteria": {
+            "neutral": "Plain, matter-of-fact, everyday",
+            "joy": "Happy, delighted, celebrating",
+            "playful": "Teasing, witty, light-hearted banter",
+            "warm": "Caring, affectionate, comforting",
+            "sad": "Sorrowful, sympathetic about a loss",
+            "concerned": "Worried, cautious, warning",
+            "angry": "Frustrated, indignant",
+            "excited": "Thrilled, energetic, amazed",
+            "calm": "Soothing, quiet, reflective",
+        },
+    },
+    "valence": {
+        "type": "score",
+        "instructions": "Is the mood of this exchange negative and heavy, or positive and uplifting?",
+        "criteria": ["very negative, heavy, grim", "somewhat negative", "neutral, everyday",
+                     "somewhat positive", "very positive, joyful"],
+    },
+    "intensity": {
+        "type": "score",
+        "instructions": "How emotionally intense is the reply?",
+        "criteria": ["calm and light", "mild", "moderate", "strong", "very intense"],
+    },
+}
+
+
+async def classify_mood(user_text: str, reply: str) -> dict | None:
+    """The mood of one exchange for the page theme, or None (classifier off or failing).
+
+    MOOD_CLASSIFIER_URL overrides the endpoint (default: LMSTUDIO_BASE_URL's
+    /classifier); "off" disables it. valence runs -1 (dark) .. 1 (bright)
+    with 0 neutral, intensity 0 (light) .. 1 (intense).
+    """
+    url = (os.getenv("MOOD_CLASSIFIER_URL")
+           or f"{os.getenv('LMSTUDIO_BASE_URL', 'http://localhost:1234/v1')}/classifier")
+    if url.strip().lower() == "off":
+        return None
+    state = {"assistant_reply": reply[:4000]}
+    if user_text:
+        state = {"user_said": user_text[:2000], **state}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                url,
+                json={"state": state, "questions": MOOD_QUESTIONS},
+                headers={"Authorization": f"Bearer {os.getenv('LMSTUDIO_API_KEY', 'lm-studio')}"},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as response:
+                data = await response.json(content_type=None)
+                if response.status != 200:
+                    logger.debug(f"Mood classifier {response.status}: {str(data)[:200]}")
+                    return None
+        answers = data["answers"]
+        emotion = answers["emotion"]
+        # Five levels each: valence centres on "neutral, everyday" (2);
+        # everyday replies score ~0.7 on intensity, so that's the zero point.
+        valence = (answers["valence"]["score"] - 2) / 2
+        intensity = (answers["intensity"]["score"] - 0.8) / 2.4
+    except Exception as exc:  # noqa: BLE001 — cosmetic; never disturbs the conversation
+        logger.debug(f"Mood classifier failed: {exc}")
+        return None
+    return {
+        "emotion": emotion["choice"],
+        "confidence": round(float(emotion.get("confidence", 0.0)), 3),
+        "valence": round(max(-1.0, min(1.0, valence)), 3),
+        "intensity": round(max(0.0, min(1.0, intensity)), 3),
+    }
+
+
+def _last_user_text(messages: list) -> str:
+    """The user's latest real words in the context (no injected notes)."""
+    for m in reversed(messages):
+        if not isinstance(m, dict) or m.get("role") != "user":
+            continue
+        content = m.get("content")
+        if isinstance(content, list):
+            content = " ".join(p.get("text", "") for p in content if isinstance(p, dict))
+        text = re.sub(r"^(\s*<system-note>.*?</system-note>)+", "", str(content or ""), flags=re.S).strip()
+        if text and not text.startswith("("):
+            return text
+    return ""
+
+
 async def detect_lmstudio_model(base_url: str) -> str | None:
     """Return the id of the model currently loaded in LM Studio, if any.
 
@@ -4688,6 +4779,26 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
         return text or _orig_aggregation_string()
 
     assistant_aggregator.aggregation_string = _verbatim_aggregation_string
+
+    # Page mood: every finished reply is classified in the background (the
+    # pipeline never waits on it) and sent to the page as a "mood" event.
+    _mood_tasks: set[asyncio.Task] = set()
+
+    @assistant_aggregator.event_handler("on_assistant_turn_stopped")
+    async def _classify_reply_mood(aggregator, message):
+        reply = re.sub(r"<think>.*?</think>", "", message.content or "", flags=re.S).strip()
+        if not reply:
+            return  # tool-call-only completion
+
+        async def _run():
+            mood = await classify_mood(_last_user_text(context.get_messages()), reply)
+            if mood:
+                logger.debug(f"Mood: {mood}")
+                await worker.queue_frames([RTVIServerMessageFrame(data={"event": "mood", **mood})])
+
+        task = asyncio.create_task(_run())
+        _mood_tasks.add(task)
+        task.add_done_callback(_mood_tasks.discard)
 
     _orig_handle_llm_end = assistant_aggregator._handle_llm_end  # noqa: SLF001
 

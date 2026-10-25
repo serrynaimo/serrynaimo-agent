@@ -349,7 +349,9 @@
        haze upward and brightens it — a subtle pulse on the user's voice. */
     transform: translateX(-50%) scaleY(var(--mic-scale, 1));
     transform-origin: bottom center;
-    filter: brightness(var(--mic-bright, 1));
+    /* --mood-bright (fed per-frame from the page mood) dims it a touch in
+       heavy conversations and lifts it in bright ones. */
+    filter: brightness(calc(var(--mic-bright, 1) * var(--mood-bright, 1)));
     width: min(900px, 72vw);
     height: 42vh;
     pointer-events: none;
@@ -452,6 +454,64 @@ const orbState = {
   memPulseUntil: 0, // memory-lookup activity pulse deadline
 };
 const activeCalls = new Set(); // tool calls currently in flight
+
+/* ------------------------------------------------------------ page mood */
+
+// Each finished reply arrives classified as a "mood" server-message (emotion,
+// how dark or bright and how intense the exchange felt). The page keeps a
+// slow-moving conversation mood from them that tints the orb, the mist and
+// the bottom haze — subtly: everyday replies classify as neutral and pull
+// everything back to the usual look. Try one from the console, e.g.
+// applyMood({emotion: "sad", confidence: 0.9, valence: -0.8, intensity: 0.7})
+// Palette offsets (the shaders' cosine palette) per emotion; neutral has none.
+const MOOD_HUES = {
+  joy: 0.9, excited: 0.95, playful: 0.12, warm: 0.05,
+  sad: 0.33, concerned: 0.85, angry: 0.0, calm: 0.5,
+};
+const mood = {
+  valence: 0,     // -1 heavy .. 1 bright (eased)
+  intensity: 0,   // 0 light .. 1 intense (eased)
+  tint: 0,        // 0..1 how much the emotion's color shows (eased)
+  tintHue: 0.62,  // palette offset of that color (eased the short way round)
+  mistT: 0,       // background mist phase: drifts faster in intense moods
+  target: { valence: 0, intensity: 0, tint: 0, tintHue: 0.62 },
+  lastAt: 0,
+};
+
+function applyMood(m) {
+  const t = mood.target;
+  // Small swings are noise: most replies should leave the page as it is.
+  const v = Math.abs(m.valence || 0) < 0.15 ? 0 : m.valence;
+  // A conversation mood, not a per-reply one: each reply moves it halfway.
+  t.valence += (v - t.valence) * 0.5;
+  t.intensity += ((m.intensity || 0) - t.intensity) * 0.5;
+  const hue = MOOD_HUES[m.emotion];
+  if (hue !== undefined && (m.confidence || 0) >= 0.45) {
+    if (mood.tint < 0.05) mood.tintHue = hue; // nothing showing yet: no hue sweep
+    t.tintHue = hue;
+    t.tint += (Math.min(1, m.confidence) - t.tint) * 0.5;
+  } else {
+    t.tint *= 0.5;
+  }
+  mood.lastAt = performance.now();
+}
+
+function resetMood() {
+  Object.assign(mood.target, { valence: 0, intensity: 0, tint: 0 });
+  mood.lastAt = 0;
+}
+
+function stepMood(now, dt) {
+  // A couple of quiet minutes and the page drifts back to its usual look.
+  if (mood.lastAt && now - mood.lastAt > 120000) resetMood();
+  const t = mood.target, k = 0.006; // a few seconds to settle: moods fade, never snap
+  mood.valence += (t.valence - mood.valence) * k;
+  mood.intensity += (t.intensity - mood.intensity) * k;
+  mood.tint += (t.tint - mood.tint) * k;
+  const d = ((t.tintHue - mood.tintHue + 1.5) % 1) - 0.5;
+  mood.tintHue += d * k * 2;
+  mood.mistT += dt * (1 + 1.5 * mood.intensity);
+}
 
 const statusEl = document.getElementById("status");
 let statusTimer = null;
@@ -1319,6 +1379,8 @@ function handleRtvi(msg) {
         addSpark(id);
         endSpark(id);
         orbState.memPulseUntil = performance.now() + 1500;
+      } else if (data && data.event === "mood") {
+        applyMood(data);
       } else if (data && data.event === "command") {
         // A spoken control phrase the server caught before the LLM: act on it.
         // (Server already re-armed the wake gate for "mute".)
@@ -1351,6 +1413,7 @@ function handleRtvi(msg) {
       } else if (data && data.event === "session-reset") {
         // Fresh conversation (button or idle timeout): clear the page.
         finishBotFlow();
+        resetMood();
         chatEl.querySelectorAll(".msg:not(.slot)").forEach((el) => el.remove());
         userSlot.textContent = "";
         userSlot.classList.remove("fading", "qualifying");
@@ -1813,6 +1876,7 @@ uniform float u_spin;      // accumulated swirl angle (drives rim shimmer)
 uniform mat3  u_rot;       // accumulated plasma rotation (wandering axis)
 uniform float u_act;       // conversation activity 0..1 (listen/think/work)
 uniform float u_ready;     // 0 until the assistant is fully ready, eases to 1
+uniform vec4  u_mood;      // page mood: x = tint hue, y = tint amount, z = valence -1..1, w = intensity
 
 float hash(vec2 p) {
   p = fract(p * vec2(123.34, 456.21));
@@ -1860,7 +1924,9 @@ void main() {
   haze *= mix(0.3, 1.0, smoothstep(R - 0.15, R + 0.1, r)); // dimmer seen through the glass
   haze *= 0.5 + 0.9 * u_level;
   haze *= u_ready; // fades in once the assistant is fully ready
-  vec3 hazeCol = palette(hueBase + hz1 * 0.35 - 0.08) * haze;
+  haze *= 1.0 + 0.35 * u_mood.w; // intense moods: a denser nebula
+  vec3 hazeCol = mix(palette(hueBase + hz1 * 0.35 - 0.08), palette(u_mood.x + hz1 * 0.2),
+                     u_mood.y * 0.3) * haze;
 
   /* ---- inside: plasma seen through a lens */
   float inside = 1.0 - smoothstep(R - 0.012, R + 0.012, r);
@@ -1875,31 +1941,41 @@ void main() {
 
   float n1 = fbm(puv * 2.2 + vec2(t * 0.9, -t * 0.7));
   float n2 = fbm(puv * 4.2 - vec2(t * 0.6, t * 0.85) + n1 * 1.3);
-  float core = exp(-dot(puv, puv) * (6.0 - 2.5 * u_level)) * (0.5 + 1.3 * u_level + 0.3 * u_act) * preDim;
-  float fil  = pow(n2, preThin) * (1.1 + 1.9 * u_level) * (1.0 + 0.5 * u_act) * preDim;
+  // Page mood: bright conversations lift the plasma a little, heavy ones
+  // dim it; intensity feeds the filaments.
+  float moodGain = 1.0 + 0.18 * u_mood.z;
+  float core = exp(-dot(puv, puv) * (6.0 - 2.5 * u_level)) * (0.5 + 1.3 * u_level + 0.3 * u_act) * preDim * moodGain;
+  float fil  = pow(n2, preThin) * (1.1 + 1.9 * u_level) * (1.0 + 0.5 * u_act) * preDim
+             * moodGain * (1.0 + 0.35 * u_mood.w);
   // Hue varies with noise, radius and a slow angular swirl, and the
   // filaments blend toward a second hue a third of the palette away.
   float ang = atan(puv.y, puv.x);
   float hue = hueBase + n2 * 0.26 + r * 0.08 + 0.09 * sin(ang * 2.0 + u_time * 0.4);
   vec3 filCol = mix(palette(hue), palette(hue + 0.3), n1);
-  vec3 plasma = filCol * fil + (vec3(0.9) + palette(hue) * 0.6) * core;
+  // The emotion's color seeps into the filaments; heavy moods drain some color.
+  vec3 moodCol = palette(u_mood.x + n2 * 0.12);
+  filCol = mix(filCol, moodCol, u_mood.y * 0.6);
+  vec3 plasma = filCol * fil + (vec3(0.9) + mix(palette(hue), moodCol, u_mood.y * 0.5) * 0.6) * core;
+  plasma = mix(plasma, vec3(dot(plasma, vec3(0.333))), max(-u_mood.z, 0.0) * 0.3);
 
   /* ---- glass shell: fresnel rim, bright ring, specular highlight */
   float fres = pow(1.0 - nz, 3.0);
-  vec3 glass = (palette(hueBase + 0.18) * fres * 0.9 + vec3(0.5) * fres * 0.25)
+  vec3 moodRim = palette(u_mood.x + 0.04);
+  vec3 glass = (mix(palette(hueBase + 0.18), moodRim, u_mood.y * 0.55) * fres * 0.9
+                + vec3(0.5) * fres * 0.25)
              * mix(0.5, 1.0, u_ready);
   // Rim shimmer: faint travelling glints while the bot is busy.
   float shimmer = noise(vec2(ang * 4.0 + u_spin * 2.0, u_time * 5.0));
   float ring = exp(-(r - R) * (r - R) * 6000.0)
              * (0.35 + 0.45 * u_level + 0.35 * u_act * shimmer);
-  vec3 ringCol = palette(hueBase + 0.05) * ring + vec3(0.3) * ring;
+  vec3 ringCol = mix(palette(hueBase + 0.05), moodRim, u_mood.y * 0.55) * ring + vec3(0.3) * ring;
 
   // Halo around the glass — wide, soft falloff. Nearly gone at rest,
   // blooming with the voice.
   float glow = exp(-max(r - R, 0.0) * 3.0)
              * smoothstep(R - 0.02, R + 0.06, r)
              * (0.025 + 0.38 * u_level);
-  vec3 glowCol = palette(hueBase + 0.08) * glow;
+  vec3 glowCol = mix(palette(hueBase + 0.08), moodRim, u_mood.y * 0.55) * glow;
   vec2 hl = uv - vec2(-0.32, 0.38) * R;
   float highlight = (exp(-dot(hl, hl) * 60.0) * 0.5 + exp(-dot(hl, hl) * 9.0) * 0.12)
                   * mix(0.55, 1.0, u_ready);
@@ -1989,7 +2065,7 @@ function initGL() {
   const loc = gl.getAttribLocation(prog, "p");
   gl.enableVertexAttribArray(loc);
   gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
-  for (const name of ["u_res", "u_time", "u_level", "u_hue", "u_conn", "u_spin", "u_rot", "u_act", "u_ready"]) {
+  for (const name of ["u_res", "u_time", "u_level", "u_hue", "u_conn", "u_spin", "u_rot", "u_act", "u_ready", "u_mood"]) {
     uniforms[name] = gl.getUniformLocation(prog, name);
   }
   // Array uniforms may be reported with a [0] suffix depending on the driver.
@@ -2079,6 +2155,7 @@ function frame() {
 
   revealBotText(dt);
   fillerTick(now);
+  stepMood(now, dt);
   readySmooth += ((assistantReady ? 1 : 0) - readySmooth) * 0.02;
 
   // Smooth the audio level: fast attack, gentle release.
@@ -2098,7 +2175,7 @@ function frame() {
     orbState.listening ? 0.45 : 0,
   );
   orbState.act += (actTarget - orbState.act) * (actTarget > orbState.act ? 0.08 : 0.025);
-  orbState.spin += stepSpin(now, dt, 0.05 + orbState.act * 0.9);
+  orbState.spin += stepSpin(now, dt, 0.05 + orbState.act * 0.9 + mood.intensity * 0.12);
 
   connSmooth += (orbState.conn - connSmooth) * 0.03;
 
@@ -2111,6 +2188,7 @@ function frame() {
   orbState.mic += (micTarget - orbState.mic) * (micTarget > orbState.mic ? 0.4 : 0.08);
   glowHaze.style.setProperty("--mic-scale", (1 + orbState.mic * 0.22).toFixed(3));
   glowHaze.style.setProperty("--mic-bright", (1 + orbState.mic * 1.25).toFixed(3));
+  glowHaze.style.setProperty("--mood-bright", (1 + mood.valence * 0.25).toFixed(3));
 
   // Feed the accent color (matches the orb) to the chat CSS; the bottom
   // haze derives its gradient hues from the same angle.
@@ -2130,6 +2208,7 @@ function frame() {
   gl.uniformMatrix3fv(uniforms.u_rot, false, spinMat3());
   gl.uniform1f(uniforms.u_act, orbState.act);
   gl.uniform1f(uniforms.u_ready, readySmooth);
+  gl.uniform4f(uniforms.u_mood, mood.tintHue, mood.tint, mood.valence, mood.intensity);
   gl.drawArrays(gl.TRIANGLES, 0, 3);
 
   // Sample the freshly drawn plasma (must happen in the same frame as the
@@ -2156,9 +2235,11 @@ uniform float u_hue; // live orb hue — the glow band and flares follow it
 uniform vec3  u_flares[16]; // xy = source position, z = intensity 0..1
 uniform float u_flareT;    // slow phase (ghosts drift)
 uniform vec2  u_flareDir;  // shared flare axis (rotates with the orb)
+uniform vec4  u_mood;      // page mood: x = tint hue, y = tint amount, z = valence -1..1, w = intensity
+uniform float u_mistT;     // mist phase (seconds; runs faster in intense moods)
 
 // Static palette: deep blue/violet mist with a faint warm counter-layer.
-const float HUE = 0.62;
+const float HUE = 0.28;
 
 float hash(vec2 p) {
   p = fract(p * vec2(123.34, 456.21));
@@ -2181,7 +2262,9 @@ float fbm(vec2 p) {
   return v;
 }
 vec3 palette(float t) {
-  return 0.5 + 0.5 * cos(6.28318 * (t + vec3(0.0, 0.33, 0.67)));
+  vec3 c = 0.5 + 0.5 * cos(6.28318 * (t + vec3(0.0, 0.33, 0.67)));
+  // The sky never goes grass-green: part of the green leans into teal.
+  return vec3(c.r, c.g * 0.72, c.b + c.g * 0.22);
 }
 
 void main() {
@@ -2203,18 +2286,22 @@ void main() {
     vec2 sd = f - sp;
     float tw = 0.55 + 0.45 * sin(u_time * (0.5 + h * 2.2) + h * 40.0);
     float star = exp(-dot(sd, sd) * 240.0) * step(0.8, h) * tw;
-    c += vec3(0.75, 0.82, 1.0) * star * (l == 0 ? 0.55 : 0.3);
+    c += vec3(0.75, 0.82, 1.0) * star * (l == 0 ? 0.55 : 0.3) * (1.0 + 0.25 * u_mood.z);
   }
 
-  // Slow colored mist: everywhere, but denser around the orb.
-  float t = u_time * 0.03;
+  // Slow colored mist: everywhere, but denser around the orb. The page mood
+  // tints it toward the emotion's color, brightens or dims it with the
+  // conversation's lightness, and drains color in heavy moods.
+  float t = u_mistT * 0.03;
   float m1 = fbm(p * 1.1 + vec2(t, -t * 0.7));
   float m2 = fbm(p * 1.8 - vec2(t * 0.8, t * 0.5) + m1);
   vec2 od = p - u_orb;
   float focus = exp(-dot(od, od) * 0.5);
-  float mist = m2 * m2 * (0.35 + 0.65 * focus);
-  c += palette(HUE + m1 * 0.3) * mist * 0.16;
-  c += palette(HUE + 0.45 + m2 * 0.2) * m1 * m1 * 0.06;
+  float mist = m2 * m2 * (0.35 + 0.65 * focus) * (1.0 + 0.35 * u_mood.z + 0.25 * u_mood.w);
+  vec3 mistCol = mix(palette(HUE + m1 * 0.3), palette(u_mood.x + m1 * 0.2), u_mood.y * 0.75);
+  mistCol = mix(mistCol, vec3(dot(mistCol, vec3(0.333))), max(-u_mood.z, 0.0) * 0.35);
+  c += mistCol * mist * 0.16;
+  c += palette(HUE + 0.45 + m2 * 0.2) * m1 * m1 * 0.06 * (1.0 + 0.3 * u_mood.z);
 
   // Dim glow band stretching left and right from behind the orb:
   // tight vertically, reaching far horizontally.
@@ -2222,7 +2309,8 @@ void main() {
   // and glowing brighter the closer it gets to the orb itself.
   float band = exp(-(od.x * od.x * 0.4 + od.y * od.y * 5.5));
   float bandGain = 0.09 + 0.11 * exp(-dot(od, od) * 2.0);
-  c += palette(u_hue - u_time * 0.015 + 0.42) * band * bandGain;
+  c += mix(palette(u_hue - u_time * 0.015 + 0.42), palette(u_mood.x + 0.04), u_mood.y * 0.6)
+       * band * bandGain;
 
   // Lens flares born directly from bright plasma: every sample point on
   // the sphere emits its own flare when bright — no selection, so flares
@@ -2255,6 +2343,9 @@ void main() {
       c += fc * fl.z * 0.13;
     }
   }
+
+  // Heavy moods close in a little: the edges darken around the orb.
+  c *= 1.0 - max(-u_mood.z, 0.0) * 0.4 * smoothstep(0.5, 1.8, length(od));
 
   // Fade the whole scene into black towards the bottom (under the chat).
   c *= smoothstep(0.0, 0.55, gl_FragCoord.y / u_res.y);
@@ -2290,7 +2381,7 @@ function initBG() {
   bgGl.vertexAttribPointer(loc, 2, bgGl.FLOAT, false, 0, 0);
   bgUniforms = {};
   for (const name of ["u_res", "u_time", "u_orb", "u_hue",
-                      "u_flareT", "u_flareDir"]) {
+                      "u_flareT", "u_flareDir", "u_mood", "u_mistT"]) {
     bgUniforms[name] = bgGl.getUniformLocation(prog, name);
   }
   bgUniforms.u_flares =
@@ -2389,6 +2480,8 @@ function renderBG(time) {
   bgGl.uniform2f(bgUniforms.u_res, W, H);
   bgGl.uniform1f(bgUniforms.u_time, time);
   bgGl.uniform1f(bgUniforms.u_hue, orbState.hue);
+  bgGl.uniform4f(bgUniforms.u_mood, mood.tintHue, mood.tint, mood.valence, mood.intensity);
+  bgGl.uniform1f(bgUniforms.u_mistT, mood.mistT);
   const fDir = currentFlareDir();
   const orbY = 0.5 * H / m; // orb center: horizontally centered, 25% down
   const uvScale = canvas.clientHeight / m; // orb-uv → bg coordinate space
