@@ -41,6 +41,7 @@ import shutil
 import time
 from datetime import datetime, timedelta
 from types import SimpleNamespace
+from urllib.parse import quote, urlencode
 
 from dotenv import load_dotenv
 
@@ -798,6 +799,14 @@ async def open_in_browser(params: FunctionCallParams):
             return
 
     logger.info(f"open_in_browser: [{url}]")
+    if error := await _open_url(url):
+        await params.result_callback({"error": error})
+        return
+    await params.result_callback({"status": "opened", "url": url})
+
+
+async def _open_url(url: str) -> str | None:
+    """Open a web URL in the default browser; the error message, or None on success."""
     proc = await asyncio.create_subprocess_exec(
         "open", url,
         stdout=asyncio.subprocess.DEVNULL,
@@ -805,11 +814,33 @@ async def open_in_browser(params: FunctionCallParams):
     )
     _, stderr = await proc.communicate()
     if proc.returncode != 0:
-        await params.result_callback(
-            {"error": f"could not open the browser: {stderr.decode(errors='ignore').strip()}"}
-        )
+        return f"could not open the browser: {stderr.decode(errors='ignore').strip()}"
+    return None
+
+
+# The screen is a chat page in the browser: ?q= has it write its own answer
+# to a prompt, ?f= renders markdown handed to it as-is.
+SCREEN_URL = os.getenv("SCREEN_URL", "https://serrynaimo.com/chat")
+
+
+async def show_on_screen(params: FunctionCallParams):
+    """Tool handler: put markdown, or a written answer to a prompt, on screen."""
+    markdown = str(params.arguments.get("markdown") or "").strip()
+    prompt = str(params.arguments.get("prompt") or "").strip()
+    if not markdown and not prompt:
+        await params.result_callback({"error": "nothing to show — pass markdown or a prompt"})
         return
-    await params.result_callback({"status": "opened", "url": url})
+
+    # Content already in hand wins over asking the page to write it.
+    query = {"f": markdown} if markdown else {"q": prompt}
+    url = f"{SCREEN_URL}?{urlencode(query, quote_via=quote)}"
+    logger.info(f"show_on_screen: [{url[:200]}]")
+    if error := await _open_url(url):
+        await params.result_callback({"error": error})
+        return
+    await params.result_callback(
+        {"status": "on screen", "content": "rendered" if markdown else "being written by the page"}
+    )
 
 
 def _recent_conversation(context, max_messages: int = 6) -> str:
@@ -2612,6 +2643,34 @@ open_in_browser_schema = FunctionSchema(
 )
 
 
+show_on_screen_schema = FunctionSchema(
+    name="show_on_screen",
+    description=(
+        "Show content on the user's screen, in a chat page that opens in their "
+        "browser. Use when the user asks to see or show something, or when it "
+        "reads better than it sounds — tables, lists, steps, code, comparisons, "
+        "long details. Pass markdown to render content you already have; pass "
+        "prompt instead to have the page write a fuller answer itself. Then just "
+        "say it's on screen — don't read it out."
+    ),
+    properties={
+        "markdown": {
+            "type": "string",
+            "description": "Finished, self-contained markdown to render as-is",
+        },
+        "prompt": {
+            "type": "string",
+            "description": (
+                "A question or request for the page to answer in writing — it "
+                "can't see this chat, so include the details it needs"
+            ),
+        },
+    },
+    required=[],
+    handler=show_on_screen,
+)
+
+
 web_search_schema = FunctionSchema(
     name="web_search",
     description=(
@@ -2752,7 +2811,7 @@ def _with_current_time(handler):
 for _schema in (
     web_search_schema, read_web_page_schema, x_search_schema,
     background_research_schema,
-    open_in_browser_schema, find_files_schema, open_file_schema,
+    open_in_browser_schema, show_on_screen_schema, find_files_schema, open_file_schema,
     read_file_schema, search_email_schema, read_email_schema, save_attachment_schema, draft_email_schema, send_email_schema, discard_draft_schema, archive_email_schema, trash_email_schema, mark_email_schema, search_local_schema, recent_notifications_schema,
     run_javascript_schema, get_weather_schema,
     remember_schema, recall_schema, forget_schema,
@@ -2826,7 +2885,8 @@ for _schema in (
 for _schema in (
     web_search_schema, read_web_page_schema, x_search_schema,
     background_research_schema,
-    get_current_time_schema, open_in_browser_schema, find_files_schema,
+    get_current_time_schema, open_in_browser_schema, show_on_screen_schema,
+    find_files_schema,
     open_file_schema, read_file_schema, search_email_schema, read_email_schema, save_attachment_schema, draft_email_schema, send_email_schema, discard_draft_schema, archive_email_schema, trash_email_schema, mark_email_schema, search_local_schema,
     recent_notifications_schema, run_javascript_schema,
     get_weather_schema, get_financial_info_schema, remember_schema,
@@ -2841,7 +2901,8 @@ for _schema in (
 NATIVE_TOOL_SCHEMAS = (
     web_search_schema, read_web_page_schema, x_search_schema,
     background_research_schema,
-    get_current_time_schema, open_in_browser_schema, find_files_schema,
+    get_current_time_schema, open_in_browser_schema, show_on_screen_schema,
+    find_files_schema,
     open_file_schema, read_file_schema, search_email_schema, read_email_schema, save_attachment_schema, draft_email_schema, send_email_schema, discard_draft_schema, archive_email_schema, trash_email_schema, mark_email_schema, search_local_schema,
     recent_notifications_schema, run_javascript_schema,
     get_weather_schema, get_financial_info_schema, remember_schema,
@@ -4523,6 +4584,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
         background_research_schema,
         get_current_time_schema,
         open_in_browser_schema,
+        show_on_screen_schema,
         find_files_schema,
         open_file_schema,
         read_file_schema,
