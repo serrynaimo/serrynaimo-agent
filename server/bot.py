@@ -230,11 +230,8 @@ def _net_error(action: str, exc: Exception) -> dict:
 
 
 async def _xai_responses(input_messages: list, tools: list, timeout: int = 60,
-                         action: str = "web search") -> dict:
-    """Call xAI's Responses API with server-side tools; parse answer+citations.
-
-    Shared by the quick searches and the deeper background_research tool.
-    """
+                         action: str = "X search") -> dict:
+    """Call xAI's Responses API with server-side tools; parse answer+citations."""
     api_key = os.getenv("XAI_API_KEY")
     if not api_key:
         return {"error": "XAI_API_KEY not configured"}
@@ -276,11 +273,50 @@ async def _xai_responses(input_messages: list, tools: list, timeout: int = 60,
     return {"answer": answer, "citations": list(dict.fromkeys(citations))[:8]}
 
 
-async def _xai_search(query: str, tool_type: str) -> dict:
-    """Quick search through one xAI server-side tool ("web_search"/"x_search")."""
-    return await _xai_responses(
-        [{"role": "user", "content": query}], [{"type": tool_type}]
-    )
+async def _research(instructions: str, user: str) -> dict:
+    """Ask the research agent (a Hermes Agent API server) and wait for its answer.
+
+    OpenAI-compatible chat completions at BACKGROUND_RESEARCH_BASE_URL; the
+    agent runs its own tools (web search, page reading, …) inside the one
+    request, so this can take minutes.
+    """
+    api_key = os.getenv("BACKGROUND_RESEARCH_API_KEY")
+    if not api_key:
+        return {"error": "BACKGROUND_RESEARCH_API_KEY not configured"}
+    base_url = os.getenv("BACKGROUND_RESEARCH_BASE_URL", "http://192.168.50.66:8642/v1")
+    payload = {
+        "model": os.getenv("BACKGROUND_RESEARCH_MODEL", "hermes-agent"),
+        "messages": [{"role": "system", "content": instructions},
+                     {"role": "user", "content": user}],
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{base_url.rstrip('/')}/chat/completions",
+                json=payload,
+                headers={"Authorization": f"Bearer {api_key}"},
+                timeout=aiohttp.ClientTimeout(
+                    total=int(os.getenv("BACKGROUND_RESEARCH_TIMEOUT_SECS", "600"))),
+            ) as response:
+                data = await response.json(content_type=None)
+                if response.status != 200:
+                    err = data.get("error", data) if isinstance(data, dict) else data
+                    msg = err.get("message", err) if isinstance(err, dict) else err
+                    return {"error": f"the researcher failed ({response.status}): {msg}"}
+    except aiohttp.ClientConnectorError:
+        # A LAN host being down isn't "no internet" — say which one it is.
+        return {"error": f"the research server at {base_url} is unreachable"}
+    except Exception as exc:  # noqa: BLE001
+        return _net_error("the background research", exc)
+
+    choice = (data.get("choices") or [{}])[0]
+    answer = ((choice.get("message") or {}).get("content") or "").strip()
+    finish = choice.get("finish_reason")
+    if not answer or finish in ("error", "cancelled"):
+        return {"error": f"the researcher returned no answer (finish_reason: {finish})"}
+    if finish == "length":  # the agent's iteration budget ran out mid-research
+        return {"answer": answer, "note": "the researcher ran out of steps; findings may be incomplete"}
+    return {"answer": answer}
 
 
 # Background research tasks in flight, keyed by their normalized query — a
@@ -290,16 +326,16 @@ _BG_RESEARCH: dict[str, asyncio.Task] = {}
 
 
 async def background_research(params: FunctionCallParams):
-    """Tool handler: start a deep web+X research task in the BACKGROUND.
+    """Tool handler: start a deep web research task in the BACKGROUND.
 
-    Grok (xAI) does the work under the hood, but the model just sees an
-    anonymous background researcher: the call returns immediately, the
-    session keeps going (speech, other tools), and the findings are injected
-    into the conversation — with a fresh LLM run — whenever they arrive.
-    Because no function call stays in flight, voice interruptions and the
-    tool-stall watchdog never touch it. Via /api/chat (params.llm is None)
-    there is no live session to report back into, so it runs synchronously
-    there instead.
+    A research agent (see _research) does the work under the hood, but the
+    model just sees an anonymous background researcher: the call returns
+    immediately, the session keeps going (speech, other tools), and the
+    findings are injected into the conversation — with a fresh LLM run —
+    whenever they arrive. Because no function call stays in flight, voice
+    interruptions and the tool-stall watchdog never touch it. Via /api/chat
+    (params.llm is None) there is no live session to report back into, so it
+    runs synchronously there instead.
     """
     query = str(params.arguments.get("query", "")).strip()
     if not query:
@@ -309,23 +345,14 @@ async def background_research(params: FunctionCallParams):
     logger.info(f"background_research: [{query[:80]}]")
     instructions = (
         "You are a careful expert consultant. Reason step by step and give a "
-        "thorough, well-grounded synthesis. Prefer verified facts; use web and "
-        "X search to check anything uncertain. If evidence is thin or "
+        "thorough, well-grounded synthesis. Prefer verified facts; research the "
+        "web to check anything uncertain. If evidence is thin or "
         "conflicting, say so plainly rather than guessing. Cite key sources."
     )
     user = query if not context_note else f"{query}\n\nContext from the user:\n{context_note}"
 
     async def _run() -> dict:
-        result = await _xai_responses(
-            [{"role": "system", "content": instructions},
-             {"role": "user", "content": user}],
-            [{"type": "web_search"}, {"type": "x_search"}],
-            timeout=int(os.getenv("BACKGROUND_RESEARCH_TIMEOUT_SECS", "240")),
-            action="the background research",
-        )
-        if "error" in result and "not configured" in result["error"]:
-            result["hint"] = "XAI_API_KEY is required for background research"
-        return result
+        return await _research(instructions, user)
 
     llm, context = params.llm, params.context
     if llm is None:  # /api/chat — synchronous, the HTTP caller wants the answer
@@ -381,57 +408,80 @@ async def background_research(params: FunctionCallParams):
     })
 
 
-async def _google_search(query: str) -> dict:
-    """Fallback web search via Google Custom Search."""
+async def _keenable(method: str, endpoint: str, action: str, timeout: int, **kwargs) -> dict:
+    """Call a Keenable (keenable.ai) endpoint, returning its JSON or an error.
+
+    With KEENABLE_API_KEY set it uses the keyed endpoint; without one, the
+    keyless /public twin (shared per-IP pool, ~1,000 requests an hour).
+    """
+    api_key = os.getenv("KEENABLE_API_KEY")
+    if api_key:
+        url, headers = f"https://api.keenable.ai/v1/{endpoint}", {"X-API-Key": api_key}
+    else:
+        url, headers = (f"https://api.keenable.ai/v1/{endpoint}/public",
+                        {"X-Keenable-Title": AGENT_NAME})
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(
-                "https://www.googleapis.com/customsearch/v1",
-                params={
-                    "key": os.getenv("GOOGLE_SEARCH_API_KEY"),
-                    "cx": os.getenv("GOOGLE_SEARCH_ENGINE_ID"),
-                    "q": query,
-                    "num": 5,
-                },
-                timeout=aiohttp.ClientTimeout(total=10),
+            async with session.request(
+                method, url, headers=headers,
+                timeout=aiohttp.ClientTimeout(total=timeout), **kwargs,
             ) as response:
                 data = await response.json()
+                if response.status != 200:
+                    msg = (data.get("message") or data.get("error")) if isinstance(data, dict) else data
+                    return {"error": f"{action} failed ({response.status}): {msg}"}
     except Exception as exc:  # noqa: BLE001
-        return _net_error("web search", exc)
+        return _net_error(action, exc)
+    return data
+
+
+async def web_search(params: FunctionCallParams):
+    """Tool handler: fast Keenable web search returning the top 5 results."""
+    query = str(params.arguments.get("query", "")).strip()
+    if not query:
+        await params.result_callback({"error": "empty query"})
+        return
+    logger.info(f"web_search: [{query}]")
+    data = await _keenable("POST", "search", "web search", 10, json={
+        "query": query, "max_results": 5, "snippet_max_length": 400,
+    })
     if "error" in data:
-        return {"error": data["error"].get("message", "search error")}
+        await params.result_callback(data)
+        return
     results = [
         {
             "title": item.get("title", ""),
-            "snippet": item.get("snippet", ""),
-            "url": item.get("link", ""),
+            "snippet": item.get("snippet") or item.get("description", ""),
+            "url": item.get("url", ""),
+            # Date of the snippet's content, so stale index copies show.
+            "date": (item.get("published_at") or item.get("acquired_at") or "")[:10],
         }
-        for item in data.get("items", [])[:5]
+        for item in data.get("results", [])[:5]
     ]
-    return {"results": results or "no results found"}
+    await params.result_callback({"results": results or "no results found"})
 
 
-async def google_search(params: FunctionCallParams):
-    """Tool handler: fast Google search returning the top 5 results."""
-    query = str(params.arguments.get("query", "")).strip()
-    if not query:
-        await params.result_callback({"error": "empty query"})
+async def read_web_page(params: FunctionCallParams):
+    """Tool handler: a web page's main content as markdown, via Keenable.
+
+    With `focus`, Keenable's extractor returns only what it asks for — short
+    and spoken-friendly instead of the whole (truncated) page.
+    """
+    url = str(params.arguments.get("url", "")).strip()
+    if not url.startswith(("http://", "https://")):
+        await params.result_callback({"error": "url must be a full http(s) web address"})
         return
-    logger.info(f"google_search: [{query}]")
-    await params.result_callback(await _google_search(query))
-
-
-async def x_web_search(params: FunctionCallParams):
-    """Tool handler: deep agentic web search via xAI (slower, reads pages)."""
-    query = str(params.arguments.get("query", "")).strip()
-    if not query:
-        await params.result_callback({"error": "empty query"})
-        return
-    logger.info(f"x_web_search: [{query}]")
-    result = await _xai_search(query, "web_search")
-    if "error" in result and "not configured" in result["error"]:
-        result["hint"] = "use google_search instead"
-    await params.result_callback(result)
+    focus = str(params.arguments.get("focus") or "").strip()
+    query = {"url": url, "max_chars": READ_MAX_CHARS}
+    if focus:
+        query["prompt"] = focus[:2000]
+    if params.arguments.get("live"):
+        query["live"] = "true"
+    logger.info(f"read_web_page: [{url}]" + (f" focus=[{focus[:80]}]" if focus else ""))
+    data = await _keenable("GET", "fetch", "reading the web page", 30, params=query)
+    if "error" not in data:
+        data = {k: data[k] for k in ("url", "title", "content") if data.get(k)}
+    await params.result_callback(data)
 
 
 async def x_search(params: FunctionCallParams):
@@ -441,7 +491,20 @@ async def x_search(params: FunctionCallParams):
         await params.result_callback({"error": "empty query"})
         return
     logger.info(f"x_search: [{query}]")
-    await params.result_callback(await _xai_search(query, "x_search"))
+    await params.result_callback(await _xai_responses(
+        [{"role": "user", "content": query}], [{"type": "x_search"}]
+    ))
+
+
+# Extra request-body fields for every chat completion sent to LMSTUDIO_BASE_URL.
+LMSTUDIO_EXTRA_BODY = {"priority": "xhigh"}
+
+
+def lmstudio_extra_body(base_url: str) -> dict:
+    """LMSTUDIO_EXTRA_BODY for requests to LMSTUDIO_BASE_URL; nothing for other endpoints (the omni server)."""
+    if base_url == os.getenv("LMSTUDIO_BASE_URL", "http://localhost:1234/v1"):
+        return LMSTUDIO_EXTRA_BODY
+    return {}
 
 
 async def detect_lmstudio_model(base_url: str) -> str | None:
@@ -2553,32 +2616,49 @@ open_in_browser_schema = FunctionSchema(
 )
 
 
-google_search_schema = FunctionSchema(
-    name="google_search",
+web_search_schema = FunctionSchema(
+    name="web_search",
     description=(
-        "Fast web search returning the top 5 Google results (title, snippet, "
-        "url). Responds quickly — good default for simple facts, lookups, and "
-        "anything a snippet can answer."
+        "Fast web search returning the top 5 results (title, snippet, url, "
+        "date). Responds quickly — good default for simple facts, lookups, and "
+        "anything a snippet can answer. Use read_web_page on a result when the "
+        "snippet isn't enough."
     ),
     properties={
         "query": {"type": "string", "description": "The search query"},
     },
     required=["query"],
-    handler=google_search,
+    handler=web_search,
 )
 
 
-x_web_search_schema = FunctionSchema(
-    name="x_web_search",
+read_web_page_schema = FunctionSchema(
+    name="read_web_page",
     description=(
-        "Deep web search that browses and reads pages, returning a researched "
-        "answer with citations. Use for questions needing depth or synthesis, not quick facts."
+        "Read a web page's content (as markdown). Use on a web_search result "
+        "whose snippet isn't enough, or a URL the user gives. Pass focus to get "
+        "just the part you need — faster and much shorter than the whole page."
     ),
     properties={
-        "query": {"type": "string", "description": "The research question"},
+        "url": {"type": "string", "description": "The full web URL to read"},
+        "focus": {
+            "type": "string",
+            "description": (
+                "Optional: what to pull out of the page, as an instruction "
+                "(e.g. 'the opening hours on Sundays')"
+            ),
+        },
+        "live": {
+            "type": "boolean",
+            "description": (
+                "Optional: fetch the page fresh from the site instead of the "
+                "index copy — for pages that change by the minute (live scores, "
+                "prices, breaking news). Slower."
+            ),
+        },
     },
-    required=["query"],
-    handler=x_web_search,
+    required=["url"],
+    handler=read_web_page,
 )
 
 
@@ -2603,12 +2683,13 @@ x_search_schema = FunctionSchema(
 background_research_schema = FunctionSchema(
     name="background_research",
     description=(
-        "Start a research task that runs in the BACKGROUND with live web and "
-        "X search access — for hard questions needing deep synthesis, "
-        "fact-critical answers, or when you are not confident enough. It "
-        "returns immediately; the findings are announced to you when ready "
+        "Hand a task to a BACKGROUND agent that can run extended checks, "
+        "research, knowledge base lookups, and control Hermes agents — for "
+        "hard questions needing deep synthesis, fact-critical answers, work "
+        "beyond your own tools, or when you are not confident enough. It "
+        "returns immediately; the result is announced to you when ready "
         "(a minute or two), so keep helping the user meanwhile — never wait "
-        "for it. The researcher has NO access to your other tools or this "
+        "for it. The agent has NO access to your other tools or this "
         "chat — include all non-public details in the query but mask private "
         "and identifiable information. Tell the user you're starting it."
     ),
@@ -2616,16 +2697,16 @@ background_research_schema = FunctionSchema(
         "query": {
             "type": "string",
             "description": (
-                "The full research question, self-contained (the researcher "
-                "can't see this chat). Mask the user's private details with "
+                "The full task or question, self-contained (the agent can't "
+                "see this chat). Mask the user's private details with "
                 "placeholders first."
             ),
         },
         "context": {
             "type": "string",
             "description": (
-                "Optional: facts from the conversation the researcher needs but "
-                "couldn't find online — with private identifiers masked by placeholders"
+                "Optional: facts from the conversation the agent needs but "
+                "couldn't look up itself — with private identifiers masked by placeholders"
             ),
         },
     },
@@ -2673,7 +2754,7 @@ def _with_current_time(handler):
 # stamp in their proxy — see mcp_toolsets._proxy). get_current_time and
 # get_financial_info are excluded.
 for _schema in (
-    google_search_schema, x_web_search_schema, x_search_schema,
+    web_search_schema, read_web_page_schema, x_search_schema,
     background_research_schema,
     open_in_browser_schema, find_files_schema, open_file_schema,
     read_file_schema, search_email_schema, read_email_schema, save_attachment_schema, draft_email_schema, send_email_schema, discard_draft_schema, archive_email_schema, trash_email_schema, mark_email_schema, search_local_schema, recent_notifications_schema,
@@ -2734,7 +2815,7 @@ def _dedup_inflight(handler):
 # background_research is NOT here: it returns instantly and keeps its own
 # in-flight registry (_BG_RESEARCH), which also answers duplicates.
 for _schema in (
-    google_search_schema, x_web_search_schema, x_search_schema,
+    web_search_schema, read_web_page_schema, x_search_schema,
     find_files_schema, read_file_schema,
     search_email_schema, read_email_schema, search_local_schema,
     recent_notifications_schema, get_weather_schema,
@@ -2747,7 +2828,7 @@ for _schema in (
 # work. The enrolled speaker's cancellation happens explicitly via the
 # verified-speech hook in run_bot once the speaker gate confirms the voice.
 for _schema in (
-    google_search_schema, x_web_search_schema, x_search_schema,
+    web_search_schema, read_web_page_schema, x_search_schema,
     background_research_schema,
     get_current_time_schema, open_in_browser_schema, find_files_schema,
     open_file_schema, read_file_schema, search_email_schema, read_email_schema, save_attachment_schema, draft_email_schema, send_email_schema, discard_draft_schema, archive_email_schema, trash_email_schema, mark_email_schema, search_local_schema,
@@ -2762,7 +2843,7 @@ for _schema in (
 # Every native tool, for sessions and for /api/chat (load_toolset is
 # session-bound and excluded — the API preloads all MCP toolsets instead).
 NATIVE_TOOL_SCHEMAS = (
-    google_search_schema, x_web_search_schema, x_search_schema,
+    web_search_schema, read_web_page_schema, x_search_schema,
     background_research_schema,
     get_current_time_schema, open_in_browser_schema, find_files_schema,
     open_file_schema, read_file_schema, search_email_schema, read_email_schema, save_attachment_schema, draft_email_schema, send_email_schema, discard_draft_schema, archive_email_schema, trash_email_schema, mark_email_schema, search_local_schema,
@@ -3734,7 +3815,8 @@ async def run_text_chat(prompt: str, history: list, max_tool_rounds: int = 6) ->
         for _ in range(max_tool_rounds + 1):
             async with http.post(
                 f"{base_url}/chat/completions",
-                json={"model": model, "messages": messages, "tools": tools},
+                json={"model": model, "messages": messages, "tools": tools,
+                      **lmstudio_extra_body(base_url)},
                 headers={"Authorization": f"Bearer {os.getenv('LMSTUDIO_API_KEY', 'lm-studio')}"},
                 timeout=aiohttp.ClientTimeout(total=300),
             ) as r:
@@ -3962,6 +4044,7 @@ class NotificationAnnouncer:
             "messages": [{"role": "system", "content": system},
                          {"role": "user", "content": user}],
             "temperature": 0.2, "max_tokens": 120,
+            **lmstudio_extra_body(self._base_url),
         }
         try:
             async with aiohttp.ClientSession() as http:
@@ -4209,7 +4292,8 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
     # Qwen3-Omni's chat template into near-empty completions (a stray '\n'
     # or ':' and immediate EOS). Those sessions get cooler sampling instead,
     # because tool discipline on audio turns degrades at the server default
-    # (~0.8).
+    # (~0.8). The LMSTUDIO_EXTRA_BODY fields are separate: every session on
+    # LMSTUDIO_BASE_URL sends them, audio-native or not.
     # Model-aware, not just mode-aware: an omni model served at the LM
     # Studio endpoint (llama-server on another machine, say) must never
     # receive the reasoning-suppression fields either — even in mode 0,
@@ -4221,14 +4305,15 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
         or "omni" in (llm_model or "").lower()
     )
     llm_extra = {}
+    extra_body = dict(lmstudio_extra_body(base_url))
     llm_settings = {"model": llm_model}
     if audio_native:
         llm_settings["temperature"] = float(os.getenv("OMNI_LLM_TEMPERATURE", "0.4"))
     else:
-        llm_extra = {
-            "reasoning_effort": os.getenv("LMSTUDIO_REASONING_EFFORT", "low"),
-            "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
-        }
+        llm_extra["reasoning_effort"] = os.getenv("LMSTUDIO_REASONING_EFFORT", "low")
+        extra_body["chat_template_kwargs"] = {"enable_thinking": False}
+    if extra_body:
+        llm_extra["extra_body"] = extra_body
     llm = LMStudioLLMService(
         base_url=base_url,
         api_key=os.getenv("LMSTUDIO_API_KEY", "lm-studio"),
@@ -4381,8 +4466,8 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
         await worker.queue_frames([LLMRunFrame()])
 
     base_schemas = [
-        google_search_schema,
-        x_web_search_schema,
+        web_search_schema,
+        read_web_page_schema,
         x_search_schema,
         background_research_schema,
         get_current_time_schema,

@@ -35,7 +35,7 @@ Built on [Pipecat](https://github.com/pipecat-ai/pipecat), the open-source frame
 - **[LM Studio](https://lmstudio.ai)** with a model loaded — this is what runs Serry's "brain"
 - **[uv](https://docs.astral.sh/uv/)** and **Node.js** — used to install and run everything
 
-You don't need any accounts or API keys to get going. A few optional online features (deeper web search, live stock prices, a cloud model to escalate to) can be switched on later by adding keys — more on that below.
+You don't need any accounts or API keys to get going. A few optional online features (X search, live stock prices, a cloud model to escalate to) can be switched on later by adding keys — more on that below.
 
 ---
 
@@ -162,24 +162,32 @@ You can also just tell her to **be quiet** ("shut up", "stop", "thank you") or t
 
 ## Optional online extras
 
-Serry is fully capable offline. These optional services simply extend her reach into the wider world — switch on only the ones you want by pasting a key into your `.env`. Weather already works out of the box, with no key at all (via the free [Open-Meteo](https://open-meteo.com)).
+Serry is fully capable offline. These optional services simply extend her reach into the wider world — switch on only the ones you want by pasting a key into your `.env`. Weather, web search and reading web pages already work out of the box, with no key at all (via the free [Open-Meteo](https://open-meteo.com) and [Keenable](https://keenable.ai)'s keyless tier).
 
-### Grok — a bigger brain, plus live web &amp; X search (paid)
+### Grok — X search (paid)
 
-Lets Serry hand a hard question to xAI's **Grok** as a background research task — she keeps chatting and reports the findings whenever they're ready — and powers her deep **web search** and **X (Twitter) search**. This one is **paid** — create a key in the [xAI console](https://console.x.ai).
+Powers Serry's **X (Twitter) search**, through xAI's **Grok**. This one is **paid** — create a key in the [xAI console](https://console.x.ai).
 
 ```bash
 XAI_API_KEY=your-key-here
 #XAI_MODEL=grok-4.5     # optional — this is already the default
 ```
 
-### Google search — everyday web lookups (free, ~100/day)
+### Hermes Agent — background research
 
-A free way to give Serry general web search (she falls back to this when Grok isn't set up). It needs **two** values: an API key and a search-engine ID. Create a Programmable Search Engine at [programmablesearchengine.google.com](https://programmablesearchengine.google.com), then get the key from the [Custom Search docs](https://developers.google.com/custom-search/v1/overview). Free for roughly **100 searches a day**.
+Lets Serry hand a hard question to a [Hermes Agent](https://hermes-agent.nousresearch.com) as a background research task — she keeps chatting and reports the findings whenever they're ready. Point her at the agent's [API server](https://hermes-agent.nousresearch.com/docs/user-guide/features/api-server) and give her its `API_SERVER_KEY`.
 
 ```bash
-GOOGLE_SEARCH_API_KEY=your-key-here
-GOOGLE_SEARCH_ENGINE_ID=your-engine-id
+BACKGROUND_RESEARCH_BASE_URL=http://192.168.50.66:8642/v1
+BACKGROUND_RESEARCH_API_KEY=your-api-server-key
+```
+
+### Keenable — everyday web lookups and page reading (free without a key)
+
+Powers Serry's quick **web search** and lets her **read a web page** — the whole page, or just the part she asks for ("the opening hours on Sundays"). It works with no key, on Keenable's keyless tier: a pool of about **1,000 requests an hour**, shared with everyone else on your IP address. If you hit that limit, a key from the [Keenable console](https://app.keenable.ai/console) removes the hourly cap ([docs](https://docs.keenable.ai)).
+
+```bash
+KEENABLE_API_KEY=keen_your-key-here
 ```
 
 ### Alpha Vantage — stocks, currencies &amp; crypto (free, 25/day)
