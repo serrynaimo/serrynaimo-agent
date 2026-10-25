@@ -105,7 +105,6 @@ from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import (
-    LLMAssistantAggregatorParams,
     LLMContextAggregatorPair,
     LLMUserAggregatorParams,
 )
@@ -124,10 +123,7 @@ from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.transports.daily.transport import DailyParams
 from pipecat.turns.user_start import TranscriptionUserTurnStartStrategy
 from pipecat.turns.user_turn_strategies import UserTurnStrategies
-from pipecat.utils.context.llm_context_summarization import (
-    LLMAutoContextSummarizationConfig,
-    LLMContextSummaryConfig,
-)
+from pipecat.utils.context.llm_context_summarization import LLMContextSummarizationUtil
 from pipecat.utils.string import TextPartForConcatenation
 from pipecat.workers.runner import WorkerRunner
 
@@ -2877,9 +2873,9 @@ _INJECT_STOPWORDS = {
 # startup so they play instantly even while the LLM saturates the GPU.
 FILLER_LINES = ["Give me a moment", "Just a second", "Hang in there a sec", "One moment", "Orbiting on that", "On it"]
 
-# Spoken when the context hits the token limit and gets compressed into a
-# summary (a slow, full-reprefill operation). Primed like the fillers, but
-# NOT part of the client's filler rotation.
+# Spoken when the context hits the token limit and its oldest turns get
+# dropped (the next request re-prefills the whole window). Primed like the
+# fillers, but NOT part of the client's filler rotation.
 REFOCUS_LINE = "I need a minute to refocus my energy. I'll be right back."
 
 
@@ -2943,8 +2939,16 @@ class LMStudioLLMService(OpenAILLMService):
     # result — from the third consecutive repeat it's a loop, not a retry.
     REPEAT_CALL_LIMIT = 2
 
-    def __init__(self, *args, **kwargs):
+    # Rolling context window: once the context reaches context_max_tokens,
+    # the oldest turns are dropped in one chunk, down to this share of the
+    # cap. Every trim changes the prompt prefix and costs one full
+    # re-prefill, so trimming a turn at a time would pay that on every turn.
+    CONTEXT_TRIM_TO = 0.6
+
+    def __init__(self, *args, context_max_tokens: int | None = None, **kwargs):
         super().__init__(*args, **kwargs)
+        self._context_max_tokens = context_max_tokens
+        self._register_event_handler("on_context_trimmed")
         self._verbatim_parts: list[str] = []
         self._verbatim_ledger: dict[int, str] = {}
         self._verbatim_seq = 0
@@ -2962,10 +2966,65 @@ class LMStudioLLMService(OpenAILLMService):
         arguments). Only repetition WITHIN one tool chain counts."""
         self._last_call_key, self._repeat_call_count = None, 0
 
+    async def get_chat_completions(self, context):
+        dropped = self._trim_context(context)
+        if dropped:
+            await self._call_event_handler("on_context_trimmed", dropped)
+        return await super().get_chat_completions(context)
+
+    def _trim_context(self, context) -> int:
+        """Rolling window: drop the oldest messages once the context hits the cap.
+
+        Runs before every completion, on the shared session context. Keeps
+        the system prompt and the session <system-note>, cuts only at a user
+        message (the latest one always stays), and never drops a tool call
+        whose result is pending or would be left behind in the kept part.
+        No summary — dropped turns are simply gone. Returns how many
+        messages were dropped.
+        """
+        limit = self._context_max_tokens
+        messages = context.messages
+        if limit is None or not messages:
+            return 0
+        tokens = [LLMContextSummarizationUtil.estimate_context_tokens(LLMContext(messages=[m]))
+                  for m in messages]
+        total = sum(tokens)
+        if total < limit:
+            return 0
+
+        def role(m):
+            return m.get("role") if isinstance(m, dict) else None
+
+        head = 1 if role(messages[0]) == "system" else 0
+        if (head < len(messages) and role(messages[head]) == "user"
+                and str(messages[head].get("content", "")).startswith("<system-note>")):
+            head += 1
+        last_user = max((i for i, m in enumerate(messages) if role(m) == "user"), default=-1)
+        target = limit * self.CONTEXT_TRIM_TO
+        cut, dropped_tokens = None, 0
+        for i in range(head + 1, last_user + 1):
+            dropped_tokens += tokens[i - 1]
+            if role(messages[i]) != "user":
+                continue
+            if LLMContextSummarizationUtil._get_earliest_function_call_not_resolved_in_range(  # noqa: SLF001
+                    messages, head, i) >= 0:
+                continue
+            cut = i
+            if total - dropped_tokens <= target:
+                break
+        if cut is None:
+            logger.warning(f"Context at ~{total} tokens (cap {limit}) but no safe point to trim at")
+            return 0
+        context.set_messages(messages[:head] + messages[cut:])
+        kept = LLMContextSummarizationUtil.estimate_context_tokens(context)
+        logger.info(f"Context window: ~{total} tokens reached the {limit} cap — dropped the "
+                    f"{cut - head} oldest messages, ~{kept} tokens left")
+        return cut - head
+
     async def run_function_calls(self, function_calls):
         """Brake for tool-call repetition loops (small models get stuck
         re-issuing the identical call: same name, same arguments, identical
-        result, forever — burning a context-compression cycle per lap).
+        result, forever — burning a context-trim cycle per lap).
         Blocked calls never execute; the model gets an error result telling
         it to answer or change course. Applied only to single-call batches —
         grouped parallel calls have their own completion bookkeeping.
@@ -3797,7 +3856,7 @@ async def run_text_chat(prompt: str, history: list, max_tool_rounds: int = 6) ->
         base_url = omni_llm_base_url()
         model = os.getenv("OMNI_LLM_MODEL", OMNI_LLM_DEFAULT_MODEL)
     else:
-        model = os.getenv("LMSTUDIO_MODEL") or await detect_lmstudio_model(base_url) or "qwen3.5-122b-a10b"
+        model = os.getenv("LMSTUDIO_MODEL") or await detect_lmstudio_model(base_url) or "qwen3.8-27b"
     calendar_block, files_block = await asyncio.gather(
         _calendar_outlook_block(), _recent_files_block()
     )
@@ -4253,20 +4312,20 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
             # another box) — the standard /v1/models works everywhere.
             llm_model = await detect_openai_model(base_url)
         if not llm_model:
-            llm_model = "qwen3.5-122b-a10b"
+            llm_model = "qwen3.8-27b"
             logger.warning(f"No model detected at {base_url}; falling back to {llm_model}")
         logger.info(f"LLM model for this session: {llm_model}")
 
-    # Context-compression threshold. "auto" senses the loaded model's context
-    # window from LM Studio and reserves ~16k for the tools array + template
-    # overhead (~12k here), the response, and the chars/4 estimation error.
-    # Recovery cost scales with the LIVE context — every summarization and
-    # every cache-missing turn re-prefills all of it (~2k tok/s) — so pin a
-    # smaller explicit value if compression stalls feel long.
+    # Context window cap (see LMStudioLLMService._trim_context). "auto" senses
+    # the loaded model's context window from LM Studio and reserves ~16k for
+    # the tools array + template overhead (~12k here), the response, and the
+    # chars/4 estimation error. Recovery cost scales with the LIVE context —
+    # every trim and every cache-missing turn re-prefills all of it (~2k
+    # tok/s) — so pin a smaller explicit value if trim stalls feel long.
     raw_max = os.getenv("CONTEXT_MAX_TOKENS", "auto").strip().lower()
     if raw_max in ("off", "0", "none", "false", "disabled"):
         context_max_tokens = None
-        logger.info("Context compression disabled")
+        logger.info("Context window cap disabled")
     elif raw_max in ("", "auto"):
         if omni_active:
             # llama-server has no load-state API; we chose the window ourselves.
@@ -4275,7 +4334,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
             window = await detect_lmstudio_context_window(base_url, llm_model)
         context_max_tokens = max(8000, (window or 32768) - 16000)
         logger.info(
-            f"Context compression threshold: {context_max_tokens} tokens "
+            f"Context window cap: {context_max_tokens} tokens "
             f"(sensed window: {window or 'unknown'})"
         )
     else:
@@ -4317,6 +4376,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
     llm = LMStudioLLMService(
         base_url=base_url,
         api_key=os.getenv("LMSTUDIO_API_KEY", "lm-studio"),
+        context_max_tokens=context_max_tokens,
         settings=OpenAILLMService.Settings(
             extra=llm_extra,
             **llm_settings,
@@ -4555,28 +4615,6 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
                 ],
             ),
         ),
-        # Context compression: when the conversation grows past the token
-        # budget, older turns are summarized (via the same LLM) and replaced.
-        # The threshold counts MESSAGE characters / 4 — the tools array and
-        # chat-template overhead (~10k tokens here) are NOT included, so set
-        # it well below the model's context window minus that overhead.
-        # Compression rewrites history, so the next turn pays one full
-        # re-prefill — the refocus announcement (below) covers the pause.
-        assistant_params=LLMAssistantAggregatorParams(
-            enable_auto_context_summarization=context_max_tokens is not None,
-            auto_context_summarization_config=(
-                LLMAutoContextSummarizationConfig(
-                    max_context_tokens=context_max_tokens,
-                    max_unsummarized_messages=None,
-                    summary_config=LLMContextSummaryConfig(
-                        # Keep the last few exchanges verbatim for continuity.
-                        min_messages_after_summary=6,
-                    ),
-                )
-                if context_max_tokens is not None
-                else None
-            ),
-        ),
     )
 
     # Verbatim conversation trail: the context stores EXACTLY what the model
@@ -4693,14 +4731,13 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
         idle_timeout_secs=None,
     )
 
-    # Voice the context-compression pause: the summary LLM call plus the
-    # follow-up full re-prefill would otherwise be a long, unexplained
-    # silence. The line is pre-synthesized, so it plays instantly even while
-    # the LLM saturates the GPU; append_to_context=False keeps it out of the
-    # conversation trail.
-    @assistant_aggregator._summarizer.event_handler("on_request_summarization")  # noqa: SLF001
-    async def _announce_refocus(summarizer, frame):
-        logger.info("Context compression triggered — announcing refocus pause")
+    # Voice the context-trim pause: the full re-prefill of the trimmed
+    # window would otherwise be a long, unexplained silence. The line is
+    # pre-synthesized, so it plays instantly even while the LLM saturates
+    # the GPU; append_to_context=False keeps it out of the conversation trail.
+    @llm.event_handler("on_context_trimmed")
+    async def _announce_refocus(llm, dropped):
+        logger.info("Context trimmed — announcing refocus pause")
         await worker.queue_frames([TTSSpeakFrame(REFOCUS_LINE, append_to_context=False)])
 
     # Tool-stall watchdog: a tool chain grinding past the limit gets
