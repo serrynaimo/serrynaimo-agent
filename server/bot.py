@@ -2873,11 +2873,6 @@ _INJECT_STOPWORDS = {
 # startup so they play instantly even while the LLM saturates the GPU.
 FILLER_LINES = ["Give me a moment", "Just a second", "Hang in there a sec", "One moment", "Orbiting on that", "On it"]
 
-# Spoken when the context hits the token limit and its oldest turns get
-# dropped (the next request re-prefills the whole window). Primed like the
-# fillers, but NOT part of the client's filler rotation.
-REFOCUS_LINE = "I need a minute to refocus my energy. I'll be right back."
-
 
 def _speech_transform(text_filter):
     """Adapt a BaseTextFilter to the TTS text-transform interface."""
@@ -2948,7 +2943,6 @@ class LMStudioLLMService(OpenAILLMService):
     def __init__(self, *args, context_max_tokens: int | None = None, **kwargs):
         super().__init__(*args, **kwargs)
         self._context_max_tokens = context_max_tokens
-        self._register_event_handler("on_context_trimmed")
         self._verbatim_parts: list[str] = []
         self._verbatim_ledger: dict[int, str] = {}
         self._verbatim_seq = 0
@@ -2967,9 +2961,7 @@ class LMStudioLLMService(OpenAILLMService):
         self._last_call_key, self._repeat_call_count = None, 0
 
     async def get_chat_completions(self, context):
-        dropped = self._trim_context(context)
-        if dropped:
-            await self._call_event_handler("on_context_trimmed", dropped)
+        self._trim_context(context)
         return await super().get_chat_completions(context)
 
     def _trim_context(self, context) -> int:
@@ -4285,7 +4277,6 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
     # Pre-synthesize the slow-tool filler lines: cached PCM plays instantly,
     # while live synthesis takes seconds when the LLM is hogging the GPU.
     tts.prime_phrases(FILLER_LINES)
-    tts.prime_phrases([REFOCUS_LINE], publish_filler_wavs=False)
 
     # LLM service — the in-bot omni server when LLM_AUDIO_INPUT=omni (llama.cpp serving
     # Qwen3-Omni, which hears the utterance audio), otherwise LM Studio.
@@ -4730,15 +4721,6 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
         # session down via the transport's disconnect handling.
         idle_timeout_secs=None,
     )
-
-    # Voice the context-trim pause: the full re-prefill of the trimmed
-    # window would otherwise be a long, unexplained silence. The line is
-    # pre-synthesized, so it plays instantly even while the LLM saturates
-    # the GPU; append_to_context=False keeps it out of the conversation trail.
-    @llm.event_handler("on_context_trimmed")
-    async def _announce_refocus(llm, dropped):
-        logger.info("Context trimmed — announcing refocus pause")
-        await worker.queue_frames([TTSSpeakFrame(REFOCUS_LINE, append_to_context=False)])
 
     # Tool-stall watchdog: a tool chain grinding past the limit gets
     # interrupted — in-flight calls are cancelled and a hidden user-role
