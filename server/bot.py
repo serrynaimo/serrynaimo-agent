@@ -4557,7 +4557,8 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
     stt.set_agent_busy_hook(lambda: bool(llm._function_call_tasks))  # noqa: SLF001
 
     # Voice-only interruption point, wired into the pipeline between LLM and
-    # TTS: anyone speaking stops playback; generation and tools continue.
+    # TTS: the enrolled voice speaking over the bot stops playback (after a
+    # ~1s voiceprint check); generation and tools continue.
     voice_gate = VoiceOnlyInterruptor()
     stt.set_voice_stop_hook(voice_gate.stop_voice)
 

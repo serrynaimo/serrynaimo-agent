@@ -548,6 +548,7 @@ class Qwen3ASRSTTService(SegmentedSTTService):
         # reply to typed input does NOT unlock the gate for bystanders.
         self._voice_driven = True
         self._interim_task = None  # partial-transcription loop while user speaks
+        self._barge_in_task = None  # voiceprint check on speech over the bot
         self._interim_enabled = interim_transcripts
         # Gate state captured when the utterance STARTED: the wake-gate
         # decision must reflect when the user began speaking, not when the
@@ -725,6 +726,12 @@ class Qwen3ASRSTTService(SegmentedSTTService):
         words can mask theirs and their words leak into the transcript.
         Sliding-window scoring finds the takeover point; audio after it is
         cut before transcription. Returns None if nothing usable remains.
+
+        A low window alone is no takeover: the bot's own voice leaking back
+        through the mic, a breath, or a pause dips single windows of the
+        enrolled speaker too, and cutting there leaves a one-word
+        transcript. So the cut also needs everything from that window on
+        to score as someone else.
         """
         sr = QWEN3_ASR_SAMPLE_RATE
         win, hop = int(1.6 * sr), int(0.8 * sr)
@@ -738,9 +745,11 @@ class Qwen3ASRSTTService(SegmentedSTTService):
                 continue  # (near-)silence can't vote on speaker identity
             try:
                 score = await asyncio.to_thread(self._speaker_score, chunk)
+                if score < threshold:
+                    rest = await asyncio.to_thread(self._speaker_score, samples[start:])
             except Exception:  # noqa: BLE001 — fail open
                 return samples
-            if score < threshold:
+            if score < threshold and rest < threshold:
                 end = start + hop
                 break
         if end >= samples.size:
@@ -806,14 +815,18 @@ class Qwen3ASRSTTService(SegmentedSTTService):
         # user who keeps talking (with pauses) is never timed out mid-flow.
         if self._utterance_started_active:
             self._last_activity = time.monotonic()
-        # Anyone speaking stops the VOICE instantly (voice only — generation
-        # and tool work continue; the next sentence still gets spoken unless
-        # the voice is stopped again).
+        # Speech over the bot stops the VOICE (voice only — generation and
+        # tool work continue; the next sentence still gets spoken unless the
+        # voice is stopped again) — but only once its first second sounds
+        # like the enrolled speaker: the bot's own audio leaking back through
+        # the mic trips VAD too, and would make the bot cut itself off.
         if self._bot_speaking and self._on_voice_stop is not None:
-            try:
-                await self._on_voice_stop()
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(f"Voice-stop hook failed: {exc}")
+            if self._encoder is None or self._calibrate:
+                await self._stop_voice()
+            else:
+                self._barge_in_task = self.create_task(
+                    self._verify_barge_in(len(self._audio_buffer))
+                )
         # Interims flow even when the wake gate is closed — they are display
         # only: the turn strategies are configured to ignore interims, so a
         # gated utterance still can't interrupt or trigger the bot. If the
@@ -823,10 +836,40 @@ class Qwen3ASRSTTService(SegmentedSTTService):
             self._interim_task = self.create_task(self._interim_loop())
 
     async def _handle_user_stopped_speaking(self, frame):
-        task, self._interim_task = self._interim_task, None
-        if task:
-            await self.cancel_task(task)
+        # A barge-in still unverified when the speech ends is left to the
+        # final speaker gate, which interrupts everything if it passes.
+        for name in ("_interim_task", "_barge_in_task"):
+            task = getattr(self, name)
+            setattr(self, name, None)
+            if task:
+                await self.cancel_task(task)
         await super()._handle_user_stopped_speaking(frame)
+
+    BARGE_IN_SECS = 1.0  # speech scored before it may stop the bot's voice
+
+    async def _stop_voice(self):
+        try:
+            await self._on_voice_stop()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"Voice-stop hook failed: {exc}")
+
+    async def _verify_barge_in(self, start_len: int):
+        """Stop the voice once speech over it scores as the enrolled speaker."""
+        need = start_len + int(self.BARGE_IN_SECS * self.sample_rate) * 2
+        while self._user_speaking and len(self._audio_buffer) < need:
+            await asyncio.sleep(0.05)
+        if not self._user_speaking or not self._bot_speaking:
+            return
+        clip = bytes(self._audio_buffer[start_len:need])
+        samples = np.frombuffer(clip, dtype="<i2").astype(np.float32) / 32768.0
+        try:
+            score = await asyncio.to_thread(self._speaker_score, samples)
+        except Exception:  # noqa: BLE001 — fail open, like the final gate
+            score = self._match_threshold
+        if score >= self._match_threshold * 0.8:  # short clips score lower
+            await self._stop_voice()
+        else:
+            logger.info(f"Barge-in check: not the enrolled voice (score {score:.2f}) — still talking")
 
     async def _interim_loop(self):
         """Transcribe the growing utterance buffer and push interim results.
