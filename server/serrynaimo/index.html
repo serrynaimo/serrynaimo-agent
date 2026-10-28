@@ -504,7 +504,7 @@ function resetMood() {
 function stepMood(now, dt) {
   // A couple of quiet minutes and the page drifts back to its usual look.
   if (mood.lastAt && now - mood.lastAt > 120000) resetMood();
-  const t = mood.target, k = 0.006; // a few seconds to settle: moods fade, never snap
+  const t = mood.target, k = ease(0.006, dt); // a few seconds to settle: moods fade, never snap
   mood.valence += (t.valence - mood.valence) * k;
   mood.intensity += (t.intensity - mood.intensity) * k;
   mood.tint += (t.tint - mood.tint) * k;
@@ -2118,8 +2118,8 @@ function stepSpin(now, dt, rate) {
     s.targetSpeed = 0.45 + Math.random() * 1.25;
     s.nextSpeedChange = now + 4000 + Math.random() * 9000;
   }
-  for (let i = 0; i < 3; i++) s.axis[i] += (s.targetAxis[i] - s.axis[i]) * 0.01;
-  s.speed += (s.targetSpeed - s.speed) * 0.02;
+  for (let i = 0; i < 3; i++) s.axis[i] += (s.targetAxis[i] - s.axis[i]) * ease(0.01, dt);
+  s.speed += (s.targetSpeed - s.speed) * ease(0.02, dt);
 
   const len = Math.hypot(...s.axis) || 1;
   s.rateNow = rate * s.speed; // current angular speed, rad/s
@@ -2144,11 +2144,26 @@ function spinMat3() {
   ]);
 }
 
+// The orb and background are two full-screen shaders; 30 fps looks the same
+// for this slow motion at a half (60 Hz) to a quarter (ProMotion) of the GPU.
+const FRAME_MS = 1000 / 30;
+
+// Per-frame easing factor k, tuned at `hz` frames per second, scaled to a
+// step of dt seconds — so the frame cap doesn't slow the animations down.
+function ease(k, dt, hz = 60) {
+  return 1 - Math.pow(1 - k, dt * hz);
+}
+
 let connSmooth = 0;
 const t0 = performance.now();
 let lastFrameTime = t0;
 function frame() {
   const now = performance.now();
+  // rAF fires at the display rate; the slack absorbs callback jitter.
+  if (now - lastFrameTime < FRAME_MS - 4) {
+    requestAnimationFrame(frame);
+    return;
+  }
   const time = (now - t0) / 1000;
   const dt = Math.min((now - lastFrameTime) / 1000, 0.1);
   lastFrameTime = now;
@@ -2156,15 +2171,15 @@ function frame() {
   revealBotText(dt);
   fillerTick(now);
   stepMood(now, dt);
-  readySmooth += ((assistantReady ? 1 : 0) - readySmooth) * 0.02;
+  readySmooth += ((assistantReady ? 1 : 0) - readySmooth) * ease(0.02, dt);
 
   // Smooth the audio level: fast attack, gentle release.
   const target = currentBotLevel();
-  orbState.level += (target - orbState.level) * (target > orbState.level ? 0.35 : 0.06);
+  orbState.level += (target - orbState.level) * ease(target > orbState.level ? 0.35 : 0.06, dt);
 
   // Ease hue toward its target; drift a little extra while talking.
-  if (orbState.talking) orbState.targetHue += 0.0004;
-  orbState.hue += (orbState.targetHue - orbState.hue) * 0.02;
+  if (orbState.talking) orbState.targetHue += 0.024 * dt;
+  orbState.hue += (orbState.targetHue - orbState.hue) * ease(0.02, dt);
 
   // Activity: thinking churns hardest, tool work close behind, listening
   // stirs gently. Eases up quickly, settles back down slowly.
@@ -2174,10 +2189,10 @@ function frame() {
     now < orbState.memPulseUntil ? 0.85 : 0,
     orbState.listening ? 0.45 : 0,
   );
-  orbState.act += (actTarget - orbState.act) * (actTarget > orbState.act ? 0.08 : 0.025);
+  orbState.act += (actTarget - orbState.act) * ease(actTarget > orbState.act ? 0.08 : 0.025, dt);
   orbState.spin += stepSpin(now, dt, 0.05 + orbState.act * 0.9 + mood.intensity * 0.12);
 
-  connSmooth += (orbState.conn - connSmooth) * 0.03;
+  connSmooth += (orbState.conn - connSmooth) * ease(0.03, dt);
 
   // Mic voice pulse for the bottom haze: only while the wake window is open
   // (the haze is hidden otherwise) and the bot isn't speaking — so speaker
@@ -2185,7 +2200,7 @@ function frame() {
   const micTarget = (assistantReady && !document.body.classList.contains("gated")
                      && !orbState.talking)
     ? currentMicLevel() : 0;
-  orbState.mic += (micTarget - orbState.mic) * (micTarget > orbState.mic ? 0.4 : 0.08);
+  orbState.mic += (micTarget - orbState.mic) * ease(micTarget > orbState.mic ? 0.4 : 0.08, dt);
   glowHaze.style.setProperty("--mic-scale", (1 + orbState.mic * 0.22).toFixed(3));
   glowHaze.style.setProperty("--mic-bright", (1 + orbState.mic * 1.25).toFixed(3));
   glowHaze.style.setProperty("--mood-bright", (1 + mood.valence * 0.25).toFixed(3));
@@ -2212,10 +2227,10 @@ function frame() {
   gl.drawArrays(gl.TRIANGLES, 0, 3);
 
   // Sample the freshly drawn plasma (must happen in the same frame as the
-  // draw) to drive the lens flares. Every 3rd frame: readback is a GPU sync.
-  if (frameCounter++ % 3 === 0) probeFlareBrightness();
+  // draw) to drive the lens flares. Every other frame: readback is a GPU sync.
+  if (frameCounter++ % 2 === 0) probeFlareBrightness(dt * 2);
 
-  renderBG(time);
+  renderBG(time, dt);
 
   requestAnimationFrame(frame);
 }
@@ -2432,7 +2447,7 @@ const flareRender = new Float32Array(probeGrid.length); // render-rate smoothed
    and could starve the whole system. */
 let probeBuf = null, probeSide = 0, probeX0 = 0, probeY0 = 0;
 
-function probeFlareBrightness() {
+function probeFlareBrightness(dt) {
   const W = canvas.width, H = canvas.height, m = Math.min(W, H);
   const dir = currentFlareDir();
   const R = Math.ceil(0.46 * m * 0.5) * 2; // covers probes out to 0.4 uv
@@ -2463,17 +2478,18 @@ function probeFlareBrightness() {
     // responsive when it whirls, so flares keep up with moving brightness.
     const mul = 1 + spinState.rateNow * 3;
     const cur = probeVals[i];
+    // Tuned at 20 probes/s (every 3rd frame at 60 fps).
     probeVals[i] += (target - cur)
-      * (target > cur ? Math.min(0.16, 0.04 * mul) : Math.min(0.1, 0.02 * mul));
+      * ease(target > cur ? Math.min(0.16, 0.04 * mul) : Math.min(0.1, 0.02 * mul), dt, 20);
   }
 }
 
 let flareGateSmooth = 1; // eases to 0 while muted: lens flares rest with the gate
 
-function renderBG(time) {
+function renderBG(time, dt) {
   if (!bgUniforms) return;
   const gateTarget = document.body.classList.contains("gated") ? 0 : 1;
-  flareGateSmooth += (gateTarget - flareGateSmooth) * 0.03;
+  flareGateSmooth += (gateTarget - flareGateSmooth) * ease(0.03, dt);
   const talkMul = (orbState.talking ? 0.45 + 0.75 * orbState.level : 0.7) * flareGateSmooth;
   const fT = (time * 0.12) % 1; // ghosts drift gently while flares live
   const W = bgCanvas.width, H = bgCanvas.height, m = Math.min(W, H);
@@ -2492,7 +2508,7 @@ function renderBG(time) {
   for (let i = 0; i < flareRender.length; i++) {
     const t = probeVals[i] * talkMul;
     flareRender[i] += (t - flareRender[i])
-      * (t > flareRender[i] ? Math.min(0.08, 0.02 * easeMul) : Math.min(0.05, 0.012 * easeMul));
+      * ease(t > flareRender[i] ? Math.min(0.08, 0.02 * easeMul) : Math.min(0.05, 0.012 * easeMul), dt);
   }
   // Every grid point is a potential flare — upload them all; the shader
   // skips the dark ones. No top-N selection, so nothing can pop in or out.
