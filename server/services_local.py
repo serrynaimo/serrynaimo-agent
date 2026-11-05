@@ -549,6 +549,24 @@ class Qwen3ASRSTTService(SegmentedSTTService):
         self._voice_driven = True
         self._interim_task = None  # partial-transcription loop while user speaks
         self._barge_in_task = None  # voiceprint check on speech over the bot
+        self._span_task = None  # span-window scoring while the user speaks
+        # Speaker scores of this utterance's span windows, by start sample —
+        # filled while the user talks, read by the final gate.
+        self._span_scores: dict[int, float] = {}
+        # Async (text, cues) -> bool from bot.py: is an utterance that passed
+        # the gates without the wake word meant for the assistant at all, or
+        # for someone in the room? None = no such check.
+        self._addressee_check = None
+        # When another voice was last heard (a whole utterance or a stretch
+        # of one), so the addressee check knows other people are around.
+        self._other_voice_at = float("-inf")
+        self._bot_spoke_at = float("-inf")  # last bot audio, of any kind
+        # Utterance began over or right after bot audio: low scores there are
+        # mostly the bot's own voice leaking back, not other people.
+        self._utterance_near_bot = False
+        # The wake window as it was before this utterance held it open, so a
+        # line meant for someone else doesn't keep the window open.
+        self._activity_before_utterance = float("-inf")
         self._interim_enabled = interim_transcripts
         # Gate state captured when the utterance STARTED: the wake-gate
         # decision must reflect when the user began speaking, not when the
@@ -614,6 +632,7 @@ class Qwen3ASRSTTService(SegmentedSTTService):
         ):
             if self._voice_driven:
                 self._last_activity = time.monotonic()
+            self._bot_spoke_at = time.monotonic()
             self._bot_speaking = not isinstance(frame, BotStoppedSpeakingFrame)
         await super().process_frame(frame, direction)
 
@@ -675,6 +694,21 @@ class Qwen3ASRSTTService(SegmentedSTTService):
         """Callable returning True while agent work (tool calls) is in flight."""
         self._agent_busy = hook
 
+    def set_addressee_check(self, hook):
+        """Async (text, cues) -> bool: False drops an utterance that passed
+        the gates without the wake word as meant for someone else. cues:
+        others_present (another voice heard in the last OTHERS_PRESENT_SECS)
+        and secs_since_bot_spoke (None before the bot first spoke)."""
+        self._addressee_check = hook
+
+    OTHERS_PRESENT_SECS = 180.0  # how long a heard voice counts as "others around"
+
+    def _note_other_voice(self, num_samples: int):
+        """Another voice was heard: unless it was most likely the bot's own
+        voice leaking back, or too short to be speech, other people are around."""
+        if not self._utterance_near_bot and num_samples >= QWEN3_ASR_SAMPLE_RATE:
+            self._other_voice_at = time.monotonic()
+
     def _notify_dropped(self):
         if self._on_dropped_speech is not None:
             try:
@@ -718,47 +752,128 @@ class Qwen3ASRSTTService(SegmentedSTTService):
             return True
         return time.monotonic() - self._last_activity <= self._wake_timeout_secs
 
-    async def _enrolled_prefix(self, samples: np.ndarray):
-        """Trim an accepted utterance to the enrolled speaker's leading part.
+    # --- speaker spans: only the enrolled voice's stretches are transcribed --
 
-        The utterance-level speaker gate scores the AVERAGE voice — if
-        another person talks in the same VAD segment, the enrolled speaker's
-        words can mask theirs and their words leak into the transcript.
-        Sliding-window scoring finds the takeover point; audio after it is
-        cut before transcription. Returns None if nothing usable remains.
+    SPAN_WIN_SECS = 1.5   # audio judged per speaker-identity window
+    SPAN_HOP_SECS = 0.25  # spacing between windows, and the cut resolution
 
-        A low window alone is no takeover: the bot's own voice leaking back
-        through the mic, a breath, or a pause dips single windows of the
-        enrolled speaker too, and cutting there leaves a one-word
-        transcript. So the cut also needs everything from that window on
-        to score as someone else.
+    def _span_geometry(self) -> tuple[int, int]:
+        sr = QWEN3_ASR_SAMPLE_RATE
+        return int(self.SPAN_WIN_SECS * sr), int(self.SPAN_HOP_SECS * sr)
+
+    def _window_score(self, chunk: np.ndarray) -> float:
+        """Speaker score of one span window; NaN for (near-)silence, which
+        can't vote on speaker identity."""
+        if float(np.sqrt(np.mean(chunk * chunk))) < 0.004:
+            return float("nan")
+        return self._speaker_score(chunk)
+
+    async def _span_loop(self):
+        """Score span windows while the user is still talking.
+
+        The utterance buffer only grows until the turn ends, so window
+        offsets stay valid; the final gate then has only the last window or
+        two left to score, and the reply isn't held up.
+        """
+        win, hop = self._span_geometry()
+        scores = self._span_scores
+        start = 0
+        try:
+            while self._user_speaking:
+                if len(self._audio_buffer) < 2 * (start + win):
+                    await asyncio.sleep(0.05)
+                    continue
+                clip = bytes(self._audio_buffer[2 * start:2 * (start + win)])
+                samples = np.frombuffer(clip, dtype="<i2").astype(np.float32) / 32768.0
+                scores[start] = await asyncio.to_thread(self._window_score, samples)
+                start += hop
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:  # noqa: BLE001 — the final gate scores whatever is missing
+            logger.debug(f"Span pre-scoring stopped: {exc}")
+
+    async def _enrolled_spans(self, samples: np.ndarray, whole: float):
+        """The enrolled speaker's stretches of an utterance, or None.
+
+        Returns (runs, score, other_voice): the stretches as (start, end)
+        sample ranges, the speaker score of their audio, and whether a part
+        left out clearly sounded like someone else (not just silence).
+
+        One score for the whole utterance judges the AVERAGE voice: when
+        someone talks before, after or in between, the enrolled voice carries
+        their words into the transcript, or their words sink the enrolled
+        voice's. So short windows are scored across the whole utterance and
+        only the enrolled voice's stretches are kept, wherever they fall; the
+        gate then judges those stretches alone. Two people talking at the
+        same moment can't be pulled apart this way.
+
+        A stretch opens at 0.8x the threshold (short windows score lower) and
+        only closes below 0.5x: a breath, a pause or the bot's own voice
+        leaking back dips single windows of the enrolled speaker too, and
+        cutting there would chop the user's own words.
         """
         sr = QWEN3_ASR_SAMPLE_RATE
-        win, hop = int(1.6 * sr), int(0.8 * sr)
-        if self._encoder is None or self._calibrate or samples.size <= win + hop:
+        win, hop = self._span_geometry()
+        threshold = self._match_threshold
+        everything = [(0, samples.size)]
+        if samples.size <= win + hop:  # too short to split: judge it whole
+            return (everything, whole, False) if whole >= threshold else None
+        starts = list(range(0, samples.size - win + 1, hop))
+        if starts[-1] + win < samples.size:
+            starts.append(samples.size - win)
+        scores = []
+        for start in starts:
+            score = self._span_scores.get(start)
+            if score is None:
+                score = await asyncio.to_thread(self._window_score, samples[start:start + win])
+            scores.append(score)
+        # Each hop-sized slice gets the mean score of the windows covering it.
+        slices = -(-samples.size // hop)
+        total, count = np.zeros(slices), np.zeros(slices)
+        for start, score in zip(starts, scores):
+            if not np.isnan(score):
+                covered = slice(start // hop, min(slices, -(-(start + win) // hop)))
+                total[covered] += score
+                count[covered] += 1
+        keep = np.zeros(slices, bool)
+        inside = False
+        for i in range(slices):
+            if count[i]:
+                inside = total[i] / count[i] >= threshold * (0.5 if inside else 0.8)
+            keep[i] = inside  # silence keeps the current state
+        # Half a second or more left out that scored clearly as someone else.
+        other_voice = int(((count > 0) & ~keep & (total < 0.5 * threshold * count)).sum()) >= 2
+        # Stretches in samples, padded so their first and last words survive.
+        pad = int(0.15 * sr)
+        edges = np.flatnonzero(np.diff(np.r_[0, keep.astype(np.int8), 0]))
+        runs: list[tuple[int, int]] = []
+        for a, b in zip(edges[::2], edges[1::2]):
+            a, b = max(0, a * hop - pad), min(samples.size, b * hop + pad)
+            if runs and a <= runs[-1][1]:
+                runs[-1] = (runs[-1][0], b)
+            else:
+                runs.append((a, b))
+        # No stretch to trust, but the whole utterance passes: short lines
+        # score lower per window than whole, so judge those whole as before.
+        fallback = (everything, whole, other_voice) if whole >= threshold else None
+        if runs == everything or sum(b - a for a, b in runs) < int(0.8 * sr):
+            return fallback
+        score = await asyncio.to_thread(
+            self._speaker_score, np.concatenate([samples[a:b] for a, b in runs])
+        )
+        return (runs, score, other_voice) if score >= threshold else fallback
+
+    @staticmethod
+    def _stitch(samples: np.ndarray, runs: list[tuple[int, int]]) -> np.ndarray:
+        """The kept stretches, with short silences between them so the ASR
+        hears pauses rather than words spliced into each other."""
+        if runs == [(0, samples.size)]:
             return samples
-        threshold = self._match_threshold * 0.8  # short windows score lower
-        end = samples.size
-        for start in range(0, samples.size - win + 1, hop):
-            chunk = samples[start:start + win]
-            if float(np.sqrt(np.mean(chunk * chunk))) < 0.004:
-                continue  # (near-)silence can't vote on speaker identity
-            try:
-                score = await asyncio.to_thread(self._speaker_score, chunk)
-                if score < threshold:
-                    rest = await asyncio.to_thread(self._speaker_score, samples[start:])
-            except Exception:  # noqa: BLE001 — fail open
-                return samples
-            if score < threshold and rest < threshold:
-                end = start + hop
-                break
-        if end >= samples.size:
-            return samples
-        if end < int(1.0 * sr):
-            logger.info("Speaker purity: segment taken over by another voice — dropped")
-            return None
-        logger.info(f"Speaker purity: trimmed mixed segment to first {end / sr:.1f}s")
-        return samples[:end]
+        gap = np.zeros(int(0.1 * QWEN3_ASR_SAMPLE_RATE), np.float32)
+        parts = []
+        for a, b in runs:
+            parts += [samples[a:b], gap]
+        return np.concatenate(parts[:-1])
 
     def _has_wake_word(self, text: str) -> bool:
         words = re.findall(r"[\w']+", text.lower())
@@ -811,10 +926,14 @@ class Qwen3ASRSTTService(SegmentedSTTService):
         self._utterance_started_active = self.conversation_active()
         self._utterance_started_at = time.monotonic()
         self._utterance_wake_seen = False
+        self._utterance_near_bot = (
+            self._bot_speaking or self._utterance_started_at - self._bot_spoke_at < 1.5
+        )
+        self._activity_before_utterance = self._last_activity
         # Speech that begins inside the window holds the window open, so a
         # user who keeps talking (with pauses) is never timed out mid-flow.
         if self._utterance_started_active:
-            self._last_activity = time.monotonic()
+            self._last_activity = self._utterance_started_at
         # Speech over the bot stops the VOICE (voice only — generation and
         # tool work continue; the next sentence still gets spoken unless the
         # voice is stopped again) — but only once its first second sounds
@@ -834,11 +953,14 @@ class Qwen3ASRSTTService(SegmentedSTTService):
         # pending text away.
         if self._interim_enabled and self._interim_task is None:
             self._interim_task = self.create_task(self._interim_loop())
+        self._span_scores = {}
+        if self._encoder is not None and not self._calibrate and self._span_task is None:
+            self._span_task = self.create_task(self._span_loop())
 
     async def _handle_user_stopped_speaking(self, frame):
         # A barge-in still unverified when the speech ends is left to the
         # final speaker gate, which interrupts everything if it passes.
-        for name in ("_interim_task", "_barge_in_task"):
+        for name in ("_interim_task", "_barge_in_task", "_span_task"):
             task = getattr(self, name)
             setattr(self, name, None)
             if task:
@@ -1035,7 +1157,8 @@ class Qwen3ASRSTTService(SegmentedSTTService):
                 "microphone device and input volume; transcription will be unreliable"
             )
 
-        # Speaker gate: only transcribe utterances from the enrolled voice.
+        # Speaker gate: only the enrolled voice is transcribed, and when
+        # someone else talks in the same segment, only its own stretches.
         if self._encoder is not None:
             try:
                 score = await asyncio.to_thread(self._speaker_score, samples)
@@ -1046,19 +1169,39 @@ class Qwen3ASRSTTService(SegmentedSTTService):
                 if self._calibrate:
                     self._capture_utterance(samples)
                     logger.info(f"Speaker gate CALIBRATION: score {score:.2f} (nothing dropped)")
-                elif score < self._match_threshold:
-                    logger.info(f"Speaker gate: dropped utterance (score {score:.2f} < {self._match_threshold})")
-                    self._notify_dropped()
-                    return
                 else:
-                    logger.info(f"Speaker gate: accepted utterance (score {score:.2f})")
-
-        # The gate passed on average — now cut anything after another voice
-        # takes over, so other people's words never enter the transcript.
-        samples = await self._enrolled_prefix(samples)
-        if samples is None:
-            self._notify_dropped()
-            return
+                    try:
+                        kept = await self._enrolled_spans(samples, score)
+                    except Exception as exc:  # noqa: BLE001 — fall back to the whole-utterance verdict
+                        logger.warning(f"Speaker span check failed (judging the whole utterance): {exc}")
+                        kept = (
+                            ([(0, samples.size)], score, False)
+                            if score >= self._match_threshold else None
+                        )
+                    if kept is None:
+                        logger.info(
+                            f"Speaker gate: dropped utterance (score {score:.2f}; no stretch "
+                            f"of the enrolled voice reaches {self._match_threshold})"
+                        )
+                        # Clearly someone else, not the user's own near-miss
+                        # (from across the room, say).
+                        if score < 0.8 * self._match_threshold:
+                            self._note_other_voice(samples.size)
+                        self._notify_dropped()
+                        return
+                    runs, kept_score, other_voice = kept
+                    if other_voice:
+                        self._note_other_voice(samples.size)
+                    if runs == [(0, samples.size)]:
+                        logger.info(f"Speaker gate: accepted utterance (score {score:.2f})")
+                    else:
+                        sr = QWEN3_ASR_SAMPLE_RATE
+                        logger.info(
+                            f"Speaker gate: kept the enrolled voice's "
+                            f"{sum(b - a for a, b in runs) / sr:.1f}s of {samples.size / sr:.1f}s "
+                            f"(score {kept_score:.2f}, whole {score:.2f})"
+                        )
+                    samples = self._stitch(samples, runs)
 
         await self.start_ttfb_metrics()
         await self.start_processing_metrics()
@@ -1091,6 +1234,33 @@ class Qwen3ASRSTTService(SegmentedSTTService):
                 return
             logger.info("Wake gate: wake word heard")
             self._muted = False  # the wake word lifts an explicit mute
+        # Addressee check: the gates know WHO spoke, not to whom. Inside the
+        # wake window the user may be talking to someone in the room, so
+        # bot.py asks whether this is meant for the assistant at all; the
+        # wake word is address enough. Runs before the interruption below, so
+        # a line meant for someone else doesn't cut the bot off either.
+        named = self._utterance_wake_seen or (self._wake_words and self._has_wake_word(text))
+        if self._addressee_check is not None and not named:
+            now = time.monotonic()
+            cues = {
+                "others_present": now - self._other_voice_at <= self.OTHERS_PRESENT_SECS,
+                "secs_since_bot_spoke": now - self._bot_spoke_at if self._bot_spoke_at > float("-inf") else None,
+            }
+            try:
+                addressed = await self._addressee_check(text, cues)
+            except Exception as exc:  # noqa: BLE001 — fail open, never lock the user out
+                logger.warning(f"Addressee check failed (letting utterance through): {exc}")
+                addressed = True
+            if self._utterance_abandoned(started_at):
+                logger.info(f"Session reset: dropped in-flight transcript [{text[:60]}]")
+                return
+            if not addressed:
+                # Side talk doesn't hold the wake window open: once the bot
+                # has been quiet long enough, the wake word is needed again.
+                if self._last_activity == self._utterance_started_at:
+                    self._last_activity = self._activity_before_utterance
+                self._notify_dropped()
+                return
         # Verified-speaker interruption: raw VAD never interrupts anything —
         # noise and other voices can neither stop speech nor cancel work.
         # An utterance that reaches this point passed the speaker (and wake)

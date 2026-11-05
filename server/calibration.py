@@ -219,14 +219,17 @@ def _run_calibration() -> dict:
         return [round(float(v) / m, 3) for v in h]
 
     # Rebuild enrollment from positive windows (cap 60) + FULL negative cohort
-    # for runtime S-norm scoring.
+    # for runtime S-norm scoring. The 60 are spread across ALL positive
+    # recordings: the first 60 in file order would silently leave out newer
+    # ones (e.g. recorded from across the room).
+    picks = np.unique(np.linspace(0, len(pos_windows) - 1, min(60, len(pos_windows))).round().astype(int))
     with _lock:
         os.makedirs(ENROLL_DIR, exist_ok=True)
         for old in glob.glob(os.path.join(ENROLL_DIR, "*")):
             os.remove(old)
-        for i, w in enumerate(pos_windows[:60], start=1):
-            _save_wav(os.path.join(ENROLL_DIR, f"cal_{i:03d}.wav"), w)
-        np.save(os.path.join(ENROLL_DIR, "cohort.npy"), np.stack(neg_embs[:200]))
+        for i, k in enumerate(picks, start=1):
+            _save_wav(os.path.join(ENROLL_DIR, f"cal_{i:03d}.wav"), pos_windows[k])
+        np.save(os.path.join(ENROLL_DIR, "cohort.npy"), np.stack(neg_embs))
     _update_env(threshold)
 
     logger.info(
@@ -450,7 +453,10 @@ def register_calibration(app):
         if len(samples) < SR:
             return JSONResponse({"error": "clip too short (need >=1s)"}, status_code=400)
         d = _wav_dir(kind)
-        n = len(glob.glob(os.path.join(d, "*.wav"))) + 1
+        # Number after the highest one taken: counting files reuses (and
+        # overwrites) an existing name once any earlier sample was deleted.
+        taken = [int(m.group(1)) for f in os.listdir(d) if (m := re.fullmatch(r"s_(\d+)\.wav", f))]
+        n = max(taken, default=0) + 1
         _save_wav(os.path.join(d, f"s_{n:03d}.wav"), samples)
         logger.info(f"calibration: saved {kind} sample #{n} ({len(samples)/SR:.1f}s)")
         return JSONResponse(_counts())

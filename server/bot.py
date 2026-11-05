@@ -128,6 +128,7 @@ from pipecat.utils.context.llm_context_summarization import LLMContextSummarizat
 from pipecat.utils.string import TextPartForConcatenation
 from pipecat.workers.runner import WorkerRunner
 
+import addressee
 import fuzzy
 from apple_mail import AppleMail
 from mcp_toolsets import (
@@ -593,6 +594,36 @@ def _last_user_text(messages: list) -> str:
         if text and not text.startswith("("):
             return text
     return ""
+
+
+def _chat_trail(messages: list, limit: int = 4) -> list[tuple[str, str]]:
+    """The last few spoken turns, oldest first, as (speaker, text): no injected
+    notes, memory blocks, tool traffic or the synthetic greeting prompt."""
+    trail: list[tuple[str, str]] = []
+    for m in reversed(messages):
+        if len(trail) >= limit:
+            break
+        if not isinstance(m, dict):
+            continue
+        content = m.get("content")
+        if isinstance(content, list):
+            content = " ".join(p.get("text", "") for p in content if isinstance(p, dict))
+        text = str(content or "")
+        if m.get("role") == "user":
+            text = re.sub(r"^(\s*<system-note>.*?</system-note>)+", "", text, flags=re.S).strip()
+            if text and not text.startswith(
+                ("(", MemoryInjector.MARK, MemoryInjector.ACTION_MARK, "Greet the user")
+            ):
+                trail.append((USER_NAME_SHORT, text[:200]))
+        elif m.get("role") == "assistant":
+            text = re.sub(r"<think>.*?</think>", "", text, flags=re.S).strip()
+            if text:
+                trail.append((AGENT_NAME, text[:200]))
+    trail.reverse()
+    # Announced notifications never enter the context, but a reply to one
+    # ("read it") is a follow-up all the same.
+    trail += [(AGENT_NAME, n["line"][:200]) for n in _SPOKEN_NOTIFS if time.time() - n["ts"] < 120]
+    return trail[-limit:]
 
 
 async def detect_lmstudio_model(base_url: str) -> str | None:
@@ -4501,6 +4532,10 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
     # receive the reasoning-suppression fields either — even in mode 0,
     # where it only reads transcripts, enable_thinking=False derails its
     # template into garbage ("user\n") and near-empty completions.
+    # stop: with thinking off the model still drafts when the injected notes
+    # already hold the answer: reply, a stray </think>, then a reworded reply,
+    # all in one completion. Ending there keeps the first reply and never
+    # generates the second.
     audio_native = (
         omni_active
         or os.getenv("LLM_AUDIO_INPUT", "0").strip().lower() in ("1", "true", "yes")
@@ -4514,6 +4549,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
     else:
         llm_extra["reasoning_effort"] = os.getenv("LMSTUDIO_REASONING_EFFORT", "low")
         extra_body["chat_template_kwargs"] = {"enable_thinking": False}
+        llm_extra["stop"] = ["</think>"]
     if extra_body:
         llm_extra["extra_body"] = extra_body
     llm = LMStudioLLMService(
@@ -4979,6 +5015,45 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
             _resume_pending["active"] = False
 
     stt.set_dropped_speech_hook(lambda: asyncio.create_task(_resume_orphaned_tool_answer()))
+
+    # Addressee check: an utterance that passes the speaker and wake gates
+    # without the wake word may still be meant for someone in the room. The
+    # classifier gets one yes/no question over the last few chat turns and
+    # the new line. ADDRESSEE_CHECK=auto (default) asks only while other
+    # voices have been heard lately, since each ask holds the reply ~0.4-0.9 s;
+    # "always" asks every time, "off" never.
+    addressee_mode = os.getenv("ADDRESSEE_CHECK", "auto").strip().lower()
+    addressee_min_yes = float(os.getenv("ADDRESSEE_MIN_YES", "0.5"))
+    side_talk: collections.deque = collections.deque(maxlen=3)  # (monotonic, line) not for the bot
+
+    async def _meant_for_agent(text: str, cues: dict) -> bool:
+        if addressee_mode == "auto" and not cues["others_present"]:
+            return True
+        if classify_command(text, stt._wake_words):  # noqa: SLF001 — control phrases are for the bot
+            return True
+        now = time.monotonic()
+        state = addressee.state(
+            _chat_trail(context.get_messages()),
+            [line for at, line in side_talk if now - at < 180],
+            text,
+            user=USER_NAME_SHORT,
+            agent=AGENT_NAME,
+            secs_since_agent=cues["secs_since_bot_spoke"],
+            others_present=cues["others_present"],
+        )
+        started = time.perf_counter()
+        p = await addressee.p_meant_for_agent(state, user=USER_NAME_SHORT, agent=AGENT_NAME)
+        took = f"{1000 * (time.perf_counter() - started):.0f} ms"
+        if p is None or p >= addressee_min_yes:
+            if p is not None:
+                logger.info(f"Addressee: for {AGENT_NAME} (p {p:.2f}, {took})")
+            return True
+        side_talk.append((now, text))
+        logger.info(f"Addressee: not for {AGENT_NAME} (p {p:.2f}, {took}) — ignored: [{text[:80]}]")
+        return False
+
+    if addressee_mode != "off":
+        stt.set_addressee_check(_meant_for_agent)
 
     # Proactive notification reading (NOTIFY_ANNOUNCE=1): watch macOS banners via
     # the Accessibility API and, when the conversation is idle/muted, read the
